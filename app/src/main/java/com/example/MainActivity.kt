@@ -76,10 +76,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val outputLanguages = listOf("Myanmar", "English")
     var selectedLanguage by remember { mutableStateOf(outputLanguages[0]) }
 
+    val context = LocalContext.current
+    val sharedPrefs = remember { context.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE) }
+
     // Settings State
-    var apiKey by remember { mutableStateOf("") }
     val models = listOf("Gemini 3.5 flash", "Gemini 3.6 flash")
-    var selectedModel by remember { mutableStateOf(models[0]) }
+    var apiKey by remember { mutableStateOf(sharedPrefs.getString("gemini_api_key", "") ?: "") }
+    var selectedModel by remember { mutableStateOf(sharedPrefs.getString("gemini_model", models[0]) ?: models[0]) }
 
     // Generation State
     var generatedScript by remember { mutableStateOf("") }
@@ -113,7 +116,6 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var selectedMediaName by remember { mutableStateOf("No file selected") }
     var selectedMediaDurationMs by remember { mutableStateOf(0L) }
 
-    val context = LocalContext.current
     val geminiApiClient = remember { GeminiApiClient(context) }
     
     // Database State
@@ -932,9 +934,15 @@ fun MainScreen(modifier: Modifier = Modifier) {
     if (showSettings) {
         SettingsDialog(
             apiKey = apiKey,
-            onApiKeyChange = { apiKey = it },
+            onApiKeyChange = { newKey ->
+                apiKey = newKey
+                sharedPrefs.edit().putString("gemini_api_key", newKey).apply()
+            },
             selectedModel = selectedModel,
-            onModelSelected = { selectedModel = it },
+            onModelSelected = { newModel ->
+                selectedModel = newModel
+                sharedPrefs.edit().putString("gemini_model", newModel).apply()
+            },
             models = models,
             onDismiss = { showSettings = false }
         )
