@@ -992,6 +992,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
 
     if (scriptToRegenerate != null) {
+        var localModelKey by remember(scriptToRegenerate) { 
+            mutableStateOf(scriptToRegenerate?.modelId?.ifBlank { selectedModelKey } ?: selectedModelKey) 
+        }
         var localParts by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.partsCount.toFloat()) }
         var localLength by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.targetLength) }
         var localPOV by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.pov) }
@@ -1007,6 +1010,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         .verticalScroll(rememberScrollState())
                         .padding(8.dp)
                 ) {
+                    DropdownSection(
+                        title = "Gemini Model",
+                        options = modelOptions.map { it.second },
+                        selectedOption = modelKeyToDisplay(localModelKey),
+                        onOptionSelected = { localModelKey = modelDisplayToKey(it) }
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
                     SliderSection(
                         title = "Number of parts the video",
                         value = localParts,
@@ -1046,6 +1056,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
             confirmButton = {
                 Button(onClick = {
                     val updatedScript = scriptToRegenerate!!.copy(
+                        modelId = localModelKey,
                         partsCount = localParts.toInt(),
                         targetLength = localLength,
                         pov = localPOV,

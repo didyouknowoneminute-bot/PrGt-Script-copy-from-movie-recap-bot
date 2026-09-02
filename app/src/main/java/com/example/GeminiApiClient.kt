@@ -91,6 +91,8 @@ class GeminiApiClient(private val context: Context) {
             val finalGeminiFileUri: String
             var durationMs = 30000L // Default fallback
             
+            emit(GenerationUpdate.Log("AI Engine: $actualModelName"))
+            
             if (existingGeminiFileUri != null && existingDurationMs != null) {
                 emit(GenerationUpdate.Log("[15%] Using existing cached media on server..."))
                 emit(GenerationUpdate.Progress(0.15f))
