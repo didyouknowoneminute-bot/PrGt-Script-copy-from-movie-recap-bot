@@ -72,6 +72,8 @@ fun ProcessingBlock(
                 .padding(16.dp)
         ) {
             // Header
+            val percentInt = (progress * 100).toInt().coerceIn(0, 100)
+            
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -91,25 +93,47 @@ fun ProcessingBlock(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                IconButton(onClick = { isExpanded = !isExpanded }) {
-                    Icon(
-                        imageVector = if (isExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                        contentDescription = "Toggle Details"
-                    )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Surface(
+                        color = MaterialTheme.colorScheme.primaryContainer,
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.padding(end = 4.dp)
+                    ) {
+                        Text(
+                            text = "$percentInt%",
+                            fontWeight = FontWeight.ExtraBold,
+                            fontSize = 14.sp,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                    IconButton(onClick = { isExpanded = !isExpanded }) {
+                        Icon(
+                            imageVector = if (isExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
+                            contentDescription = "Toggle Details"
+                        )
+                    }
                 }
             }
 
             Spacer(modifier = Modifier.height(8.dp))
+            
+            val animatedProgress by animateFloatAsState(
+                targetValue = progress.coerceIn(0f, 1f),
+                animationSpec = tween(durationMillis = 300, easing = FastOutSlowInEasing),
+                label = "realtimeProgress"
+            )
+
             LinearProgressIndicator(
-                progress = { progress },
+                progress = { animatedProgress },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(8.dp)
-                    .clip(RoundedCornerShape(4.dp)),
+                    .height(10.dp)
+                    .clip(RoundedCornerShape(5.dp)),
                 color = MaterialTheme.colorScheme.primary,
                 trackColor = MaterialTheme.colorScheme.surface
             )
-            Spacer(modifier = Modifier.height(16.dp))
+            Spacer(modifier = Modifier.height(12.dp))
 
             AnimatedVisibility(
                 visible = isExpanded,

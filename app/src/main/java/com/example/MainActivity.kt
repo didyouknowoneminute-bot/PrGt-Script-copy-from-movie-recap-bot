@@ -80,9 +80,23 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val sharedPrefs = remember { context.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE) }
 
     // Settings State
-    val models = listOf("Gemini 3.5 flash", "Gemini 3.6 flash")
+    val modelOptions = listOf(
+        "gemini-3.7-flash" to "Gemini 3.7 Flash (Hybrid Reasoning/နောက်ဆုံးထွက်)",
+        "gemini-3.6-flash" to "Gemini 3.6 Flash (Agentic)",
+        "gemini-3.5-flash" to "Gemini 3.5 Flash (မြန်ဆန်/Stable)",
+        "gemini-3.5-flash-lite" to "Gemini 3.5 Flash-Lite (Low-latency)",
+        "gemini-3.1-flash-lite" to "Gemini 3.1 Flash-Lite (အမြန်ဆုံး/ချွေတာရေး)"
+    )
+    val modelKeys = modelOptions.map { it.first }
+    val modelDisplayMap = modelOptions.toMap()
+    val modelKeyToDisplay = { key: String -> modelDisplayMap[key] ?: key }
+    val modelDisplayToKey = { display: String -> modelOptions.find { it.second == display }?.first ?: display }
+
     var apiKey by remember { mutableStateOf(sharedPrefs.getString("gemini_api_key", "") ?: "") }
-    var selectedModel by remember { mutableStateOf(sharedPrefs.getString("gemini_model", models[0]) ?: models[0]) }
+    var selectedModelKey by remember { 
+        val saved = sharedPrefs.getString("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
+        mutableStateOf(if (modelKeys.contains(saved)) saved else "gemini-3.5-flash")
+    }
 
     // Generation State
     var generatedScript by remember { mutableStateOf("") }
@@ -150,7 +164,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
         generationJob = coroutineScope.launch {
             val scriptPartsMap = mutableMapOf<Int, String>()
             
-            val activeModel = existingScript?.modelId ?: selectedModel
+            val activeModel = existingScript?.modelId ?: selectedModelKey
             val activeParts = existingScript?.partsCount?.toFloat() ?: parts
             val activeLength = existingScript?.targetLength ?: selectedLength
             val activePOV = existingScript?.pov ?: selectedPOV
@@ -940,12 +954,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 apiKey = newKey
                 sharedPrefs.edit().putString("gemini_api_key", newKey).apply()
             },
-            selectedModel = selectedModel,
-            onModelSelected = { newModel ->
-                selectedModel = newModel
-                sharedPrefs.edit().putString("gemini_model", newModel).apply()
+            selectedModel = modelKeyToDisplay(selectedModelKey),
+            onModelSelected = { selectedDisplay ->
+                val newKey = modelDisplayToKey(selectedDisplay)
+                selectedModelKey = newKey
+                sharedPrefs.edit().putString("gemini_model", newKey).apply()
             },
-            models = models,
+            models = modelOptions.map { it.second },
             onDismiss = { showSettings = false }
         )
     }

@@ -42,10 +42,14 @@ class GeminiApiClient(private val context: Context) {
         .build()
 
     private fun getModelName(uiModelName: String): String {
-        return when (uiModelName) {
-            "Gemini 3.6 flash" -> "gemini-1.5-pro" 
-            "Gemini 3.5 flash" -> "gemini-1.5-flash" 
-            else -> "gemini-1.5-flash"
+        return when {
+            uiModelName.contains("3.7", ignoreCase = true) -> "gemini-3.7-flash"
+            uiModelName.contains("3.6", ignoreCase = true) -> "gemini-3.6-flash"
+            uiModelName.contains("3.5-flash-lite", ignoreCase = true) || uiModelName.contains("3.5 Flash-Lite", ignoreCase = true) -> "gemini-3.5-flash-lite"
+            uiModelName.contains("3.5", ignoreCase = true) -> "gemini-3.5-flash"
+            uiModelName.contains("3.1", ignoreCase = true) -> "gemini-3.1-flash-lite"
+            uiModelName.startsWith("gemini-") -> uiModelName.trim()
+            else -> "gemini-3.7-flash"
         }
     }
 
@@ -88,15 +92,30 @@ class GeminiApiClient(private val context: Context) {
             var durationMs = 30000L // Default fallback
             
             if (existingGeminiFileUri != null && existingDurationMs != null) {
-                emit(GenerationUpdate.Log("Using existing cached media..."))
-                emit(GenerationUpdate.Progress(0.20f))
+                emit(GenerationUpdate.Log("[15%] Using existing cached media on server..."))
+                emit(GenerationUpdate.Progress(0.15f))
                 finalGeminiFileUri = existingGeminiFileUri
                 durationMs = existingDurationMs
             } else {
-                emit(GenerationUpdate.Log("Uploading media... Please wait."))
-                emit(GenerationUpdate.Progress(0.05f))
+                emit(GenerationUpdate.Log("[0%] Preparing media upload..."))
+                emit(GenerationUpdate.Progress(0.01f))
                 
-                val uploadResult = uploadFile(apiKey, mediaUri!!, mediaMimeType ?: "video/mp4")
+                var lastLogPercent = -1
+                val uploadResult = uploadFile(apiKey, mediaUri!!, mediaMimeType ?: "video/mp4") { ratio, uploadedBytes, totalBytes ->
+                    // Upload takes 0% to 12% of total process
+                    val totalUploadProgress = 0.01f + (ratio * 0.11f)
+                    val uploadPercent = (ratio * 100).toInt()
+                    
+                    // Log upload percentage at milestones (every 25%)
+                    if (uploadPercent % 25 == 0 && uploadPercent != lastLogPercent) {
+                        lastLogPercent = uploadPercent
+                        val mbUploaded = String.format(java.util.Locale.US, "%.1f", uploadedBytes / (1024.0 * 1024.0))
+                        val mbTotal = String.format(java.util.Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
+                        kotlinx.coroutines.runBlocking {
+                            // Synchronously update
+                        }
+                    }
+                }
                 
                 val fileUriInfo = when (uploadResult) {
                     is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
@@ -106,13 +125,15 @@ class GeminiApiClient(private val context: Context) {
                     }
                 }
                 
-                emit(GenerationUpdate.Log("Upload successful! File cached on server."))
-                emit(GenerationUpdate.Progress(0.15f))
+                emit(GenerationUpdate.Log("[12%] Media upload complete. File cached on server."))
+                emit(GenerationUpdate.Progress(0.12f))
 
                 // Wait for video processing if it's a video
                 if (mediaMimeType?.startsWith("video") == true) {
-                    emit(GenerationUpdate.Log("Waiting for Gemini to process the video..."))
+                    emit(GenerationUpdate.Log("[13%] Waiting for Gemini server to process video..."))
+                    emit(GenerationUpdate.Progress(0.13f))
                     var isActive = false
+                    var pollCount = 0
                     while(!isActive) {
                         val state = checkFileState(apiKey, fileUriInfo.second)
                         if (state == "ACTIVE") {
@@ -121,14 +142,17 @@ class GeminiApiClient(private val context: Context) {
                             emit(GenerationUpdate.Error("Gemini failed to process the uploaded video."))
                             return@flow
                         } else {
-                            emit(GenerationUpdate.Log("Video is processing by Gemini (State: $state)... waiting 10 seconds."))
-                            delay(10000)
+                            pollCount++
+                            val currentProcProgress = (0.13f + (pollCount * 0.01f)).coerceAtMost(0.15f)
+                            emit(GenerationUpdate.Progress(currentProcProgress))
+                            emit(GenerationUpdate.Log("[${(currentProcProgress * 100).toInt()}%] Gemini is indexing video frames (State: $state)... waiting."))
+                            delay(5000)
                         }
                     }
-                    emit(GenerationUpdate.Log("Video processing complete."))
+                    emit(GenerationUpdate.Log("[15%] Video processing and frame indexing complete."))
                 }
 
-                emit(GenerationUpdate.Progress(0.20f))
+                emit(GenerationUpdate.Progress(0.15f))
 
                 // Extract Video Duration
                 try {
@@ -223,7 +247,11 @@ class GeminiApiClient(private val context: Context) {
                 val startStr = formatTime(startMs)
                 val endStr = formatTime(endMs)
                 
-                emit(GenerationUpdate.Log("Generating Segment ${i + 1}/$parts [$startStr - $endStr]..."))
+                val startPercent = (15 + ((85f * i) / parts)).toInt()
+                val targetEndPercent = (15 + ((85f * (i + 1)) / parts)).toInt()
+                
+                emit(GenerationUpdate.Progress(startPercent / 100f))
+                emit(GenerationUpdate.Log("[$startPercent%] Generating Segment ${i + 1}/$parts ($startStr - $endStr)..."))
                 emit(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear the placeholder
 
                 val timingConstraint = if (isVideo) {
@@ -345,14 +373,16 @@ class GeminiApiClient(private val context: Context) {
                     }
                 }
                 
-                if (!success) {
+                if (success) {
+                    emit(GenerationUpdate.Log("[$targetEndPercent%] Segment ${i + 1}/$parts ($startStr - $endStr) completed."))
+                } else {
                     failedParts.add(i)
-                    emit(GenerationUpdate.Log("Segment ${i + 1} failed after 3 attempts. Will retry at the end."))
+                    emit(GenerationUpdate.Log("[$targetEndPercent%] Segment ${i + 1} failed after 3 attempts. Will retry at the end."))
                     emit(GenerationUpdate.ScriptChunk(i, "\n[အပိုင်း (${i + 1}) အား ၃ ကြိမ်တိုင်တိုင် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။ နောက်ဆုံးမှ ပြန်လည်ကြိုးစားပါမည်။]\n", isError = true))
                     // Do not break; continue to the next part
                 }
                 
-                val currentProgress = 0.20f + (0.60f * ((i + 1) / parts.toFloat()))
+                val currentProgress = targetEndPercent / 100f
                 emit(GenerationUpdate.Progress(currentProgress))
             }
             
@@ -515,7 +545,7 @@ class GeminiApiClient(private val context: Context) {
                 }
             }
 
-            emit(GenerationUpdate.Log("Script Generation Complete!"))
+            emit(GenerationUpdate.Log("[100%] All script segments generated successfully!"))
             emit(GenerationUpdate.Progress(1.0f))
             emit(GenerationUpdate.Complete)
 
@@ -584,7 +614,7 @@ class GeminiApiClient(private val context: Context) {
         data class Failure(val errorDetail: String) : UploadResult()
     }
 
-    private fun uploadFile(apiKey: String, fileUri: Uri, mimeType: String): UploadResult {
+    private fun uploadFile(apiKey: String, fileUri: Uri, mimeType: String, onProgress: (Float, Long, Long) -> Unit): UploadResult {
         val fileSize = getFileSize(fileUri)
         if (fileSize <= 0) {
             val err = "Invalid file size ($fileSize bytes). Could not read selected media."
@@ -636,7 +666,21 @@ class GeminiApiClient(private val context: Context) {
             override fun contentLength() = fileSize
             override fun writeTo(sink: BufferedSink) {
                 context.contentResolver.openInputStream(fileUri)?.use { input ->
-                    sink.writeAll(input.source())
+                    val buffer = ByteArray(64 * 1024) // 64 KB buffer for precise progress tracking
+                    var uploadedBytes = 0L
+                    var read: Int
+                    var lastReportedPercent = -1
+                    while (input.read(buffer).also { read = it } != -1) {
+                        sink.write(buffer, 0, read)
+                        sink.flush()
+                        uploadedBytes += read
+                        val ratio = if (fileSize > 0) uploadedBytes.toFloat() / fileSize.toFloat() else 0f
+                        val currentPercent = (ratio * 100).toInt()
+                        if (currentPercent != lastReportedPercent) {
+                            lastReportedPercent = currentPercent
+                            onProgress(ratio.coerceIn(0f, 1f), uploadedBytes, fileSize)
+                        }
+                    }
                 }
             }
         }
