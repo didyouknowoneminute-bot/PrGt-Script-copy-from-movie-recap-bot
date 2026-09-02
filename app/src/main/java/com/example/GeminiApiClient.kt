@@ -96,11 +96,14 @@ class GeminiApiClient(private val context: Context) {
                 emit(GenerationUpdate.Log("Uploading media... Please wait."))
                 emit(GenerationUpdate.Progress(0.05f))
                 
-                val fileUriInfo = uploadFile(apiKey, mediaUri!!, mediaMimeType ?: "video/mp4")
+                val uploadResult = uploadFile(apiKey, mediaUri!!, mediaMimeType ?: "video/mp4")
                 
-                if (fileUriInfo == null) {
-                    emit(GenerationUpdate.Error("Upload failed. Could not retrieve file URI from Gemini."))
-                    return@flow
+                val fileUriInfo = when (uploadResult) {
+                    is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
+                    is UploadResult.Failure -> {
+                        emit(GenerationUpdate.Error("Upload failed:\n${uploadResult.errorDetail}"))
+                        return@flow
+                    }
                 }
                 
                 emit(GenerationUpdate.Log("Upload successful! File cached on server."))
@@ -152,6 +155,9 @@ class GeminiApiClient(private val context: Context) {
             val segmentDurationMs = durationMs / parts
             val segmentDurationMins = segmentDurationMs / 60000.0
 
+            val isAudio = mediaMimeType?.startsWith("audio") == true
+            val isVideo = !isAudio
+
             val (minWords, maxWords) = when (length) {
                 "Short" -> Pair(maxOf(30, (60 * segmentDurationMins).toInt()), maxOf(47, (95 * segmentDurationMins).toInt()))
                 "Medium" -> Pair(maxOf(55, (110 * segmentDurationMins).toInt()), maxOf(77, (155 * segmentDurationMins).toInt()))
@@ -160,21 +166,42 @@ class GeminiApiClient(private val context: Context) {
                 else -> Pair(maxOf(55, (110 * segmentDurationMins).toInt()), maxOf(77, (155 * segmentDurationMins).toInt()))
             }
             
-            val povInstruction = pov
-            val toneInstruction = tone
-            val lengthInstruction = "စကားလုံးအရေအတွက် $minWords မှ $maxWords လုံး အတွင်း အတိအကျဖြစ်အောင် ရေးသားပေးရမည်။"
+            val povDetail = when {
+                pov.contains("Main Character", ignoreCase = true) || pov.contains("First", ignoreCase = true) -> 
+                    "အဓိကဇာတ်ကောင်၏ ရှုထောင့်အမြင် (First-Person POV / 'ကျွန်တော်/ကျွန်မ/ငါ') မှ ကိုယ်တိုင်ကြုံတွေ့နေရသကဲ့သို့ ခံစားချက်ပြင်းပြစွာ ပြောပြရမည်။"
+                pov.contains("Third", ignoreCase = true) || pov.contains("Omniscient", ignoreCase = true) -> 
+                    "ပြင်ပဇာတ်ကြောင်းပြောသူအမြင် (Third-Person / Omniscient Narrator) မှ 'သူ'၊ 'သူမ'၊ 'သူတို့' စသည်ဖြင့် အရာအားလုံးကို ခြုံငုံသိမြင်နေသော ပုံစံဖြင့် ဇာတ်ကြောင်းပြောပြရမည်။"
+                pov.contains("Second", ignoreCase = true) -> 
+                    "ကြည့်ရှုသူ/နားဆင်သူအား တိုက်ရိုက်ပြောဆိုသော အမြင် (Second-Person POV / 'မင်း/ခင်ဗျား/သင်') ဖြင့် စိတ်ဝင်စားဖွယ် ပြောပြရမည်။"
+                else -> "$pov ရှုထောင့်အမြင်အတိုင်း ဇာတ်ကြောင်းပြောပြရမည်။"
+            }
+
+            val toneDetail = "$tone (ရွေးချယ်ထားသော '$tone' လေသံအတိုင်း နားထောင်သူ စိတ်ဝင်စားအောင် ရေးသားပါ)"
+            val lengthInstruction = "ရွေးချယ်ထားသော Script Length '$length' အရ စကားလုံးအရေအတွက် $minWords မှ $maxWords လုံး အတွင်း အတိအကျဖြစ်အောင် ရေးသားပေးရမည်။ (ပိုတိုခြင်း၊ ပိုရှည်လွန်းခြင်း လုံးဝ မဖြစ်ရပါ။)"
+
+            val modalityInstruction = if (isVideo) {
+                """
+                |Media Source: ဗီဒီယို (Video - Visual Actions + Spoken Dialogues & Audio)
+                |- ဤဗီဒီယိုအပိုင်းအခြားအတွင်း ဖြစ်ပျက်နေသော ဇာတ်ကောင်များ၏ လှုပ်ရှားမှု/မြင်ကွင်းများ (Visual actions, scenes, character expressions) နှင့် ဇာတ်ကောင်များ ပြောဆိုသော စကားသံ/နောက်ခံအသံများ (Spoken dialogues, speech context, sound effects) နှစ်ခုစလုံးကို အသေးစိတ် ကြည့်ရှုနားထောင်ပြီး အခြေခံ၍ ရေးသားရမည်။
+                """.trimMargin()
+            } else {
+                """
+                |Media Source: အသံဖိုင် (Audio Only - Speech & Sound Context)
+                |- ဤအသံဖိုင်အပိုင်းအခြားအတွင်း ပြောဆိုသော စကားသံများ (Spoken dialogues, speeches, narration) နှင့် နောက်ခံအသံ/အသံအရည်အသွေးများ (Background audio context, sound cues) ကိုသာ အပြည့်အဝ နားထောင်ပြီး အခြေခံ၍ ရေးသားရမည်။ မရှိသော visual မြင်ကွင်းများကို ကိုယ်တိုင်မဖန်တီးဘဲ အသံထဲပါသော အကြောင်းအရာကိုသာ အခြေခံရမည်။
+                """.trimMargin()
+            }
 
             val languageConstraint = if (language == "Myanmar") {
                 """
                 |မြန်မာဘာသာအတွက် အင်္ဂလိပ်စာလုံး လုံးဝမပါစေရန်နှင့် Transliteration လုပ်ရန်။ 
                 |ကိန်းဂဏန်းများကို စာလုံးပေါင်း၍ဖော်ပြရန် (ဥပမာ - 1 အစား 'တစ်'၊ 100 အစား 'တစ်ရာ'၊ 786 အစား 'ခုနှစ်ရာ ရှစ်ဆယ့်ခြောက်'၊ 3545 အစား 'သုံးထောင့်ငါးရာလေးဆယ့်ငါး')။
-                |ဇာတ်လမ်းကို ဗီဒီယိုပါ အစီအစဉ်အတိုင်း (Chronological Sequence) အတိအကျ ရေးသားရန်။
+                |ဇာတ်လမ်းကို မူရင်းအစီအစဉ်အတိုင်း (Chronological Sequence) အတိအကျ ရေးသားရန်။
                 """.trimMargin()
             } else {
                 """
                 |CRITICAL: The final output MUST BE ENTIRELY IN $language. Do NOT output any Myanmar language in the generated script!
                 |Use natural and fluent $language.
-                |Write strictly in chronological sequence of the video.
+                |Write strictly in chronological sequence.
                 |Spell out all numbers using words instead of digits (e.g., use 'one' instead of '1', 'one hundred' instead of '100').
                 |Avoid abbreviations and contractions (e.g., use 'do not' instead of 'don't').
                 |Replace symbols with words for TTS-readability (e.g., use 'and' instead of '&', 'percent' instead of '%').
@@ -199,22 +226,32 @@ class GeminiApiClient(private val context: Context) {
                 emit(GenerationUpdate.Log("Generating Segment ${i + 1}/$parts [$startStr - $endStr]..."))
                 emit(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear the placeholder
 
-                val timingConstraint = """
-                    Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အဖြစ်အပျက်များကိုသာ အတိအကျ ကြည့်ရှုရေးသားပါ။ 
+                val timingConstraint = if (isVideo) {
+                    """
+                    Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
                     (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
                     သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ဖြစ်ပျက်ခဲ့ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
-                """.trimIndent()
+                    """.trimIndent()
+                } else {
+                    """
+                    Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
+                    (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
+                    သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ပါဝင်ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
+                    """.trimIndent()
+                }
                 
                 val systemInstruction = """
                     သင်သည် အလွန်အသေးစိတ်ကျသော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
                     
                     ညွှန်ကြားချက်များ:
-                    1. POV: $povInstruction
-                    2. Tone: $toneInstruction
-                    3. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
-                    4. Timing & Context: $timingConstraint
-                    5. Length Constraint: $lengthInstruction (ပိုတိုခြင်း၊ ပိုရှည်ခြင်း လုံးဝ မဖြစ်ရပါ။)
-                    6. Language Constraints: $languageConstraint
+                    1. Input Media Analysis:
+                    $modalityInstruction
+                    2. Narrator POV: $povDetail
+                    3. Script Tone: $toneDetail
+                    4. Length Constraint: $lengthInstruction
+                    5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
+                    6. Timing & Context: $timingConstraint
+                    7. Language Constraints: $languageConstraint
                 """.trimIndent()
 
                 val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို PrGt's Script ရေးသားပေးပါ။"
@@ -335,22 +372,32 @@ class GeminiApiClient(private val context: Context) {
                     emit(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts [$startStr - $endStr]..."))
                     emit(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear error message
 
-                    val timingConstraint = """
-                        Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အဖြစ်အပျက်များကိုသာ အတိအကျ ကြည့်ရှုရေးသားပါ။ 
+                    val timingConstraint = if (isVideo) {
+                        """
+                        Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
                         (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
                         သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ဖြစ်ပျက်ခဲ့ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
-                    """.trimIndent()
+                        """.trimIndent()
+                    } else {
+                        """
+                        Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
+                        (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
+                        သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ပါဝင်ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
+                        """.trimIndent()
+                    }
                     
                     val systemInstruction = """
                         သင်သည် အလွန်အသေးစိတ်ကျသော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
                         
                         ညွှန်ကြားချက်များ:
-                        1. POV: $povInstruction
-                        2. Tone: $toneInstruction
-                        3. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
-                        4. Timing & Context: $timingConstraint
-                        5. Length Constraint: $lengthInstruction (ပိုတိုခြင်း၊ ပိုရှည်ခြင်း လုံးဝ မဖြစ်ရပါ။)
-                        6. Language Constraints: $languageConstraint
+                        1. Input Media Analysis:
+                        $modalityInstruction
+                        2. Narrator POV: $povDetail
+                        3. Script Tone: $toneDetail
+                        4. Length Constraint: $lengthInstruction
+                        5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
+                        6. Timing & Context: $timingConstraint
+                        7. Language Constraints: $languageConstraint
                     """.trimIndent()
 
                     val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို PrGt's Script ရေးသားပေးပါ။"
@@ -532,11 +579,17 @@ class GeminiApiClient(private val context: Context) {
         return size
     }
 
-    private fun uploadFile(apiKey: String, fileUri: Uri, mimeType: String): Pair<String, String>? {
+    sealed class UploadResult {
+        data class Success(val uri: String, val name: String) : UploadResult()
+        data class Failure(val errorDetail: String) : UploadResult()
+    }
+
+    private fun uploadFile(apiKey: String, fileUri: Uri, mimeType: String): UploadResult {
         val fileSize = getFileSize(fileUri)
         if (fileSize <= 0) {
-            Log.e("GeminiApiClient", "Cannot upload file: Invalid file size ($fileSize bytes)")
-            return null
+            val err = "Invalid file size ($fileSize bytes). Could not read selected media."
+            Log.e("GeminiApiClient", "Cannot upload file: $err")
+            return UploadResult.Failure(err)
         }
 
         val initJson = JSONObject().apply {
@@ -560,15 +613,22 @@ class GeminiApiClient(private val context: Context) {
         try {
             client.newCall(initRequest).execute().use { response ->
                 if (!response.isSuccessful) {
-                    val errBody = response.body?.string()
-                    Log.e("GeminiApiClient", "Upload init failed: HTTP ${response.code} ${response.message} - $errBody")
-                    return null
+                    val errBody = response.body?.string() ?: "Empty body"
+                    val errMsg = "Upload init failed (HTTP ${response.code} ${response.message}): $errBody"
+                    Log.e("GeminiApiClient", errMsg)
+                    return UploadResult.Failure(errMsg)
                 }
-                uploadUrl = response.header("X-Goog-Upload-URL") ?: return null
+                uploadUrl = response.header("X-Goog-Upload-URL") ?: ""
+                if (uploadUrl.isEmpty()) {
+                    val errMsg = "Gemini server did not return X-Goog-Upload-URL header."
+                    Log.e("GeminiApiClient", errMsg)
+                    return UploadResult.Failure(errMsg)
+                }
             }
         } catch (e: Exception) {
-            Log.e("GeminiApiClient", "Init upload request exception", e)
-            return null
+            val errMsg = "Network exception during upload init: ${e.message}"
+            Log.e("GeminiApiClient", errMsg, e)
+            return UploadResult.Failure(errMsg)
         }
 
         val fileRequestBody = object : RequestBody() {
@@ -585,28 +645,35 @@ class GeminiApiClient(private val context: Context) {
             .url(uploadUrl)
             .post(fileRequestBody)
             .addHeader("X-Goog-Upload-Protocol", "resumable")
-            .addHeader("X-Goog-Upload-Command", "upload")
+            .addHeader("X-Goog-Upload-Command", "upload, finalize")
             .addHeader("X-Goog-Upload-Offset", "0")
             .build()
 
         try {
             client.newCall(uploadRequest).execute().use { response ->
+                val respBody = response.body?.string() ?: ""
                 if (response.isSuccessful) {
-                    val responseJson = JSONObject(response.body?.string() ?: "")
+                    val responseJson = JSONObject(respBody)
                     val fileObj = responseJson.optJSONObject("file")
                     val uri = fileObj?.optString("uri")
                     val name = fileObj?.optString("name")
-                    if (uri != null && name != null) {
-                        return Pair(uri, name)
+                    if (!uri.isNullOrEmpty() && !name.isNullOrEmpty()) {
+                        return UploadResult.Success(uri, name)
+                    } else {
+                        val errMsg = "Upload succeeded but file info missing in response: $respBody"
+                        Log.e("GeminiApiClient", errMsg)
+                        return UploadResult.Failure(errMsg)
                     }
                 } else {
-                    val errBody = response.body?.string()
-                    Log.e("GeminiApiClient", "Binary upload failed: HTTP ${response.code} ${response.message} - $errBody")
+                    val errMsg = "Binary upload failed (HTTP ${response.code} ${response.message}): $respBody"
+                    Log.e("GeminiApiClient", errMsg)
+                    return UploadResult.Failure(errMsg)
                 }
             }
         } catch (e: Exception) {
-            Log.e("GeminiApiClient", "Binary upload exception", e)
+            val errMsg = "Binary upload exception: ${e.message}"
+            Log.e("GeminiApiClient", errMsg, e)
+            return UploadResult.Failure(errMsg)
         }
-        return null
     }
 }
