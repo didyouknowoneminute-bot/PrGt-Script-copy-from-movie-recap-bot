@@ -142,6 +142,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var newNameInput by remember { mutableStateOf("") }
     var scriptToDelete by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var scriptToRegenerate by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
+    var viewingHistoryScript by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     
     var currentScriptId by remember { mutableStateOf<Int?>(null) }
     var isEditingScript by remember { mutableStateOf(false) }
@@ -443,14 +444,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             Spacer(modifier = Modifier.height(12.dp))
                             Button(
                                 onClick = { 
-                                    generatedScript = script.scriptText
-                                    currentScriptId = script.id
-                                    isEditingScript = false
-                                    showHistory = false 
+                                    viewingHistoryScript = script
                                 },
                                 modifier = Modifier.fillMaxWidth()
                             ) {
-                                Text("View Full Script")
+                                Text("View Full Script (ဖတ်ရှုမည်)")
                             }
 
                             val timeSinceSaved = System.currentTimeMillis() - script.timestamp
@@ -672,7 +670,6 @@ fun MainScreen(modifier: Modifier = Modifier) {
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .padding(16.dp)
         ) {
             ProcessingBlock(
                 progress = generationProgress,
@@ -685,6 +682,186 @@ fun MainScreen(modifier: Modifier = Modifier) {
     } // End of root Box
 
     var previousVersionToShow by remember { mutableStateOf<String?>(null) }
+
+    if (viewingHistoryScript != null) {
+        val script = viewingHistoryScript!!
+        var isEditingInViewer by remember(script.id) { mutableStateOf(false) }
+        var viewerText by remember(script.id) { mutableStateOf(script.scriptText) }
+        
+        val wordCount = viewerText.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
+        val charCount = viewerText.length
+        val formattedDate = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(script.timestamp))
+
+        AlertDialog(
+            onDismissRequest = { viewingHistoryScript = null },
+            properties = androidx.compose.ui.window.DialogProperties(
+                usePlatformDefaultWidth = false,
+                dismissOnBackPress = true,
+                dismissOnClickOutside = false
+            ),
+            modifier = Modifier
+                .fillMaxWidth(0.96f)
+                .fillMaxHeight(0.92f),
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = script.fileName,
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = "$formattedDate • ${script.language} • ${script.modelId}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    IconButton(onClick = { viewingHistoryScript = null }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close")
+                    }
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    // Statistics & Metadata chip row
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 12.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "စာလုံးရေ: $wordCount",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                        Surface(
+                            color = MaterialTheme.colorScheme.secondaryContainer,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "အက္ခရာ: $charCount",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onSecondaryContainer,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                        Surface(
+                            color = MaterialTheme.colorScheme.tertiaryContainer,
+                            shape = RoundedCornerShape(8.dp)
+                        ) {
+                            Text(
+                                text = "POV: ${script.pov}",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+
+                    // Main script scroll area
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surface,
+                        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+                    ) {
+                        if (isEditingInViewer) {
+                            OutlinedTextField(
+                                value = viewerText,
+                                onValueChange = { viewerText = it },
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .padding(8.dp),
+                                textStyle = MaterialTheme.typography.bodyLarge.copy(lineHeight = 24.sp)
+                            )
+                        } else {
+                            SelectionContainer {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .verticalScroll(rememberScrollState())
+                                        .padding(16.dp)
+                                ) {
+                                    Text(
+                                        text = viewerText,
+                                        style = MaterialTheme.typography.bodyLarge,
+                                        lineHeight = 26.sp,
+                                        color = MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        IconButton(onClick = {
+                            clipboardManager.setText(AnnotatedString(viewerText))
+                        }) {
+                            Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
+                        }
+                        if (isEditingInViewer) {
+                            IconButton(onClick = {
+                                isEditingInViewer = false
+                                coroutineScope.launch {
+                                    dao.updateScriptText(script.id, viewerText)
+                                }
+                            }) {
+                                Icon(Icons.Filled.Save, contentDescription = "Save", tint = MaterialTheme.colorScheme.primary)
+                            }
+                        } else {
+                            IconButton(onClick = {
+                                isEditingInViewer = true
+                            }) {
+                                Icon(Icons.Filled.Edit, contentDescription = "Edit")
+                            }
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = {
+                            generatedScript = viewerText
+                            currentScriptId = script.id
+                            isEditingScript = false
+                            showHistory = false
+                            viewingHistoryScript = null
+                        }) {
+                            Text("Main Screen သို့ပို့မည်")
+                        }
+                        Button(onClick = { viewingHistoryScript = null }) {
+                            Text("ပိတ်မည်")
+                        }
+                    }
+                }
+            }
+        )
+    }
 
     if (showScriptInfo != null) {
         val totalCalls = showScriptInfo?.totalApiCalls ?: 0

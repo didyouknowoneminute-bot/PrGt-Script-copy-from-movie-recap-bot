@@ -55,21 +55,26 @@ fun ProcessingBlock(
         label = "alpha"
     )
 
+    val targetHeightFraction = if (isExpanded) 0.75f else 0.10f
+    val animatedHeightFraction by animateFloatAsState(
+        targetValue = targetHeightFraction,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "heightFraction"
+    )
+
     Card(
-        modifier = if (isExpanded) {
-            Modifier
-                .fillMaxWidth()
-                .fillMaxHeight(0.75f)
-        } else {
-            Modifier.fillMaxWidth()
-        },
+        modifier = Modifier
+            .fillMaxWidth()
+            .fillMaxHeight(animatedHeightFraction)
+            .padding(horizontal = 12.dp, vertical = 6.dp),
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
-        shape = RoundedCornerShape(16.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp),
+        shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp, bottomStart = 16.dp, bottomEnd = 16.dp)
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(16.dp)
+                .padding(horizontal = 16.dp, vertical = 10.dp)
         ) {
             // Header
             val percentInt = (progress * 100).toInt().coerceIn(0, 100)
@@ -90,6 +95,7 @@ fun ProcessingBlock(
                     Text(
                         text = "NARRATING... $timeString",
                         fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
@@ -107,16 +113,19 @@ fun ProcessingBlock(
                             modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
                         )
                     }
-                    IconButton(onClick = { isExpanded = !isExpanded }) {
+                    IconButton(
+                        onClick = { isExpanded = !isExpanded },
+                        modifier = Modifier.size(36.dp)
+                    ) {
                         Icon(
-                            imageVector = if (isExpanded) Icons.Filled.KeyboardArrowUp else Icons.Filled.KeyboardArrowDown,
-                            contentDescription = "Toggle Details"
+                            imageVector = if (isExpanded) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowUp,
+                            contentDescription = if (isExpanded) "Minimize (1/10)" else "Expand (3/4)"
                         )
                     }
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            Spacer(modifier = Modifier.height(6.dp))
             
             val animatedProgress by animateFloatAsState(
                 targetValue = progress.coerceIn(0f, 1f),
@@ -128,27 +137,26 @@ fun ProcessingBlock(
                 progress = { animatedProgress },
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(10.dp)
-                    .clip(RoundedCornerShape(5.dp)),
+                    .height(8.dp)
+                    .clip(RoundedCornerShape(4.dp)),
                 color = MaterialTheme.colorScheme.primary,
                 trackColor = MaterialTheme.colorScheme.surface
             )
-            Spacer(modifier = Modifier.height(12.dp))
 
-            AnimatedVisibility(
-                visible = isExpanded,
-                modifier = Modifier.weight(1f, fill = false)
-            ) {
+            if (isExpanded) {
+                Spacer(modifier = Modifier.height(10.dp))
                 Column(
-                    modifier = Modifier.fillMaxSize()
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f)
                 ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
                             .weight(1f)
-                            .clip(RoundedCornerShape(8.dp))
+                            .clip(RoundedCornerShape(10.dp))
                             .background(Color.Black)
-                            .padding(8.dp)
+                            .padding(10.dp)
                     ) {
                         LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                             items(logs) { log ->
@@ -162,14 +170,15 @@ fun ProcessingBlock(
                             }
                         }
                     }
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(10.dp))
 
                     Button(
                         onClick = onStopClick,
                         colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        shape = RoundedCornerShape(10.dp)
                     ) {
-                        Text("ရပ်တန့်မည် (Stop)", color = MaterialTheme.colorScheme.onError)
+                        Text("ရပ်တန့်မည် (Stop)", color = MaterialTheme.colorScheme.onError, fontWeight = FontWeight.Bold)
                     }
                 }
             }
