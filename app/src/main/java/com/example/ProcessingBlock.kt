@@ -56,11 +56,21 @@ fun ProcessingBlock(
     )
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = if (isExpanded) {
+            Modifier
+                .fillMaxWidth()
+                .fillMaxHeight(0.75f)
+        } else {
+            Modifier.fillMaxWidth()
+        },
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant),
         shape = RoundedCornerShape(16.dp)
     ) {
-        Column(modifier = Modifier.padding(16.dp)) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp)
+        ) {
             // Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -101,12 +111,17 @@ fun ProcessingBlock(
             )
             Spacer(modifier = Modifier.height(16.dp))
 
-            AnimatedVisibility(visible = isExpanded) {
-                Column {
+            AnimatedVisibility(
+                visible = isExpanded,
+                modifier = Modifier.weight(1f, fill = false)
+            ) {
+                Column(
+                    modifier = Modifier.fillMaxSize()
+                ) {
                     Box(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(150.dp)
+                            .weight(1f)
                             .clip(RoundedCornerShape(8.dp))
                             .background(Color.Black)
                             .padding(8.dp)

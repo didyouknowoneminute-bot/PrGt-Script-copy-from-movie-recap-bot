@@ -493,10 +493,50 @@ class GeminiApiClient(private val context: Context) {
         return "PROCESSING"
     }
 
+    private fun getFileSize(uri: Uri): Long {
+        var size = -1L
+        try {
+            context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.SIZE), null, null, null)?.use { cursor ->
+                val sizeIndex = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                if (sizeIndex != -1 && cursor.moveToFirst()) {
+                    size = cursor.getLong(sizeIndex)
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("GeminiApiClient", "Failed to get file size via query", e)
+        }
+        if (size <= 0) {
+            try {
+                context.contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+                    size = fd.statSize
+                }
+            } catch (e: Exception) {
+                Log.e("GeminiApiClient", "Failed to get file size via openFileDescriptor", e)
+            }
+        }
+        if (size <= 0) {
+            try {
+                context.contentResolver.openInputStream(uri)?.use { input ->
+                    var count = 0L
+                    val buffer = ByteArray(8192)
+                    var read: Int
+                    while (input.read(buffer).also { read = it } != -1) {
+                        count += read
+                    }
+                    size = count
+                }
+            } catch (e: Exception) {
+                Log.e("GeminiApiClient", "Failed to calculate file size via stream", e)
+            }
+        }
+        return size
+    }
+
     private fun uploadFile(apiKey: String, fileUri: Uri, mimeType: String): Pair<String, String>? {
-        var fileSize = 0L
-        context.contentResolver.openFileDescriptor(fileUri, "r")?.use { fd ->
-            fileSize = fd.statSize
+        val fileSize = getFileSize(fileUri)
+        if (fileSize <= 0) {
+            Log.e("GeminiApiClient", "Cannot upload file: Invalid file size ($fileSize bytes)")
+            return null
         }
 
         val initJson = JSONObject().apply {
@@ -517,9 +557,18 @@ class GeminiApiClient(private val context: Context) {
             .build()
 
         var uploadUrl = ""
-        client.newCall(initRequest).execute().use { response ->
-            if (!response.isSuccessful) return null
-            uploadUrl = response.header("X-Goog-Upload-URL") ?: return null
+        try {
+            client.newCall(initRequest).execute().use { response ->
+                if (!response.isSuccessful) {
+                    val errBody = response.body?.string()
+                    Log.e("GeminiApiClient", "Upload init failed: HTTP ${response.code} ${response.message} - $errBody")
+                    return null
+                }
+                uploadUrl = response.header("X-Goog-Upload-URL") ?: return null
+            }
+        } catch (e: Exception) {
+            Log.e("GeminiApiClient", "Init upload request exception", e)
+            return null
         }
 
         val fileRequestBody = object : RequestBody() {
@@ -540,16 +589,23 @@ class GeminiApiClient(private val context: Context) {
             .addHeader("X-Goog-Upload-Offset", "0")
             .build()
 
-        client.newCall(uploadRequest).execute().use { response ->
-            if (response.isSuccessful) {
-                val responseJson = JSONObject(response.body?.string() ?: "")
-                val fileObj = responseJson.optJSONObject("file")
-                val uri = fileObj?.optString("uri")
-                val name = fileObj?.optString("name")
-                if (uri != null && name != null) {
-                    return Pair(uri, name)
+        try {
+            client.newCall(uploadRequest).execute().use { response ->
+                if (response.isSuccessful) {
+                    val responseJson = JSONObject(response.body?.string() ?: "")
+                    val fileObj = responseJson.optJSONObject("file")
+                    val uri = fileObj?.optString("uri")
+                    val name = fileObj?.optString("name")
+                    if (uri != null && name != null) {
+                        return Pair(uri, name)
+                    }
+                } else {
+                    val errBody = response.body?.string()
+                    Log.e("GeminiApiClient", "Binary upload failed: HTTP ${response.code} ${response.message} - $errBody")
                 }
             }
+        } catch (e: Exception) {
+            Log.e("GeminiApiClient", "Binary upload exception", e)
         }
         return null
     }

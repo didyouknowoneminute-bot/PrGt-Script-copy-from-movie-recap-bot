@@ -133,6 +133,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var isEditingScript by remember { mutableStateOf(false) }
     val clipboardManager = LocalClipboardManager.current
     var showScriptInfo by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
+    var errorMessageDialog by remember { mutableStateOf<String?>(null) }
 
     val launchGeneration: (com.example.db.PrGtScript?, List<Int>?) -> Unit = { existingScript, retryParts ->
         val generationStartTime = existingScript?.timestamp ?: System.currentTimeMillis()
@@ -230,6 +231,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     is GenerationUpdate.Error -> {
                         generationLogs.add("ERROR: ${update.message}")
                         finalScript += "\nError: ${update.message}"
+                        errorMessageDialog = update.message
                     }
                     is GenerationUpdate.RequireRetryDecision -> {
                         showRetryDialog = update.failedParts
@@ -945,6 +947,42 @@ fun MainScreen(modifier: Modifier = Modifier) {
             },
             models = models,
             onDismiss = { showSettings = false }
+        )
+    }
+
+    if (errorMessageDialog != null) {
+        AlertDialog(
+            onDismissRequest = { errorMessageDialog = null },
+            title = {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Filled.Info,
+                        contentDescription = "Error",
+                        tint = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(end = 8.dp)
+                    )
+                    Text("Error ဖြစ်ပေါ်ပါသည်", color = MaterialTheme.colorScheme.error)
+                }
+            },
+            text = {
+                Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                    Text(
+                        text = errorMessageDialog ?: "အမည်မသိ အမှားတစ်ခု ဖြစ်ပေါ်ပါသည်။",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = "အကြံပြုချက်: API Key မှန်ကန်မှု ရှိ/မရှိ Settings တွင် စစ်ဆေးပါ သို့မဟုတ် အင်တာနက် လိုင်းကောင်းမွန်မှု ရှိ/မရှိ ပြန်လည်စစ်ဆေးပေးပါ။",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { errorMessageDialog = null }) {
+                    Text("နားလည်ပါပြီ")
+                }
+            }
         )
     }
 }
