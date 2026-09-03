@@ -6,7 +6,12 @@ import android.net.Uri
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
@@ -73,17 +78,18 @@ class GeminiApiClient(private val context: Context) {
         retryDecisionChannel: kotlinx.coroutines.channels.ReceiveChannel<Boolean>? = null,
         existingGeminiFileUri: String? = null,
         existingDurationMs: Long? = null,
-        specificPartsToGenerate: List<Int>? = null
-    ): Flow<GenerationUpdate> = flow {
-        emit(GenerationUpdate.Progress(0.0f))
+        specificPartsToGenerate: List<Int>? = null,
+        rpm: Int = 20
+    ): Flow<GenerationUpdate> = channelFlow {
+        send(GenerationUpdate.Progress(0.0f))
         
         if (apiKey.isBlank()) {
-            emit(GenerationUpdate.Error("API Key is missing. Please add it in settings."))
-            return@flow
+            send(GenerationUpdate.Error("API Key is missing. Please add it in settings."))
+            return@channelFlow
         }
         if (mediaUri == null && existingGeminiFileUri == null) {
-            emit(GenerationUpdate.Error("Please select a video or audio file first."))
-            return@flow
+            send(GenerationUpdate.Error("Please select a video or audio file first."))
+            return@channelFlow
         }
 
         try {
@@ -91,16 +97,16 @@ class GeminiApiClient(private val context: Context) {
             val finalGeminiFileUri: String
             var durationMs = 30000L // Default fallback
             
-            emit(GenerationUpdate.Log("AI Engine: $actualModelName"))
+            send(GenerationUpdate.Log("AI Engine: $actualModelName"))
             
             if (existingGeminiFileUri != null && existingDurationMs != null) {
-                emit(GenerationUpdate.Log("[15%] Using existing cached media on server..."))
-                emit(GenerationUpdate.Progress(0.15f))
+                send(GenerationUpdate.Log("[15%] Using existing cached media on server..."))
+                send(GenerationUpdate.Progress(0.15f))
                 finalGeminiFileUri = existingGeminiFileUri
                 durationMs = existingDurationMs
             } else {
-                emit(GenerationUpdate.Log("[0%] Preparing media upload..."))
-                emit(GenerationUpdate.Progress(0.01f))
+                send(GenerationUpdate.Log("[0%] Preparing media upload..."))
+                send(GenerationUpdate.Progress(0.01f))
                 
                 var lastLogPercent = -1
                 val uploadResult = uploadFile(apiKey, mediaUri!!, mediaMimeType ?: "video/mp4") { ratio, uploadedBytes, totalBytes ->
@@ -113,27 +119,24 @@ class GeminiApiClient(private val context: Context) {
                         lastLogPercent = uploadPercent
                         val mbUploaded = String.format(java.util.Locale.US, "%.1f", uploadedBytes / (1024.0 * 1024.0))
                         val mbTotal = String.format(java.util.Locale.US, "%.1f", totalBytes / (1024.0 * 1024.0))
-                        kotlinx.coroutines.runBlocking {
-                            // Synchronously update
-                        }
                     }
                 }
                 
                 val fileUriInfo = when (uploadResult) {
                     is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
                     is UploadResult.Failure -> {
-                        emit(GenerationUpdate.Error("Upload failed:\n${uploadResult.errorDetail}"))
-                        return@flow
+                        send(GenerationUpdate.Error("Upload failed:\n${uploadResult.errorDetail}"))
+                        return@channelFlow
                     }
                 }
                 
-                emit(GenerationUpdate.Log("[12%] Media upload complete. File cached on server."))
-                emit(GenerationUpdate.Progress(0.12f))
+                send(GenerationUpdate.Log("[12%] Media upload complete. File cached on server."))
+                send(GenerationUpdate.Progress(0.12f))
 
                 // Wait for video processing if it's a video
                 if (mediaMimeType?.startsWith("video") == true) {
-                    emit(GenerationUpdate.Log("[13%] Waiting for Gemini server to process video..."))
-                    emit(GenerationUpdate.Progress(0.13f))
+                    send(GenerationUpdate.Log("[13%] Waiting for Gemini server to process video..."))
+                    send(GenerationUpdate.Progress(0.13f))
                     var isActive = false
                     var pollCount = 0
                     while(!isActive) {
@@ -141,20 +144,20 @@ class GeminiApiClient(private val context: Context) {
                         if (state == "ACTIVE") {
                             isActive = true
                         } else if (state == "FAILED") {
-                            emit(GenerationUpdate.Error("Gemini failed to process the uploaded video."))
-                            return@flow
+                            send(GenerationUpdate.Error("Gemini failed to process the uploaded video."))
+                            return@channelFlow
                         } else {
                             pollCount++
                             val currentProcProgress = (0.13f + (pollCount * 0.01f)).coerceAtMost(0.15f)
-                            emit(GenerationUpdate.Progress(currentProcProgress))
-                            emit(GenerationUpdate.Log("[${(currentProcProgress * 100).toInt()}%] Gemini is indexing video frames (State: $state)... waiting."))
+                            send(GenerationUpdate.Progress(currentProcProgress))
+                            send(GenerationUpdate.Log("[${(currentProcProgress * 100).toInt()}%] Gemini is indexing video frames (State: $state)... waiting."))
                             delay(5000)
                         }
                     }
-                    emit(GenerationUpdate.Log("[15%] Video processing and frame indexing complete."))
+                    send(GenerationUpdate.Log("[15%] Video processing and frame indexing complete."))
                 }
 
-                emit(GenerationUpdate.Progress(0.15f))
+                send(GenerationUpdate.Progress(0.15f))
 
                 // Extract Video Duration
                 try {
@@ -167,16 +170,16 @@ class GeminiApiClient(private val context: Context) {
                     retriever.release()
                 } catch (e: Exception) {
                     Log.e("GeminiApiClient", "Failed to extract duration", e)
-                    emit(GenerationUpdate.Log("(Note: Could not detect exact duration, defaulting to 30s)"))
+                    send(GenerationUpdate.Log("(Note: Could not detect exact duration, defaulting to 30s)"))
                 }
                 
                 // Emit FileInfo for saving to database
-                emit(GenerationUpdate.FileInfo(fileUriInfo.first, mediaMimeType ?: "video/mp4", durationMs))
+                send(GenerationUpdate.FileInfo(fileUriInfo.first, mediaMimeType ?: "video/mp4", durationMs))
                 finalGeminiFileUri = fileUriInfo.first
             }
 
             val parts = partsCount.toInt()
-            emit(GenerationUpdate.InitParts(parts))
+            send(GenerationUpdate.InitParts(parts))
             
             val segmentDurationMs = durationMs / parts
             val segmentDurationMins = segmentDurationMs / 60000.0
@@ -234,165 +237,203 @@ class GeminiApiClient(private val context: Context) {
                 """.trimMargin()
             }
 
-            // Track failed parts
-            val failedParts = mutableListOf<Int>()
+            // Track failed parts and completed parts
+            val failedParts = java.util.Collections.synchronizedList(mutableListOf<Int>())
+            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val partsToProcess = (0 until parts).filter { specificPartsToGenerate == null || specificPartsToGenerate.contains(it) }
+            val totalToProcess = partsToProcess.size
 
-            // Pass 1: Loop sequentially through each part
-            for (i in 0 until parts) {
-                if (specificPartsToGenerate != null && !specificPartsToGenerate.contains(i)) {
-                    continue // Skip parts not requested
+            send(GenerationUpdate.Log("Starting generation with $rpm RPM (Pipelined Parallel mode)..."))
+
+            // Rate limiter: sliding window of timestamps (ms)
+            val requestTimestamps = java.util.Collections.synchronizedList(mutableListOf<Long>())
+            val minDelayBetweenRequestsMs = (60_000L / maxOf(1, rpm))
+
+            suspend fun acquireRateLimitSlot() {
+                while (true) {
+                    val now = System.currentTimeMillis()
+                    // Remove timestamps older than 60 seconds
+                    val size = synchronized(requestTimestamps) {
+                        requestTimestamps.removeAll { now - it >= 60_000L }
+                        if (requestTimestamps.size < rpm) {
+                            requestTimestamps.add(now)
+                            return
+                        }
+                        requestTimestamps.size
+                    }
+                    // If full, wait for the oldest timestamp to exit the 60s window
+                    val oldest = synchronized(requestTimestamps) { requestTimestamps.firstOrNull() } ?: now
+                    val waitTime = maxOf(100L, 60_000L - (now - oldest) + 50L)
+                    delay(waitTime)
                 }
+            }
 
-                val startMs = i * segmentDurationMs
-                val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
-                
-                val startStr = formatTime(startMs)
-                val endStr = formatTime(endMs)
-                
-                val startPercent = (15 + ((85f * i) / parts)).toInt()
-                val targetEndPercent = (15 + ((85f * (i + 1)) / parts)).toInt()
-                
-                emit(GenerationUpdate.Progress(startPercent / 100f))
-                emit(GenerationUpdate.Log("[$startPercent%] Generating Segment ${i + 1}/$parts ($startStr - $endStr)..."))
-                emit(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear the placeholder
+            coroutineScope {
+                partsToProcess.forEachIndexed { index, i ->
+                    val startMs = i * segmentDurationMs
+                    val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
+                    val startStr = formatTime(startMs)
+                    val endStr = formatTime(endMs)
 
-                val timingConstraint = if (isVideo) {
-                    """
-                    Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
-                    (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
-                    သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ဖြစ်ပျက်ခဲ့ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
-                    """.trimIndent()
-                } else {
-                    """
-                    Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
-                    (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
-                    သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ပါဝင်ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
-                    """.trimIndent()
-                }
-                
-                val systemInstruction = """
-                    သင်သည် အလွန်အသေးစိတ်ကျသော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
-                    
-                    ညွှန်ကြားချက်များ:
-                    1. Input Media Analysis:
-                    $modalityInstruction
-                    2. Narrator POV: $povDetail
-                    3. Script Tone: $toneDetail
-                    4. Length Constraint: $lengthInstruction
-                    5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
-                    6. Timing & Context: $timingConstraint
-                    7. Language Constraints: $languageConstraint
-                """.trimIndent()
+                    send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true))
+                    send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
 
-                val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို PrGt's Script ရေးသားပေးပါ။"
+                    launch {
+                        // Delay between initiating requests according to RPM
+                        if (index > 0) {
+                            delay(index * minDelayBetweenRequestsMs)
+                        }
 
-                val jsonBody = JSONObject().apply {
-                    put("system_instruction", JSONObject().apply {
-                        put("parts", JSONArray().apply {
-                            put(JSONObject().apply { put("text", systemInstruction) })
-                        })
-                    })
-                    put("contents", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("role", "user")
-                            put("parts", JSONArray().apply {
-                                put(JSONObject().apply {
-                                    put("file_data", JSONObject().apply {
-                                        put("mime_type", mediaMimeType ?: "video/mp4")
-                                        put("file_uri", finalGeminiFileUri)
-                                    })
-                                })
-                                put(JSONObject().apply {
-                                    put("text", prompt)
+                        acquireRateLimitSlot()
+
+                        send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr) to AI..."))
+
+                        val timingConstraint = if (isVideo) {
+                            """
+                            Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
+                            (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
+                            သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ဖြစ်ပျက်ခဲ့ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
+                            """.trimIndent()
+                        } else {
+                            """
+                            Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
+                            (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
+                            သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ပါဝင်ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
+                            """.trimIndent()
+                        }
+                        
+                        val systemInstruction = """
+                            သင်သည် အလွန်အသေးစိတ်ကျသော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
+                            
+                            ညွှန်ကြားချက်များ:
+                            1. Input Media Analysis:
+                            $modalityInstruction
+                            2. Narrator POV: $povDetail
+                            3. Script Tone: $toneDetail
+                            4. Length Constraint: $lengthInstruction
+                            5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
+                            6. Timing & Context: $timingConstraint
+                            7. Language Constraints: $languageConstraint
+                        """.trimIndent()
+
+                        val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို PrGt's Script ရေးသားပေးပါ။"
+
+                        val jsonBody = JSONObject().apply {
+                            put("system_instruction", JSONObject().apply {
+                                put("parts", JSONArray().apply {
+                                    put(JSONObject().apply { put("text", systemInstruction) })
                                 })
                             })
-                        })
-                    })
-                }
+                            put("contents", JSONArray().apply {
+                                put(JSONObject().apply {
+                                    put("role", "user")
+                                    put("parts", JSONArray().apply {
+                                        put(JSONObject().apply {
+                                            put("file_data", JSONObject().apply {
+                                                put("mime_type", mediaMimeType ?: "video/mp4")
+                                                put("file_uri", finalGeminiFileUri)
+                                            })
+                                        })
+                                        put(JSONObject().apply {
+                                            put("text", prompt)
+                                        })
+                                    })
+                                })
+                            })
+                        }
 
-                val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull())
+                        val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull())
 
-                val request = Request.Builder()
-                    .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$apiKey")
-                    .post(requestBody)
-                    .build()
+                        val request = Request.Builder()
+                            .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$apiKey")
+                            .post(requestBody)
+                            .build()
 
-                var success = false
-                var attempts = 0
-                val maxAttempts = 3
-                
-                while (!success && attempts < maxAttempts) {
-                    attempts++
-                    if (attempts > 1) {
-                        emit(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
-                        kotlinx.coroutines.delay(2000)
-                    }
-                    
-                    try {
-                        client.newCall(request).execute().use { response ->
-                            if (!response.isSuccessful) {
-                                emit(GenerationUpdate.ApiCallResult(false))
-                                if (attempts == maxAttempts) {
-                                    val errorBody = response.body?.string()
-                                    emit(GenerationUpdate.Log("API Error in Part ${i + 1}"))
-                                    emit(GenerationUpdate.ScriptChunk(i, "API Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody\n\n"))
-                                }
-                                return@use
+                        var success = false
+                        var attempts = 0
+                        val maxAttempts = 3
+                        
+                        while (!success && attempts < maxAttempts) {
+                            attempts++
+                            if (attempts > 1) {
+                                send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
+                                acquireRateLimitSlot()
                             }
-                            
-                            val responseString = response.body?.string() ?: ""
                             
                             try {
-                                val jsonArray = JSONArray(responseString)
-                                for (j in 0 until jsonArray.length()) {
-                                    val chunk = jsonArray.getJSONObject(j)
-                                    val candidates = chunk.optJSONArray("candidates")
-                                    if (candidates != null && candidates.length() > 0) {
-                                        val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
-                                        if (contentParts != null && contentParts.length() > 0) {
-                                            val text = contentParts.getJSONObject(0).optString("text", "")
-                                            emit(GenerationUpdate.ScriptChunk(i, text))
+                                client.newCall(request).execute().use { response ->
+                                    if (!response.isSuccessful) {
+                                        send(GenerationUpdate.ApiCallResult(false))
+                                        if (attempts == maxAttempts) {
+                                            val errorBody = response.body?.string()
+                                            send(GenerationUpdate.Log("API Error in Part ${i + 1}: ${response.code}"))
+                                            send(GenerationUpdate.ScriptChunk(i, "API Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody\n\n", isError = true))
                                         }
+                                        return@use
+                                    }
+                                    
+                                    val responseString = response.body?.string() ?: ""
+                                    
+                                    try {
+                                        val jsonArray = JSONArray(responseString)
+                                        val partTextBuilder = StringBuilder()
+                                        for (j in 0 until jsonArray.length()) {
+                                            val chunk = jsonArray.getJSONObject(j)
+                                            val candidates = chunk.optJSONArray("candidates")
+                                            if (candidates != null && candidates.length() > 0) {
+                                                val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
+                                                if (contentParts != null && contentParts.length() > 0) {
+                                                    val text = contentParts.getJSONObject(0).optString("text", "")
+                                                    partTextBuilder.append(text)
+                                                }
+                                            }
+                                        }
+                                        val resultText = partTextBuilder.toString()
+                                        if (resultText.isNotBlank()) {
+                                            send(GenerationUpdate.ScriptChunk(i, resultText))
+                                            success = true
+                                            send(GenerationUpdate.ApiCallResult(true))
+                                        } else {
+                                            throw Exception("Empty response candidate text")
+                                        }
+                                    } catch (e: Exception) {
+                                        send(GenerationUpdate.ApiCallResult(false))
+                                        if (attempts == maxAttempts) {
+                                            send(GenerationUpdate.Log("Error parsing output for Part ${i + 1}"))
+                                            send(GenerationUpdate.ScriptChunk(i, "Error parsing output for Part ${i + 1}: ${e.message}\nRaw Output: $responseString", isError = true))
+                                        }
+                                        return@use
                                     }
                                 }
-                                success = true
-                                emit(GenerationUpdate.ApiCallResult(true))
                             } catch (e: Exception) {
-                                emit(GenerationUpdate.ApiCallResult(false))
+                                send(GenerationUpdate.ApiCallResult(false))
                                 if (attempts == maxAttempts) {
-                                    emit(GenerationUpdate.Log("Error parsing output for Part ${i + 1}"))
-                                    emit(GenerationUpdate.ScriptChunk(i, "Error parsing output for Part ${i + 1}: ${e.message}\nRaw Output: $responseString"))
+                                    send(GenerationUpdate.Log("Network Error in Part ${i + 1}: ${e.message}"))
+                                    send(GenerationUpdate.ScriptChunk(i, "Network Error in Part ${i + 1}: ${e.message}\n\n", isError = true))
                                 }
-                                return@use
                             }
                         }
-                    } catch (e: Exception) {
-                        emit(GenerationUpdate.ApiCallResult(false))
-                        if (attempts == maxAttempts) {
-                            emit(GenerationUpdate.Log("Network Error in Part ${i + 1}"))
-                            emit(GenerationUpdate.ScriptChunk(i, "Network Error in Part ${i + 1}: ${e.message}\n\n"))
+                        
+                        val doneCount = completedCount.incrementAndGet()
+                        val currentProgress = 0.15f + (0.85f * (doneCount.toFloat() / maxOf(1, totalToProcess)))
+                        send(GenerationUpdate.Progress(currentProgress))
+
+                        if (success) {
+                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed successfully."))
+                        } else {
+                            failedParts.add(i)
+                            send(GenerationUpdate.Log("❌ Part ${i + 1} failed after $maxAttempts attempts."))
+                            send(GenerationUpdate.ScriptChunk(i, "\n[အပိုင်း (${i + 1}) အား ၃ ကြိမ်တိုင်တိုင် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။]\n", isError = true))
                         }
                     }
                 }
-                
-                if (success) {
-                    emit(GenerationUpdate.Log("[$targetEndPercent%] Segment ${i + 1}/$parts ($startStr - $endStr) completed."))
-                } else {
-                    failedParts.add(i)
-                    emit(GenerationUpdate.Log("[$targetEndPercent%] Segment ${i + 1} failed after 3 attempts. Will retry at the end."))
-                    emit(GenerationUpdate.ScriptChunk(i, "\n[အပိုင်း (${i + 1}) အား ၃ ကြိမ်တိုင်တိုင် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။ နောက်ဆုံးမှ ပြန်လည်ကြိုးစားပါမည်။]\n", isError = true))
-                    // Do not break; continue to the next part
-                }
-                
-                val currentProgress = targetEndPercent / 100f
-                emit(GenerationUpdate.Progress(currentProgress))
             }
             
             // Pass 2 & User Prompts: Retry failed parts
             var remainingFailedParts = failedParts.toList()
             
             while (remainingFailedParts.isNotEmpty()) {
-                emit(GenerationUpdate.Log("Retrying ${remainingFailedParts.size} failed segment(s)..."))
+                send(GenerationUpdate.Log("Retrying ${remainingFailedParts.size} failed segment(s)..."))
                 val newlyFailed = mutableListOf<Int>()
                 
                 for (i in remainingFailedParts) {
@@ -401,8 +442,8 @@ class GeminiApiClient(private val context: Context) {
                     val startStr = formatTime(startMs)
                     val endStr = formatTime(endMs)
                     
-                    emit(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts [$startStr - $endStr]..."))
-                    emit(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear error message
+                    send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts [$startStr - $endStr]..."))
+                    send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear error message
 
                     val timingConstraint = if (isVideo) {
                         """
@@ -472,18 +513,18 @@ class GeminiApiClient(private val context: Context) {
                     while (!success && attempts < maxAttempts) {
                         attempts++
                         if (attempts > 1) {
-                            emit(GenerationUpdate.Log("Final Retry Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
-                            kotlinx.coroutines.delay(2000)
+                            send(GenerationUpdate.Log("Final Retry Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
+                            delay(2000)
                         }
                         
                         try {
                             client.newCall(request).execute().use { response ->
                                 if (!response.isSuccessful) {
-                                    emit(GenerationUpdate.ApiCallResult(false))
+                                    send(GenerationUpdate.ApiCallResult(false))
                                     if (attempts == maxAttempts) {
                                         val errorBody = response.body?.string()
-                                        emit(GenerationUpdate.Log("Final Retry Error in Part ${i + 1}"))
-                                        emit(GenerationUpdate.ScriptChunk(i, "\n[Final Retry Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody]\n", isError = true))
+                                        send(GenerationUpdate.Log("Final Retry Error in Part ${i + 1}"))
+                                        send(GenerationUpdate.ScriptChunk(i, "\n[Final Retry Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody]\n", isError = true))
                                     }
                                     return@use
                                 }
@@ -499,26 +540,26 @@ class GeminiApiClient(private val context: Context) {
                                             val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
                                             if (contentParts != null && contentParts.length() > 0) {
                                                 val text = contentParts.getJSONObject(0).optString("text", "")
-                                                emit(GenerationUpdate.ScriptChunk(i, text))
+                                                send(GenerationUpdate.ScriptChunk(i, text))
                                             }
                                         }
                                     }
                                     success = true
-                                    emit(GenerationUpdate.ApiCallResult(true))
+                                    send(GenerationUpdate.ApiCallResult(true))
                                 } catch (e: Exception) {
-                                    emit(GenerationUpdate.ApiCallResult(false))
+                                    send(GenerationUpdate.ApiCallResult(false))
                                     if (attempts == maxAttempts) {
-                                        emit(GenerationUpdate.Log("Error parsing final output for Part ${i + 1}"))
-                                        emit(GenerationUpdate.ScriptChunk(i, "\n[Error parsing final output for Part ${i + 1}: ${e.message}]\n", isError = true))
+                                        send(GenerationUpdate.Log("Error parsing final output for Part ${i + 1}"))
+                                        send(GenerationUpdate.ScriptChunk(i, "\n[Error parsing final output for Part ${i + 1}: ${e.message}]\n", isError = true))
                                     }
                                     return@use
                                 }
                             }
                         } catch (e: Exception) {
-                            emit(GenerationUpdate.ApiCallResult(false))
+                            send(GenerationUpdate.ApiCallResult(false))
                             if (attempts == maxAttempts) {
-                                emit(GenerationUpdate.Log("Network Error in Final Retry Part ${i + 1}"))
-                                emit(GenerationUpdate.ScriptChunk(i, "\n[Network Error in Final Retry Part ${i + 1}: ${e.message}]\n", isError = true))
+                                send(GenerationUpdate.Log("Network Error in Final Retry Part ${i + 1}"))
+                                send(GenerationUpdate.ScriptChunk(i, "\n[Network Error in Final Retry Part ${i + 1}: ${e.message}]\n", isError = true))
                             }
                         }
                     }
@@ -532,14 +573,14 @@ class GeminiApiClient(private val context: Context) {
                 
                 if (remainingFailedParts.isNotEmpty()) {
                     if (retryDecisionChannel != null) {
-                        emit(GenerationUpdate.RequireRetryDecision(remainingFailedParts))
+                        send(GenerationUpdate.RequireRetryDecision(remainingFailedParts))
                         // Suspend and wait for user's decision from the UI
                         val shouldRetry = retryDecisionChannel.receive()
                         if (!shouldRetry) {
-                            emit(GenerationUpdate.Log("User chose to accept script with missing parts."))
+                            send(GenerationUpdate.Log("User chose to accept script with missing parts."))
                             break // Stop retrying, exit the loop
                         } else {
-                            emit(GenerationUpdate.Log("User requested another retry for failed parts."))
+                            send(GenerationUpdate.Log("User requested another retry for failed parts."))
                         }
                     } else {
                         break // No channel, just stop
@@ -547,13 +588,13 @@ class GeminiApiClient(private val context: Context) {
                 }
             }
 
-            emit(GenerationUpdate.Log("[100%] All script segments generated successfully!"))
-            emit(GenerationUpdate.Progress(1.0f))
-            emit(GenerationUpdate.Complete)
+            send(GenerationUpdate.Log("[100%] All script segments generated successfully!"))
+            send(GenerationUpdate.Progress(1.0f))
+            send(GenerationUpdate.Complete)
 
         } catch (e: Exception) {
-            emit(GenerationUpdate.Log("Exception: ${e.message}"))
-            emit(GenerationUpdate.Error(e.message ?: "Unknown error"))
+            send(GenerationUpdate.Log("Exception: ${e.message}"))
+            send(GenerationUpdate.Error(e.message ?: "Unknown error"))
             Log.e("GeminiApiClient", "Error", e)
         }
     }.flowOn(Dispatchers.IO)

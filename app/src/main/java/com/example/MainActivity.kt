@@ -97,6 +97,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
         val saved = sharedPrefs.getString("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
         mutableStateOf(if (modelKeys.contains(saved)) saved else "gemini-3.5-flash")
     }
+    var rpmSetting by remember { mutableFloatStateOf(sharedPrefs.getFloat("gemini_rpm", 20f)) }
 
     // Generation State
     var generatedScript by remember { mutableStateOf("") }
@@ -129,6 +130,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var selectedMediaMimeType by remember { mutableStateOf<String?>(null) }
     var selectedMediaName by remember { mutableStateOf("No file selected") }
     var selectedMediaDurationMs by remember { mutableStateOf(0L) }
+
+    // Persistent server-cached media state for current session
+    var cachedUploadedGeminiUri by remember { mutableStateOf<String?>(null) }
+    var cachedUploadedDurationMs by remember { mutableStateOf<Long?>(null) }
+    var cachedUploadedMimeType by remember { mutableStateOf<String?>(null) }
+    var cachedUploadedApiKey by remember { mutableStateOf<String?>(null) }
 
     val geminiApiClient = remember { GeminiApiClient(context) }
     
@@ -172,9 +179,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
             val activeTone = existingScript?.tone ?: selectedTone
             val activeLanguage = existingScript?.language ?: selectedLanguage
             
-            var savedGeminiFileUri = existingScript?.geminiFileUri
-            var savedMimeType = existingScript?.mimeType
+            var savedGeminiFileUri = existingScript?.geminiFileUri ?: if (cachedUploadedApiKey == apiKey) cachedUploadedGeminiUri else null
+            var savedMimeType = existingScript?.mimeType ?: if (cachedUploadedApiKey == apiKey && cachedUploadedMimeType != null) cachedUploadedMimeType else selectedMediaMimeType
             var savedDurationMs = (existingScript?.durationSec?.toLongOrNull() ?: 0L) * 1000
+            if (savedDurationMs <= 0L && cachedUploadedApiKey == apiKey && cachedUploadedDurationMs != null && cachedUploadedDurationMs!! > 0L) {
+                savedDurationMs = cachedUploadedDurationMs!!
+            }
             var savedPartsCount = existingScript?.partsCount ?: parts.toInt()
             
             var localTotalApiCalls = existingScript?.totalApiCalls ?: 0
@@ -209,7 +219,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 retryDecisionChannel = decisionChannel,
                 existingGeminiFileUri = savedGeminiFileUri,
                 existingDurationMs = if (savedDurationMs > 0) savedDurationMs else null,
-                specificPartsToGenerate = retryParts
+                specificPartsToGenerate = retryParts,
+                rpm = rpmSetting.toInt()
             ).collect { update ->
                 when (update) {
                     is GenerationUpdate.Log -> generationLogs.add(update.message)
@@ -218,6 +229,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         savedGeminiFileUri = update.geminiFileUri
                         savedMimeType = update.mimeType
                         savedDurationMs = update.durationMs
+                        cachedUploadedGeminiUri = update.geminiFileUri
+                        cachedUploadedDurationMs = update.durationMs
+                        cachedUploadedMimeType = update.mimeType
+                        cachedUploadedApiKey = apiKey
                     }
                     is GenerationUpdate.InitParts -> {
                         savedPartsCount = update.totalParts
@@ -316,6 +331,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            if (selectedMediaUri != uri) {
+                cachedUploadedGeminiUri = null
+                cachedUploadedDurationMs = null
+                cachedUploadedMimeType = null
+                cachedUploadedApiKey = null
+            }
             selectedMediaUri = uri
             selectedMediaMimeType = context.contentResolver.getType(uri)
             selectedMediaName = "Video selected"
@@ -335,6 +356,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
         if (uri != null) {
+            if (selectedMediaUri != uri) {
+                cachedUploadedGeminiUri = null
+                cachedUploadedDurationMs = null
+                cachedUploadedMimeType = null
+                cachedUploadedApiKey = null
+            }
             selectedMediaUri = uri
             selectedMediaMimeType = context.contentResolver.getType(uri)
             selectedMediaName = "Audio selected"
@@ -1021,7 +1048,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         title = "Number of parts the video",
                         value = localParts,
                         onValueChange = { localParts = it },
-                        valueRange = 1f..10f
+                        valueRange = 5f..50f
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     DropdownSection(
@@ -1149,6 +1176,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 sharedPrefs.edit().putString("gemini_model", newKey).apply()
             },
             models = modelOptions.map { it.second },
+            rpm = rpmSetting,
+            onRpmChange = { newRpm ->
+                rpmSetting = newRpm
+                sharedPrefs.edit().putFloat("gemini_rpm", newRpm).apply()
+            },
             onDismiss = { showSettings = false }
         )
     }
@@ -1359,6 +1391,8 @@ fun SettingsDialog(
     selectedModel: String,
     onModelSelected: (String) -> Unit,
     models: List<String>,
+    rpm: Float,
+    onRpmChange: (Float) -> Unit,
     onDismiss: () -> Unit
 ) {
     AlertDialog(
@@ -1368,6 +1402,7 @@ fun SettingsDialog(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
+                    .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
@@ -1385,6 +1420,45 @@ fun SettingsDialog(
                     selectedOption = selectedModel,
                     onOptionSelected = onModelSelected
                 )
+
+                Column {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Generation Speed (RPM)",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "${rpm.toInt()} RPM",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Slider(
+                        value = rpm,
+                        onValueChange = onRpmChange,
+                        valueRange = 4f..40f,
+                        steps = 35,
+                        colors = SliderDefaults.colors(
+                            thumbColor = MaterialTheme.colorScheme.primary,
+                            activeTrackColor = MaterialTheme.colorScheme.primary
+                        )
+                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text("Min: 4 (Safe)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Default: 20", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Text("Max: 40 (Fast)", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
             }
         },
         confirmButton = {

@@ -160,9 +160,31 @@ fun ProcessingBlock(
                     ) {
                         LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                             items(logs) { log ->
+                                val logColor = when {
+                                    // Failed / Error / Retrying / Exception (Red)
+                                    log.contains("error", ignoreCase = true) ||
+                                    log.contains("failed", ignoreCase = true) ||
+                                    log.contains("fail", ignoreCase = true) ||
+                                    log.contains("exception", ignoreCase = true) ||
+                                    log.contains("timeout", ignoreCase = true) ||
+                                    log.contains("retrying", ignoreCase = true) ||
+                                    log.contains("မအောင်မြင်", ignoreCase = true) ||
+                                    log.contains("ရပ်တန့်", ignoreCase = true) -> Color(0xFFFF5252) // Vibrant Red
+
+                                    // Successfully / Complete / Cached (Green)
+                                    log.contains("complete", ignoreCase = true) ||
+                                    log.contains("success", ignoreCase = true) ||
+                                    log.contains("cached", ignoreCase = true) ||
+                                    log.contains("အောင်မြင်", ignoreCase = true) ||
+                                    log.contains("ပြီးစီး", ignoreCase = true) -> Color(0xFF69F0AE) // Vibrant Light Green
+
+                                    // Working / In-progress / Indexing / Waiting / Default (Yellow)
+                                    else -> Color(0xFFFFEE58) // Bright Warm Yellow
+                                }
+
                                 Text(
                                     text = log,
-                                    color = Color.Green,
+                                    color = logColor,
                                     fontSize = 12.sp,
                                     fontFamily = FontFamily.Monospace,
                                     lineHeight = 16.sp
