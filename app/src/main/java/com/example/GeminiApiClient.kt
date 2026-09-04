@@ -333,6 +333,18 @@ class GeminiApiClient(private val context: Context) {
                                                 put("mime_type", mediaMimeType ?: "video/mp4")
                                                 put("file_uri", finalGeminiFileUri)
                                             })
+                                            if (isVideo) {
+                                                val startSec = startMs / 1000
+                                                val endSec = (endMs / 1000).coerceAtLeast(startSec + 1)
+                                                put("video_metadata", JSONObject().apply {
+                                                    put("start_offset", JSONObject().apply {
+                                                        put("seconds", startSec)
+                                                    })
+                                                    put("end_offset", JSONObject().apply {
+                                                        put("seconds", endSec)
+                                                    })
+                                                })
+                                            }
                                         })
                                         put(JSONObject().apply {
                                             put("text", prompt)
@@ -490,6 +502,18 @@ class GeminiApiClient(private val context: Context) {
                                             put("mime_type", mediaMimeType ?: "video/mp4")
                                             put("file_uri", finalGeminiFileUri)
                                         })
+                                        if (isVideo) {
+                                            val startSec = startMs / 1000
+                                            val endSec = (endMs / 1000).coerceAtLeast(startSec + 1)
+                                            put("video_metadata", JSONObject().apply {
+                                                put("start_offset", JSONObject().apply {
+                                                    put("seconds", startSec)
+                                                })
+                                                put("end_offset", JSONObject().apply {
+                                                    put("seconds", endSec)
+                                                })
+                                            })
+                                        }
                                     })
                                     put(JSONObject().apply {
                                         put("text", prompt)
