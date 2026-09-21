@@ -10,6 +10,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.channelFlow
 import kotlinx.coroutines.flow.flow
@@ -197,12 +199,12 @@ class GeminiApiClient(private val context: Context) {
             
             val povDetail = when {
                 pov.contains("Main Character", ignoreCase = true) || pov.contains("First", ignoreCase = true) -> 
-                    "အဓိကဇာတ်ကောင်၏ ရှုထောင့်အမြင် (First-Person POV / 'ကျွန်တော်/ကျွန်မ/ငါ') မှ ကိုယ်တိုင်ကြုံတွေ့နေရသကဲ့သို့ ခံစားချက်ပြင်းပြစွာ ပြောပြရမည်။"
+                    "အဓိကဇာတ်ကောင်၏ ရှုထောင့်အမြင် (First-Person POV / 'ကျွန်တော်/ကျွန်မ/ငါ') မှ ကိုယ်တိုင်ကြုံတွေ့နေရသကဲ့သို့ စကားပြောသဘာဝအတိုင်း ခံစားချက်ပြင်းပြစွာ ပြန်ပြောပြရမည်။ (စာအရေးအသားပုံစံ လုံးဝမသုံးဘဲ ကိုယ်တွေ့ပြောစကားအတိုင်း ပြောပြရမည်။)"
                 pov.contains("Third", ignoreCase = true) || pov.contains("Omniscient", ignoreCase = true) -> 
-                    "ပြင်ပဇာတ်ကြောင်းပြောသူအမြင် (Third-Person / Omniscient Narrator) မှ 'သူ'၊ 'သူမ'၊ 'သူတို့' စသည်ဖြင့် အရာအားလုံးကို ခြုံငုံသိမြင်နေသော ပုံစံဖြင့် ဇာတ်ကြောင်းပြောပြရမည်။"
+                    "ပြင်ပဇာတ်ကြောင်းပြောသူအမြင် (Third-Person / Omniscient Narrator) မှ 'သူ'၊ 'သူမ'၊ 'သူတို့' စသည်ဖြင့် အရာအားလုံးကို ခြုံငုံသိမြင်နေသော ပုံစံဖြင့် မိတ်ဆွေတစ်ယောက်ကို ဇာတ်လမ်းပြန်ပြောပြနေသလို စကားပြောသဘာဝအတိုင်း ဇာတ်ကြောင်းပြောပြရမည်။ (စာအရေးအသားပုံစံ လုံးဝမသုံးရ။)"
                 pov.contains("Second", ignoreCase = true) -> 
-                    "ကြည့်ရှုသူ/နားဆင်သူအား တိုက်ရိုက်ပြောဆိုသော အမြင် (Second-Person POV / 'မင်း/ခင်ဗျား/သင်') ဖြင့် စိတ်ဝင်စားဖွယ် ပြောပြရမည်။"
-                else -> "$pov ရှုထောင့်အမြင်အတိုင်း ဇာတ်ကြောင်းပြောပြရမည်။"
+                    "ကြည့်ရှုသူ/နားဆင်သူအား တိုက်ရိုက်ပြောဆိုသော အမြင် (Second-Person POV / 'မင်း/ခင်ဗျား/သင်') ဖြင့် စကားပြောသဘာဝအတိုင်း စိတ်ဝင်စားဖွယ် ပြောပြရမည်။ (စာအရေးအသားပုံစံ လုံးဝမသုံးရ။)"
+                else -> "$pov ရှုထောင့်အမြင်အတိုင်း စကားပြောသဘာဝအတိုင်း ဇာတ်ကြောင်းပြောပြရမည်။"
             }
 
             val toneDetail = "$tone (ရွေးချယ်ထားသော '$tone' လေသံအတိုင်း နားထောင်သူ စိတ်ဝင်စားအောင် ရေးသားပါ)"
@@ -222,9 +224,16 @@ class GeminiApiClient(private val context: Context) {
 
             val languageConstraint = if (language == "Myanmar") {
                 """
-                |မြန်မာဘာသာအတွက် အင်္ဂလိပ်စာလုံး လုံးဝမပါစေရန်နှင့် Transliteration လုပ်ရန်။ 
-                |ကိန်းဂဏန်းများကို စာလုံးပေါင်း၍ဖော်ပြရန် (ဥပမာ - 1 အစား 'တစ်'၊ 100 အစား 'တစ်ရာ'၊ 786 အစား 'ခုနှစ်ရာ ရှစ်ဆယ့်ခြောက်'၊ 3545 အစား 'သုံးထောင့်ငါးရာလေးဆယ့်ငါး')။
-                |ဇာတ်လမ်းကို မူရင်းအစီအစဉ်အတိုင်း (Chronological Sequence) အတိအကျ ရေးသားရန်။
+                |၁။ စကားပြောပုံစံ စည်းကမ်း (Spoken Burmese): မြန်မာစာပေသုံး စာအရေးအသားပုံစံ (Formal Written/Literary Style) ကို လုံးဝ (လုံးဝ) မသုံးရ။ လူအချင်းချင်း စိတ်ဝင်စားဖွယ် ဇာတ်လမ်းပြန်ပြောပြနေသော သဘာဝကျသည့် လူပြောစကား/စကားပြောပုံစံ (Conversational Spoken Voiceover Style) ဖြင့်သာ ရေးသားရမည်။
+                |- ဝါကျအဆုံးတွင် 'သည်' ကို လုံးဝမသုံးရ -> 'တယ် / ခဲ့တယ် / သွားတယ် / ဖြစ်သွားတယ်' သာ သုံးရမည်။
+                |- '၏' ကို လုံးဝမသုံးရ -> 'ရဲ့' သာ သုံးရမည်။
+                |- '၌' ကို လုံးဝမသုံးရ -> 'မှာ' သာ သုံးရမည်။
+                |- '၍' သို့မဟုတ် 'ပြီးနောက်' ကို လုံးဝမသုံးရ -> 'ပြီးတော့ / အဲ့ဒီနောက်' သာ သုံးရမည်။
+                |- 'သောကြောင့်' သို့မဟုတ် 'သဖြင့်' ကို လုံးဝမသုံးရ -> 'မို့လို့ / ကြောင့်' သာ သုံးရမည်။
+                |- 'လျက်' ကို လုံးဝမသုံးရ -> 'ရင်းနဲ့ / နေတုန်း' သာ သုံးရမည်။
+                |၂။ မြန်မာဘာသာအတွက် အင်္ဂလိပ်စာလုံး လုံးဝမပါစေရန်နှင့် Transliteration လုပ်ရန်။ 
+                |၃။ ကိန်းဂဏန်းများကို စာလုံးပေါင်း၍ဖော်ပြရန် (ဥပမာ - 1 အစား 'တစ်'၊ 100 အစား 'တစ်ရာ'၊ 786 အစား 'ခုနှစ်ရာ ရှစ်ဆယ့်ခြောက်'၊ 3545 အစား 'သုံးထောင့်ငါးရာလေးဆယ့်ငါး')။
+                |၄။ ဇာတ်လမ်းကို မူရင်းအစီအစဉ်အတိုင်း (Chronological Sequence) အတိအကျ ရေးသားရန်။
                 """.trimMargin()
             } else {
                 """
@@ -245,26 +254,45 @@ class GeminiApiClient(private val context: Context) {
 
             send(GenerationUpdate.Log("Starting generation with $rpm RPM (Pipelined Parallel mode)..."))
 
-            // Rate limiter: sliding window of timestamps (ms)
-            val requestTimestamps = java.util.Collections.synchronizedList(mutableListOf<Long>())
+            // Rate limiter: sliding window + strict minimum interval between ANY two requests
+            val rateLimitMutex = Mutex()
+            var lastRequestTimeMs = 0L
+            val requestTimestamps = mutableListOf<Long>()
             val minDelayBetweenRequestsMs = (60_000L / maxOf(1, rpm))
 
             suspend fun acquireRateLimitSlot() {
-                while (true) {
-                    val now = System.currentTimeMillis()
-                    // Remove timestamps older than 60 seconds
-                    val size = synchronized(requestTimestamps) {
+                rateLimitMutex.withLock {
+                    while (true) {
+                        val now = System.currentTimeMillis()
+                        // 1. Remove timestamps older than 60 seconds
                         requestTimestamps.removeAll { now - it >= 60_000L }
-                        if (requestTimestamps.size < rpm) {
-                            requestTimestamps.add(now)
-                            return
+
+                        // 2. Strict minimum spacing between any two consecutive requests
+                        val timeSinceLast = now - lastRequestTimeMs
+                        val intervalWait = if (lastRequestTimeMs > 0 && timeSinceLast < minDelayBetweenRequestsMs) {
+                            minDelayBetweenRequestsMs - timeSinceLast
+                        } else {
+                            0L
                         }
-                        requestTimestamps.size
+
+                        // 3. Sliding window: wait until oldest request exits the 60-second window
+                        val windowWait = if (requestTimestamps.size >= rpm) {
+                            val oldest = requestTimestamps.firstOrNull() ?: now
+                            maxOf(100L, 60_000L - (now - oldest) + 50L)
+                        } else {
+                            0L
+                        }
+
+                        val waitTime = maxOf(intervalWait, windowWait)
+                        if (waitTime <= 0L) {
+                            val currentTime = System.currentTimeMillis()
+                            requestTimestamps.add(currentTime)
+                            lastRequestTimeMs = currentTime
+                            return@withLock
+                        }
+
+                        delay(waitTime)
                     }
-                    // If full, wait for the oldest timestamp to exit the 60s window
-                    val oldest = synchronized(requestTimestamps) { requestTimestamps.firstOrNull() } ?: now
-                    val waitTime = maxOf(100L, 60_000L - (now - oldest) + 50L)
-                    delay(waitTime)
                 }
             }
 
@@ -279,14 +307,6 @@ class GeminiApiClient(private val context: Context) {
                     send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
 
                     launch {
-                        // Delay between initiating requests according to RPM
-                        if (index > 0) {
-                            delay(index * minDelayBetweenRequestsMs)
-                        }
-
-                        acquireRateLimitSlot()
-
-                        send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr) to AI..."))
 
                         val timingConstraint = if (isVideo) {
                             """
@@ -311,7 +331,7 @@ class GeminiApiClient(private val context: Context) {
                             2. Narrator POV: $povDetail
                             3. Script Tone: $toneDetail
                             4. Length Constraint: $lengthInstruction
-                            5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
+                            5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
                             6. Timing & Context: $timingConstraint
                             7. Language Constraints: $languageConstraint
                         """.trimIndent()
@@ -369,8 +389,10 @@ class GeminiApiClient(private val context: Context) {
                             attempts++
                             if (attempts > 1) {
                                 send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
-                                acquireRateLimitSlot()
                             }
+                            
+                            acquireRateLimitSlot()
+                            send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""} to AI..."))
                             
                             try {
                                 client.newCall(request).execute().use { response ->
@@ -480,7 +502,7 @@ class GeminiApiClient(private val context: Context) {
                         2. Narrator POV: $povDetail
                         3. Script Tone: $toneDetail
                         4. Length Constraint: $lengthInstruction
-                        5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။
+                        5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
                         6. Timing & Context: $timingConstraint
                         7. Language Constraints: $languageConstraint
                     """.trimIndent()
@@ -538,8 +560,10 @@ class GeminiApiClient(private val context: Context) {
                         attempts++
                         if (attempts > 1) {
                             send(GenerationUpdate.Log("Final Retry Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
-                            delay(2000)
                         }
+                        
+                        acquireRateLimitSlot()
+                        send(GenerationUpdate.Log("🚀 Sending Final Retry Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Attempt $attempts]" else ""} to AI..."))
                         
                         try {
                             client.newCall(request).execute().use { response ->

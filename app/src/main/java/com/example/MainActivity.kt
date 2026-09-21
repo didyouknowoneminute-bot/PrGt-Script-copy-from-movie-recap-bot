@@ -56,6 +56,31 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+private fun getMediaFileName(context: android.content.Context, uri: Uri, fallback: String): String {
+    var name: String? = null
+    try {
+        if (uri.scheme == "content") {
+            context.contentResolver.query(uri, arrayOf(android.provider.OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val index = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                    if (index != -1) {
+                        name = cursor.getString(index)
+                    }
+                }
+            }
+        }
+    } catch (e: Exception) {
+        // ignore and fallback
+    }
+    if (name.isNullOrBlank()) {
+        name = uri.lastPathSegment?.let { segment ->
+            val cut = segment.lastIndexOf('/')
+            if (cut != -1) segment.substring(cut + 1) else segment
+        }
+    }
+    return if (!name.isNullOrBlank()) name else fallback
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(modifier: Modifier = Modifier) {
@@ -339,7 +364,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
             }
             selectedMediaUri = uri
             selectedMediaMimeType = context.contentResolver.getType(uri)
-            selectedMediaName = "Video selected"
+            selectedMediaName = getMediaFileName(context, uri, "Video selected")
             try {
                 val retriever = android.media.MediaMetadataRetriever()
                 retriever.setDataSource(context, uri)
@@ -364,7 +389,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
             }
             selectedMediaUri = uri
             selectedMediaMimeType = context.contentResolver.getType(uri)
-            selectedMediaName = "Audio selected"
+            selectedMediaName = getMediaFileName(context, uri, "Audio selected")
             try {
                 val retriever = android.media.MediaMetadataRetriever()
                 retriever.setDataSource(context, uri)
