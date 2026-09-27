@@ -10,6 +10,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.flow.Flow
@@ -36,7 +37,17 @@ sealed class GenerationUpdate {
     data class RequireRetryDecision(val failedParts: List<Int>) : GenerationUpdate()
     data class FileInfo(val geminiFileUri: String, val mimeType: String, val durationMs: Long) : GenerationUpdate()
     data class Error(val message: String) : GenerationUpdate()
-    data class ApiCallResult(val success: Boolean) : GenerationUpdate()
+    data class ApiCallResult(
+        val success: Boolean,
+        val isSpare: Boolean = false,
+        val mainTotal: Int = 0,
+        val mainSuccess: Int = 0,
+        val mainFailed: Int = 0,
+        val spareTotal: Int = 0,
+        val spareSuccess: Int = 0,
+        val spareFailed: Int = 0,
+        val usedSpareKey: Boolean = false
+    ) : GenerationUpdate()
     object Complete : GenerationUpdate()
 }
 
@@ -69,6 +80,9 @@ class GeminiApiClient(private val context: Context) {
 
     suspend fun generateRecapScript(
         apiKey: String,
+        spareApiKey: String = "",
+        rpdEnabled: Boolean = false,
+        rpdLimit: Int = 20,
         modelName: String,
         partsCount: Float,
         length: String,
@@ -248,7 +262,9 @@ class GeminiApiClient(private val context: Context) {
 
             // Track failed parts and completed parts
             val failedParts = java.util.Collections.synchronizedList(mutableListOf<Int>())
-            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val successfulCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val failedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val workingCount = java.util.concurrent.atomic.AtomicInteger(0)
             val partsToProcess = (0 until parts).filter { specificPartsToGenerate == null || specificPartsToGenerate.contains(it) }
             val totalToProcess = partsToProcess.size
 
@@ -296,17 +312,128 @@ class GeminiApiClient(private val context: Context) {
                 }
             }
 
+            // Key and RPD state management
+            val keyMutex = Mutex()
+            var activeApiKey = apiKey
+            var activeGeminiFileUri = finalGeminiFileUri
+            var mainTotalCalls = 0
+            var mainSuccessCalls = 0
+            var mainFailedCalls = 0
+            var spareTotalCalls = 0
+            var spareSuccessCalls = 0
+            var spareFailedCalls = 0
+            var hasSwitchedToSpare = false
+            var isSpareMediaUploaded = false
+
+            suspend fun getOrSwitchKeyAndFile(): Triple<String, String, Boolean> {
+                return keyMutex.withLock {
+                    if (rpdEnabled && !hasSwitchedToSpare && mainTotalCalls >= rpdLimit) {
+                        if (spareApiKey.isNotBlank()) {
+                            send(GenerationUpdate.Log("⚠️ Main API Key RPD limit ($rpdLimit) ပြည့်သွားပါပြီ (Total: $mainTotalCalls, Success: $mainSuccessCalls, Failed: $mainFailedCalls)။"))
+                            send(GenerationUpdate.Log("🔄 Spare API Key သို့ ပြောင်းလဲအသုံးပြုနေပါသည်..."))
+                            
+                            if (!isSpareMediaUploaded && mediaUri != null) {
+                                send(GenerationUpdate.Log("📤 Spare API Key ဖြင့် Media ဖိုင်အား ဆာဗာသို့ ပြန်လည် Upload တင်နေပါသည်..."))
+                                val uploadResult = uploadFile(spareApiKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
+                                val spareFileUriInfo = when (uploadResult) {
+                                    is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
+                                    is UploadResult.Failure -> {
+                                        send(GenerationUpdate.Error("Spare API Key ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
+                                        throw Exception("Spare API Key upload failed: ${uploadResult.errorDetail}")
+                                    }
+                                }
+                                
+                                if (mediaMimeType?.startsWith("video") == true) {
+                                    send(GenerationUpdate.Log("[Spare Key] Waiting for Gemini server to process video..."))
+                                    var isActive = false
+                                    while (!isActive) {
+                                        val state = checkFileState(spareApiKey, spareFileUriInfo.second)
+                                        if (state == "ACTIVE") {
+                                            isActive = true
+                                        } else if (state == "FAILED") {
+                                            send(GenerationUpdate.Error("Gemini server failed to process video with Spare API Key."))
+                                            throw Exception("Gemini server failed to process video with Spare API Key")
+                                        } else {
+                                            delay(3000)
+                                        }
+                                    }
+                                }
+                                activeGeminiFileUri = spareFileUriInfo.first
+                                isSpareMediaUploaded = true
+                                send(GenerationUpdate.Log("✅ Spare API Key ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
+                            }
+                            
+                            activeApiKey = spareApiKey
+                            hasSwitchedToSpare = true
+                            send(GenerationUpdate.Log("🚀 ကျန်ရှိသော Script အပိုင်းများကို Spare API Key ဖြင့် ဆက်လက်ထုတ်လုပ်ပါမည်။"))
+                        } else {
+                            send(GenerationUpdate.Log("⚠️ Main API Key RPD limit ($rpdLimit) ပြည့်သွားသော်လည်း Spare API Key ထည့်သွင်းထားခြင်း မရှိပါ။ Settings တွင် Spare API Key ထည့်သွင်းပေးပါ။"))
+                        }
+                    }
+                    Triple(activeApiKey, activeGeminiFileUri, hasSwitchedToSpare)
+                }
+            }
+
+            suspend fun recordCallOutcome(isSpare: Boolean, success: Boolean) {
+                keyMutex.withLock {
+                    if (!isSpare) {
+                        mainTotalCalls++
+                        if (success) mainSuccessCalls++ else mainFailedCalls++
+                    } else {
+                        spareTotalCalls++
+                        if (success) spareSuccessCalls++ else spareFailedCalls++
+                    }
+                    val currentRpdTotal = mainTotalCalls + spareTotalCalls
+                    if (rpdEnabled) {
+                        val keyName = if (isSpare) "Spare Key" else "Main Key"
+                        val countOnKey = if (isSpare) spareTotalCalls else mainTotalCalls
+                        send(GenerationUpdate.Log("ℹ️ RPD [$keyName]: Request #$countOnKey/$rpdLimit (Total RPD: $currentRpdTotal, Success: ${mainSuccessCalls + spareSuccessCalls}, Failed: ${mainFailedCalls + spareFailedCalls})"))
+                    }
+                    send(GenerationUpdate.ApiCallResult(
+                        success = success,
+                        isSpare = isSpare,
+                        mainTotal = mainTotalCalls,
+                        mainSuccess = mainSuccessCalls,
+                        mainFailed = mainFailedCalls,
+                        spareTotal = spareTotalCalls,
+                        spareSuccess = spareSuccessCalls,
+                        spareFailed = spareFailedCalls,
+                        usedSpareKey = hasSwitchedToSpare
+                    ))
+                }
+            }
+
+            var remainingFailedParts = listOf<Int>()
             coroutineScope {
-                partsToProcess.forEachIndexed { index, i ->
-                    val startMs = i * segmentDurationMs
-                    val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
-                    val startStr = formatTime(startMs)
-                    val endStr = formatTime(endMs)
+                val statusTimerJob = launch {
+                    var minute = 1
+                    while (isActive) {
+                        delay(60_000L)
+                        val success = successfulCount.get()
+                        val failed = failedCount.get()
+                        val working = workingCount.get().coerceAtLeast(0)
+                        val pending = (totalToProcess - (success + failed + working)).coerceAtLeast(0)
+                        val remaining = (totalToProcess - success).coerceAtLeast(0)
+                        val timeLabel = String.format(java.util.Locale.US, "%02d:00", minute)
+                        send(GenerationUpdate.Log("📊 [Status $timeLabel] Success: $success | Failed: $failed | Working: $working | Pending: $pending | Remaining: $remaining (Total: $totalToProcess)"))
+                        minute++
+                    }
+                }
 
-                    send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true))
-                    send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
+                try {
+                    coroutineScope {
+                        partsToProcess.forEachIndexed { index, i ->
+                            val startMs = i * segmentDurationMs
+                            val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
+                            val startStr = formatTime(startMs)
+                            val endStr = formatTime(endMs)
 
-                    launch {
+                            send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true))
+                            send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
+
+                            launch {
+                                workingCount.incrementAndGet()
+                                try {
 
                         val timingConstraint = if (isVideo) {
                             """
@@ -374,13 +501,6 @@ class GeminiApiClient(private val context: Context) {
                             })
                         }
 
-                        val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull())
-
-                        val request = Request.Builder()
-                            .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$apiKey")
-                            .post(requestBody)
-                            .build()
-
                         var success = false
                         var attempts = 0
                         val maxAttempts = 3
@@ -392,15 +512,33 @@ class GeminiApiClient(private val context: Context) {
                             }
                             
                             acquireRateLimitSlot()
-                            send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""} to AI..."))
+                            
+                            val (callApiKey, callFileUri, isSpareCall) = getOrSwitchKeyAndFile()
+                            val keyLabel = if (isSpareCall) " [Spare Key]" else ""
+                            send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""}$keyLabel to AI..."))
+                            
+                            val requestBody = createSegmentRequestBody(
+                                systemInstruction = systemInstruction,
+                                prompt = prompt,
+                                mediaMimeType = mediaMimeType,
+                                fileUri = callFileUri,
+                                isVideo = isVideo,
+                                startMs = startMs,
+                                endMs = endMs
+                            )
+                            val request = Request.Builder()
+                                .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$callApiKey")
+                                .post(requestBody)
+                                .build()
                             
                             try {
                                 client.newCall(request).execute().use { response ->
                                     if (!response.isSuccessful) {
-                                        send(GenerationUpdate.ApiCallResult(false))
+                                        recordCallOutcome(isSpareCall, false)
+                                        val errorBody = response.body?.string() ?: ""
+                                        val errorDetail = extractApiErrorMessage(response.code, response.message, errorBody)
+                                        send(GenerationUpdate.Log("❌ Part ${i + 1} (Attempt $attempts/$maxAttempts) Failed: HTTP ${response.code} - $errorDetail"))
                                         if (attempts == maxAttempts) {
-                                            val errorBody = response.body?.string()
-                                            send(GenerationUpdate.Log("API Error in Part ${i + 1}: ${response.code}"))
                                             send(GenerationUpdate.ScriptChunk(i, "API Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody\n\n", isError = true))
                                         }
                                         return@use
@@ -426,58 +564,66 @@ class GeminiApiClient(private val context: Context) {
                                         if (resultText.isNotBlank()) {
                                             send(GenerationUpdate.ScriptChunk(i, resultText))
                                             success = true
-                                            send(GenerationUpdate.ApiCallResult(true))
+                                            recordCallOutcome(isSpareCall, true)
                                         } else {
                                             throw Exception("Empty response candidate text")
                                         }
                                     } catch (e: Exception) {
-                                        send(GenerationUpdate.ApiCallResult(false))
+                                        recordCallOutcome(isSpareCall, false)
+                                        send(GenerationUpdate.Log("❌ Part ${i + 1} (Attempt $attempts/$maxAttempts) Parsing Error: ${e.message ?: "Unknown parse error"}"))
                                         if (attempts == maxAttempts) {
-                                            send(GenerationUpdate.Log("Error parsing output for Part ${i + 1}"))
                                             send(GenerationUpdate.ScriptChunk(i, "Error parsing output for Part ${i + 1}: ${e.message}\nRaw Output: $responseString", isError = true))
                                         }
                                         return@use
                                     }
                                 }
                             } catch (e: Exception) {
-                                send(GenerationUpdate.ApiCallResult(false))
+                                recordCallOutcome(isSpareCall, false)
+                                send(GenerationUpdate.Log("❌ Part ${i + 1} (Attempt $attempts/$maxAttempts) Network Error: ${e.javaClass.simpleName} - ${e.message ?: "Connection failed"}"))
                                 if (attempts == maxAttempts) {
-                                    send(GenerationUpdate.Log("Network Error in Part ${i + 1}: ${e.message}"))
                                     send(GenerationUpdate.ScriptChunk(i, "Network Error in Part ${i + 1}: ${e.message}\n\n", isError = true))
                                 }
                             }
                         }
                         
-                        val doneCount = completedCount.incrementAndGet()
-                        val currentProgress = 0.15f + (0.85f * (doneCount.toFloat() / maxOf(1, totalToProcess)))
-                        send(GenerationUpdate.Progress(currentProgress))
-
                         if (success) {
+                            val currentSuccess = successfulCount.incrementAndGet()
+                            val currentProgress = 0.15f + (0.85f * (currentSuccess.toFloat() / maxOf(1, totalToProcess)))
+                            send(GenerationUpdate.Progress(currentProgress))
                             send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed successfully."))
                         } else {
+                            failedCount.incrementAndGet()
                             failedParts.add(i)
                             send(GenerationUpdate.Log("❌ Part ${i + 1} failed after $maxAttempts attempts."))
                             send(GenerationUpdate.ScriptChunk(i, "\n[အပိုင်း (${i + 1}) အား ၃ ကြိမ်တိုင်တိုင် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။]\n", isError = true))
                         }
+                    } finally {
+                        workingCount.decrementAndGet()
                     }
                 }
             }
+        }
+        
+        // Pass 2 & User Prompts: Retry failed parts
+        remainingFailedParts = failedParts.toList()
+        
+        while (remainingFailedParts.isNotEmpty()) {
+            send(GenerationUpdate.Log("Retrying ${remainingFailedParts.size} failed segment(s)..."))
+            val newlyFailed = mutableListOf<Int>()
             
-            // Pass 2 & User Prompts: Retry failed parts
-            var remainingFailedParts = failedParts.toList()
-            
-            while (remainingFailedParts.isNotEmpty()) {
-                send(GenerationUpdate.Log("Retrying ${remainingFailedParts.size} failed segment(s)..."))
-                val newlyFailed = mutableListOf<Int>()
+            for (i in remainingFailedParts) {
+                val startMs = i * segmentDurationMs
+                val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
+                val startStr = formatTime(startMs)
+                val endStr = formatTime(endMs)
                 
-                for (i in remainingFailedParts) {
-                    val startMs = i * segmentDurationMs
-                    val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
-                    val startStr = formatTime(startMs)
-                    val endStr = formatTime(endMs)
-                    
-                    send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts [$startStr - $endStr]..."))
-                    send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear error message
+                send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts [$startStr - $endStr]..."))
+                send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear error message
+
+                workingCount.incrementAndGet()
+                failedCount.decrementAndGet()
+                var success = false
+                try {
 
                     val timingConstraint = if (isVideo) {
                         """
@@ -545,14 +691,7 @@ class GeminiApiClient(private val context: Context) {
                         })
                     }
 
-                    val requestBody = jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull())
-
-                    val request = Request.Builder()
-                        .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$apiKey")
-                        .post(requestBody)
-                        .build()
-
-                    var success = false
+                    success = false
                     var attempts = 0
                     val maxAttempts = 3
                     
@@ -563,15 +702,33 @@ class GeminiApiClient(private val context: Context) {
                         }
                         
                         acquireRateLimitSlot()
-                        send(GenerationUpdate.Log("🚀 Sending Final Retry Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Attempt $attempts]" else ""} to AI..."))
+                        
+                        val (callApiKey, callFileUri, isSpareCall) = getOrSwitchKeyAndFile()
+                        val keyLabel = if (isSpareCall) " [Spare Key]" else ""
+                        send(GenerationUpdate.Log("🚀 Sending Final Retry Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Attempt $attempts]" else ""}$keyLabel to AI..."))
+                        
+                        val requestBody = createSegmentRequestBody(
+                            systemInstruction = systemInstruction,
+                            prompt = prompt,
+                            mediaMimeType = mediaMimeType,
+                            fileUri = callFileUri,
+                            isVideo = isVideo,
+                            startMs = startMs,
+                            endMs = endMs
+                        )
+                        val request = Request.Builder()
+                            .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$callApiKey")
+                            .post(requestBody)
+                            .build()
                         
                         try {
                             client.newCall(request).execute().use { response ->
                                 if (!response.isSuccessful) {
-                                    send(GenerationUpdate.ApiCallResult(false))
+                                    recordCallOutcome(isSpareCall, false)
+                                    val errorBody = response.body?.string() ?: ""
+                                    val errorDetail = extractApiErrorMessage(response.code, response.message, errorBody)
+                                    send(GenerationUpdate.Log("❌ Final Retry Part ${i + 1} (Attempt $attempts/$maxAttempts) Failed: HTTP ${response.code} - $errorDetail"))
                                     if (attempts == maxAttempts) {
-                                        val errorBody = response.body?.string()
-                                        send(GenerationUpdate.Log("Final Retry Error in Part ${i + 1}"))
                                         send(GenerationUpdate.ScriptChunk(i, "\n[Final Retry Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody]\n", isError = true))
                                     }
                                     return@use
@@ -581,6 +738,7 @@ class GeminiApiClient(private val context: Context) {
                                 
                                 try {
                                     val jsonArray = JSONArray(responseString)
+                                    val partTextBuilder = StringBuilder()
                                     for (j in 0 until jsonArray.length()) {
                                         val chunk = jsonArray.getJSONObject(j)
                                         val candidates = chunk.optJSONArray("candidates")
@@ -588,31 +746,46 @@ class GeminiApiClient(private val context: Context) {
                                             val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
                                             if (contentParts != null && contentParts.length() > 0) {
                                                 val text = contentParts.getJSONObject(0).optString("text", "")
-                                                send(GenerationUpdate.ScriptChunk(i, text))
+                                                partTextBuilder.append(text)
                                             }
                                         }
                                     }
-                                    success = true
-                                    send(GenerationUpdate.ApiCallResult(true))
+                                    val resultText = partTextBuilder.toString()
+                                    if (resultText.isNotBlank()) {
+                                        send(GenerationUpdate.ScriptChunk(i, resultText))
+                                        success = true
+                                        recordCallOutcome(isSpareCall, true)
+                                    } else {
+                                        throw Exception("Empty response candidate text")
+                                    }
                                 } catch (e: Exception) {
-                                    send(GenerationUpdate.ApiCallResult(false))
+                                    recordCallOutcome(isSpareCall, false)
+                                    send(GenerationUpdate.Log("❌ Final Retry Part ${i + 1} (Attempt $attempts/$maxAttempts) Parsing Error: ${e.message ?: "Unknown parse error"}"))
                                     if (attempts == maxAttempts) {
-                                        send(GenerationUpdate.Log("Error parsing final output for Part ${i + 1}"))
                                         send(GenerationUpdate.ScriptChunk(i, "\n[Error parsing final output for Part ${i + 1}: ${e.message}]\n", isError = true))
                                     }
                                     return@use
                                 }
                             }
                         } catch (e: Exception) {
-                            send(GenerationUpdate.ApiCallResult(false))
+                            recordCallOutcome(isSpareCall, false)
+                            send(GenerationUpdate.Log("❌ Final Retry Part ${i + 1} (Attempt $attempts/$maxAttempts) Network Error: ${e.javaClass.simpleName} - ${e.message ?: "Connection failed"}"))
                             if (attempts == maxAttempts) {
-                                send(GenerationUpdate.Log("Network Error in Final Retry Part ${i + 1}"))
                                 send(GenerationUpdate.ScriptChunk(i, "\n[Network Error in Final Retry Part ${i + 1}: ${e.message}]\n", isError = true))
                             }
                         }
                     }
+                } finally {
+                    workingCount.decrementAndGet()
+                }
                     
-                    if (!success) {
+                    if (success) {
+                        val currentSuccess = successfulCount.incrementAndGet()
+                        val currentProgress = 0.15f + (0.85f * (currentSuccess.toFloat() / maxOf(1, totalToProcess)))
+                        send(GenerationUpdate.Progress(currentProgress))
+                        send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts [$startStr - $endStr] recovered successfully."))
+                    } else {
+                        failedCount.incrementAndGet()
                         newlyFailed.add(i)
                     }
                 }
@@ -635,9 +808,18 @@ class GeminiApiClient(private val context: Context) {
                     }
                 }
             }
+        } finally {
+            statusTimerJob.cancel()
+        }
+    }
 
-            send(GenerationUpdate.Log("[100%] All script segments generated successfully!"))
-            send(GenerationUpdate.Progress(1.0f))
+            if (remainingFailedParts.isEmpty() && successfulCount.get() >= totalToProcess) {
+                send(GenerationUpdate.Log("[100%] All script segments generated successfully!"))
+                send(GenerationUpdate.Progress(1.0f))
+            } else {
+                val finalPct = ((0.15f + (0.85f * (successfulCount.get().toFloat() / maxOf(1, totalToProcess)))) * 100).toInt()
+                send(GenerationUpdate.Log("[$finalPct%] Script generation finished with ${remainingFailedParts.size} incomplete part(s)."))
+            }
             send(GenerationUpdate.Complete)
 
         } catch (e: Exception) {
@@ -646,6 +828,71 @@ class GeminiApiClient(private val context: Context) {
             Log.e("GeminiApiClient", "Error", e)
         }
     }.flowOn(Dispatchers.IO)
+
+    private fun createSegmentRequestBody(
+        systemInstruction: String,
+        prompt: String,
+        mediaMimeType: String?,
+        fileUri: String,
+        isVideo: Boolean,
+        startMs: Long,
+        endMs: Long
+    ): RequestBody {
+        val jsonBody = JSONObject().apply {
+            put("system_instruction", JSONObject().apply {
+                put("parts", JSONArray().apply {
+                    put(JSONObject().apply { put("text", systemInstruction) })
+                })
+            })
+            put("contents", JSONArray().apply {
+                put(JSONObject().apply {
+                    put("role", "user")
+                    put("parts", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("file_data", JSONObject().apply {
+                                put("mime_type", mediaMimeType ?: "video/mp4")
+                                put("file_uri", fileUri)
+                            })
+                            if (isVideo) {
+                                val startSec = startMs / 1000
+                                val endSec = (endMs / 1000).coerceAtLeast(startSec + 1)
+                                put("video_metadata", JSONObject().apply {
+                                    put("start_offset", JSONObject().apply {
+                                        put("seconds", startSec)
+                                    })
+                                    put("end_offset", JSONObject().apply {
+                                        put("seconds", endSec)
+                                    })
+                                })
+                            }
+                        })
+                        put(JSONObject().apply {
+                            put("text", prompt)
+                        })
+                    })
+                })
+            })
+        }
+        return jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull())
+    }
+
+    private fun extractApiErrorMessage(code: Int, message: String, errorBody: String?): String {
+        if (errorBody.isNullOrBlank()) return "$code $message"
+        try {
+            val json = JSONObject(errorBody)
+            val errObj = json.optJSONObject("error")
+            if (errObj != null) {
+                val status = errObj.optString("status")
+                val msg = errObj.optString("message")
+                val detail = if (status.isNotBlank()) "$status: $msg" else msg
+                if (detail.isNotBlank()) return detail
+            }
+        } catch (_: Exception) {
+            // Not a JSON object or parsing failed
+        }
+        val clean = errorBody.replace("\n", " ").trim()
+        return if (clean.length > 150) clean.take(150) + "..." else clean
+    }
     
     private fun checkFileState(apiKey: String, name: String): String {
         val request = Request.Builder()

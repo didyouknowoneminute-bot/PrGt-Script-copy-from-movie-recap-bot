@@ -118,6 +118,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val modelDisplayToKey = { display: String -> modelOptions.find { it.second == display }?.first ?: display }
 
     var apiKey by remember { mutableStateOf(sharedPrefs.getString("gemini_api_key", "") ?: "") }
+    var spareApiKey by remember { mutableStateOf(sharedPrefs.getString("gemini_spare_api_key", "") ?: "") }
+    var rpdEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("gemini_rpd_enabled", true)) }
     var selectedModelKey by remember { 
         val saved = sharedPrefs.getString("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
         mutableStateOf(if (modelKeys.contains(saved)) saved else "gemini-3.5-flash")
@@ -215,6 +217,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
             var localTotalApiCalls = existingScript?.totalApiCalls ?: 0
             var localSuccessApiCalls = existingScript?.successApiCalls ?: 0
             var localFailedApiCalls = existingScript?.failedApiCalls ?: 0
+            var localMainApiCalls = 0
+            var localMainSuccessCalls = 0
+            var localMainFailedCalls = 0
+            var localSpareApiCalls = 0
+            var localSpareSuccessCalls = 0
+            var localSpareFailedCalls = 0
+            var localUsedSpareKey = false
             var previousVersionsArray = org.json.JSONArray(existingScript?.previousVersionsJson ?: "[]")
             
             if (existingScript != null && retryParts != null && existingScript.scriptPartsJson.isNotBlank()) {
@@ -233,6 +242,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
             geminiApiClient.generateRecapScript(
                 apiKey = apiKey,
+                spareApiKey = spareApiKey,
+                rpdEnabled = rpdEnabled,
+                rpdLimit = 20,
                 modelName = activeModel,
                 partsCount = activeParts,
                 length = activeLength,
@@ -295,10 +307,16 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     is GenerationUpdate.ApiCallResult -> {
                         localTotalApiCalls++
                         if (update.success) localSuccessApiCalls++ else localFailedApiCalls++
+                        localMainApiCalls = update.mainTotal
+                        localMainSuccessCalls = update.mainSuccess
+                        localMainFailedCalls = update.mainFailed
+                        localSpareApiCalls = update.spareTotal
+                        localSpareSuccessCalls = update.spareSuccess
+                        localSpareFailedCalls = update.spareFailed
+                        localUsedSpareKey = update.usedSpareKey
                     }
                     is GenerationUpdate.Complete -> {
                         generationLogs.add("Generation Complete!")
-                        generationProgress = 1.0f
                         activeDecisionChannel = null
                     }
                 }
@@ -316,6 +334,18 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     previousVersionsArray.put(prevVersionObj)
                 }
                 
+                val rpdJson = org.json.JSONObject().apply {
+                    put("rpdEnabled", rpdEnabled)
+                    put("rpdLimit", 20)
+                    put("usedSpareKey", localUsedSpareKey)
+                    put("mainTotal", localMainApiCalls)
+                    put("mainSuccess", localMainSuccessCalls)
+                    put("mainFailed", localMainFailedCalls)
+                    put("spareTotal", localSpareApiCalls)
+                    put("spareSuccess", localSpareSuccessCalls)
+                    put("spareFailed", localSpareFailedCalls)
+                }
+
                 val scriptEntity = com.example.db.PrGtScript(
                     fileName = existingScript?.fileName ?: selectedMediaName,
                     fileSize = "N/A",
@@ -334,10 +364,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     totalApiCalls = localTotalApiCalls,
                     successApiCalls = localSuccessApiCalls,
                     failedApiCalls = localFailedApiCalls,
-                    previousVersionsJson = previousVersionsArray.toString()
+                    previousVersionsJson = previousVersionsArray.toString(),
+                    rpdInfoJson = rpdJson.toString()
                 )
-                // Delete older than 72 hours
-                val cutoffTime = System.currentTimeMillis() - (72L * 60 * 60 * 1000)
+                // Delete older than 168 hours (7 days)
+                val cutoffTime = System.currentTimeMillis() - (168L * 60 * 60 * 1000)
                 dao.deleteOlderThan(cutoffTime)
                 if (existingScript != null) {
                     dao.deleteScriptById(existingScript.id)
@@ -345,7 +376,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 val newId = dao.insertScript(scriptEntity)
                 currentScriptId = newId.toInt()
                 isEditingScript = false
-                dao.keepLatestTen()
+                dao.keepLatestFifty()
             }
             
             isGenerating = false
@@ -939,10 +970,36 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     Text("Tone: ${showScriptInfo?.tone}")
                     
                     Spacer(modifier = Modifier.height(16.dp))
-                    Text("API Calls:", fontWeight = FontWeight.Bold)
-                    Text("Total Calls: $totalCalls")
-                    Text("Success Calls: $successCalls", color = MaterialTheme.colorScheme.primary)
-                    Text("Failed Calls: $failedCalls", color = MaterialTheme.colorScheme.error)
+                    Text("API Calls & RPD Status:", fontWeight = FontWeight.Bold)
+                    val rpdObj = try {
+                        if (!showScriptInfo?.rpdInfoJson.isNullOrBlank()) org.json.JSONObject(showScriptInfo!!.rpdInfoJson) else null
+                    } catch (_: Exception) {
+                        null
+                    }
+                    if (rpdObj != null) {
+                        val isRpdOn = rpdObj.optBoolean("rpdEnabled", false)
+                        val usedSpare = rpdObj.optBoolean("usedSpareKey", false)
+                        val mTot = rpdObj.optInt("mainTotal", totalCalls)
+                        val mSuc = rpdObj.optInt("mainSuccess", successCalls)
+                        val mFai = rpdObj.optInt("mainFailed", failedCalls)
+                        val sTot = rpdObj.optInt("spareTotal", 0)
+                        val sSuc = rpdObj.optInt("spareSuccess", 0)
+                        val sFai = rpdObj.optInt("spareFailed", 0)
+
+                        Text("RPD Mode: ${if (isRpdOn) "ON (Max 20 Requests)" else "OFF"}")
+                        Text("Main API Key Calls: $mTot (Success: $mSuc, Failed: $mFai)")
+                        if (usedSpare || sTot > 0) {
+                            Text("Spare API Key Used: Yes", color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                            Text("Spare API Key Calls: $sTot (Success: $sSuc, Failed: $sFai)")
+                        } else {
+                            Text("Spare API Key Used: No")
+                        }
+                        Text("Total Calls (Main + Spare): $totalCalls (Success: $successCalls, Failed: $failedCalls)")
+                    } else {
+                        Text("Total Calls: $totalCalls")
+                        Text("Success Calls: $successCalls", color = MaterialTheme.colorScheme.primary)
+                        Text("Failed Calls: $failedCalls", color = MaterialTheme.colorScheme.error)
+                    }
                     
                     if (prevVersions.length() > 0) {
                         Spacer(modifier = Modifier.height(16.dp))
@@ -1194,6 +1251,16 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 apiKey = newKey
                 sharedPrefs.edit().putString("gemini_api_key", newKey).apply()
             },
+            spareApiKey = spareApiKey,
+            onSpareApiKeyChange = { newKey ->
+                spareApiKey = newKey
+                sharedPrefs.edit().putString("gemini_spare_api_key", newKey).apply()
+            },
+            rpdEnabled = rpdEnabled,
+            onRpdEnabledChange = { newEnabled ->
+                rpdEnabled = newEnabled
+                sharedPrefs.edit().putBoolean("gemini_rpd_enabled", newEnabled).apply()
+            },
             selectedModel = modelKeyToDisplay(selectedModelKey),
             onModelSelected = { selectedDisplay ->
                 val newKey = modelDisplayToKey(selectedDisplay)
@@ -1413,6 +1480,10 @@ fun DropdownSection(
 fun SettingsDialog(
     apiKey: String,
     onApiKeyChange: (String) -> Unit,
+    spareApiKey: String,
+    onSpareApiKeyChange: (String) -> Unit,
+    rpdEnabled: Boolean,
+    onRpdEnabledChange: (Boolean) -> Unit,
     selectedModel: String,
     onModelSelected: (String) -> Unit,
     models: List<String>,
@@ -1434,10 +1505,58 @@ fun SettingsDialog(
                 OutlinedTextField(
                     value = apiKey,
                     onValueChange = onApiKeyChange,
-                    label = { Text("API Key") },
+                    label = { Text("Main API Key") },
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
                 )
+
+                OutlinedTextField(
+                    value = spareApiKey,
+                    onValueChange = onSpareApiKeyChange,
+                    label = { Text("Spare API Key") },
+                    placeholder = { Text("Enter spare API key (optional)") },
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp)
+                )
+
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "RPD Limit (Requests Per Day)",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = if (rpdEnabled) "Maximum: 20 Requests (On)" else "Off (ကန့်သတ်ချက်မရှိ)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (rpdEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = rpdEnabled,
+                                onCheckedChange = onRpdEnabledChange
+                            )
+                        }
+                        if (rpdEnabled) {
+                            Spacer(modifier = Modifier.height(6.dp))
+                            Text(
+                                text = "Main Key ဖြင့် ၂၀ ကြိမ် (Success + Failed) ပြည့်ပါက Spare Key သို့ အလိုအလျောက် Video ပြန်တင်ပြီး ဆက် run ပေးပါမည်။",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                }
 
                 DropdownSection(
                     title = "Gemini Model",

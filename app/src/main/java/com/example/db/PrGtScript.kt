@@ -23,5 +23,6 @@ data class PrGtScript(
     val totalApiCalls: Int = 0,
     val successApiCalls: Int = 0,
     val failedApiCalls: Int = 0,
-    val previousVersionsJson: String = "[]"
+    val previousVersionsJson: String = "[]",
+    val rpdInfoJson: String = ""
 )

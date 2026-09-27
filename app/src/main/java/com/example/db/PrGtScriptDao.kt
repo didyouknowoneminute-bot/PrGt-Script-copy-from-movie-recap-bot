@@ -25,6 +25,6 @@ interface PrGtScriptDao {
     @Query("DELETE FROM prgt_scripts WHERE timestamp < :cutoffTime")
     suspend fun deleteOlderThan(cutoffTime: Long)
 
-    @Query("DELETE FROM prgt_scripts WHERE id NOT IN (SELECT id FROM prgt_scripts ORDER BY timestamp DESC LIMIT 10)")
-    suspend fun keepLatestTen()
+    @Query("DELETE FROM prgt_scripts WHERE id NOT IN (SELECT id FROM prgt_scripts ORDER BY timestamp DESC LIMIT 50)")
+    suspend fun keepLatestFifty()
 }

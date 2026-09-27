@@ -161,6 +161,11 @@ fun ProcessingBlock(
                         LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                             items(logs) { log ->
                                 val logColor = when {
+                                    // 1-minute Status Summary (Vibrant Sky Blue)
+                                    log.startsWith("📊") ||
+                                    log.contains("[Status", ignoreCase = true) ||
+                                    log.contains("📊 [Status", ignoreCase = true) -> Color(0xFF40C4FF) // Vibrant Sky Blue
+
                                     // Failed / Error / Retrying / Exception (Red)
                                     log.contains("error", ignoreCase = true) ||
                                     log.contains("failed", ignoreCase = true) ||
