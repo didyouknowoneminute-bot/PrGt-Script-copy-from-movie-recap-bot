@@ -161,6 +161,9 @@ fun ProcessingBlock(
                         LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
                             items(logs) { log ->
                                 val logColor = when {
+                                    // RPD info (White)
+                                    log.contains("ℹ️ RPD") -> Color.White
+
                                     // 1-minute Status Summary (Vibrant Sky Blue)
                                     log.startsWith("📊") ||
                                     log.contains("[Status", ignoreCase = true) ||

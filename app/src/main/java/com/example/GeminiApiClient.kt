@@ -269,6 +269,15 @@ class GeminiApiClient(private val context: Context) {
             val totalToProcess = partsToProcess.size
 
             send(GenerationUpdate.Log("Starting generation with $rpm RPM (Pipelined Parallel mode)..."))
+            if (rpdEnabled) {
+                val mStatus = RpdTracker.getStatus(context, apiKey, rpdLimit)
+                send(GenerationUpdate.Log("ℹ️ RPD Cache: Main Key has ${mStatus.usedCount}/$rpdLimit requests used today (${mStatus.remainingCount} available)."))
+                send(GenerationUpdate.Log("ℹ️ Daily Quota Reset: ${mStatus.resetTimeDescription} (${mStatus.hoursUntilReset}h ${mStatus.minutesUntilReset}m until midnight PST/PDT)."))
+                if (spareApiKey.isNotBlank()) {
+                    val sStatus = RpdTracker.getStatus(context, spareApiKey, rpdLimit)
+                    send(GenerationUpdate.Log("ℹ️ RPD Cache: Spare Key has ${sStatus.usedCount}/$rpdLimit requests used today (${sStatus.remainingCount} available)."))
+                }
+            }
 
             // Rate limiter: sliding window + strict minimum interval between ANY two requests
             val rateLimitMutex = Mutex()
@@ -316,10 +325,13 @@ class GeminiApiClient(private val context: Context) {
             val keyMutex = Mutex()
             var activeApiKey = apiKey
             var activeGeminiFileUri = finalGeminiFileUri
-            var mainTotalCalls = 0
+            val mainInitialUsed = if (rpdEnabled) RpdTracker.getStatus(context, apiKey, rpdLimit).usedCount else 0
+            val spareInitialUsed = if (rpdEnabled && spareApiKey.isNotBlank()) RpdTracker.getStatus(context, spareApiKey, rpdLimit).usedCount else 0
+
+            var mainTotalCalls = mainInitialUsed
             var mainSuccessCalls = 0
             var mainFailedCalls = 0
-            var spareTotalCalls = 0
+            var spareTotalCalls = spareInitialUsed
             var spareSuccessCalls = 0
             var spareFailedCalls = 0
             var hasSwitchedToSpare = false
@@ -379,15 +391,22 @@ class GeminiApiClient(private val context: Context) {
                     if (!isSpare) {
                         mainTotalCalls++
                         if (success) mainSuccessCalls++ else mainFailedCalls++
+                        if (rpdEnabled) {
+                            RpdTracker.recordCall(context, apiKey)
+                        }
                     } else {
                         spareTotalCalls++
                         if (success) spareSuccessCalls++ else spareFailedCalls++
+                        if (rpdEnabled && spareApiKey.isNotBlank()) {
+                            RpdTracker.recordCall(context, spareApiKey)
+                        }
                     }
                     val currentRpdTotal = mainTotalCalls + spareTotalCalls
                     if (rpdEnabled) {
                         val keyName = if (isSpare) "Spare Key" else "Main Key"
                         val countOnKey = if (isSpare) spareTotalCalls else mainTotalCalls
-                        send(GenerationUpdate.Log("ℹ️ RPD [$keyName]: Request #$countOnKey/$rpdLimit (Total RPD: $currentRpdTotal, Success: ${mainSuccessCalls + spareSuccessCalls}, Failed: ${mainFailedCalls + spareFailedCalls})"))
+                        val remainingOnKey = (rpdLimit - countOnKey).coerceAtLeast(0)
+                        send(GenerationUpdate.Log("ℹ️ RPD [$keyName]: Request #$countOnKey/$rpdLimit (Available: $remainingOnKey, Total: $currentRpdTotal, Success: ${mainSuccessCalls + spareSuccessCalls}, Failed: ${mainFailedCalls + spareFailedCalls})"))
                     }
                     send(GenerationUpdate.ApiCallResult(
                         success = success,

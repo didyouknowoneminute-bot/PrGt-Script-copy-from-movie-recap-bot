@@ -37,6 +37,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Save
 import com.example.ui.theme.MyApplicationTheme
@@ -1502,6 +1503,70 @@ fun SettingsDialog(
                     .padding(vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
+                val context = LocalContext.current
+                val mainKeyStatus = remember(apiKey, rpdEnabled) { RpdTracker.getStatus(context, apiKey) }
+                val spareKeyStatus = remember(spareApiKey, rpdEnabled) { RpdTracker.getStatus(context, spareApiKey) }
+
+                if (rpdEnabled && apiKey.isNotBlank()) {
+                    if (mainKeyStatus.isLimitReached) {
+                        Card(
+                            shape = RoundedCornerShape(10.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Warning,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = "⚠️ Main Key: RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Text(
+                                        text = "Google Daily Quota reset ဖြစ်မည့်အချိန်: ${mainKeyStatus.resetTimeDescription} (${mainKeyStatus.hoursUntilReset} နာရီ ${mainKeyStatus.minutesUntilReset} မိနစ်အကြာ)။ Spare Key ထည့်သွင်းထားပါက အလိုအလျောက် ဆက်လက် run ပေးပါမည်။",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Main Key RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                                Text(
+                                    text = "Reset: ${mainKeyStatus.hoursUntilReset}h ${mainKeyStatus.minutesUntilReset}m",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
+
                 OutlinedTextField(
                     value = apiKey,
                     onValueChange = onApiKeyChange,
@@ -1509,6 +1574,66 @@ fun SettingsDialog(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(12.dp)
                 )
+
+                if (rpdEnabled && spareApiKey.isNotBlank()) {
+                    if (spareKeyStatus.isLimitReached) {
+                        Card(
+                            shape = RoundedCornerShape(10.dp),
+                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Warning,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(22.dp)
+                                )
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Column {
+                                    Text(
+                                        text = "⚠️ Spare Key: RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                    Text(
+                                        text = "Reset အချိန်: ${spareKeyStatus.resetTimeDescription} (${spareKeyStatus.hoursUntilReset} နာရီ ${spareKeyStatus.minutesUntilReset} မိနစ်အကြာ)။ Key အသစ် လဲလှယ်ပေးပါ။",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                            }
+                        }
+                    } else {
+                        Surface(
+                            shape = RoundedCornerShape(8.dp),
+                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Spare Key RPD: ${spareKeyStatus.usedCount}/${spareKeyStatus.maxLimit} ကြိမ် (Available: ${spareKeyStatus.remainingCount} ကြိမ်)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                                Text(
+                                    text = "Reset: ${spareKeyStatus.hoursUntilReset}h ${spareKeyStatus.minutesUntilReset}m",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                }
 
                 OutlinedTextField(
                     value = spareApiKey,
@@ -1550,7 +1675,7 @@ fun SettingsDialog(
                         if (rpdEnabled) {
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Main Key ဖြင့် ၂၀ ကြိမ် (Success + Failed) ပြည့်ပါက Spare Key သို့ အလိုအလျောက် Video ပြန်တင်ပြီး ဆက် run ပေးပါမည်။",
+                                text = "Main Key ဖြင့် ၂၀ ကြိမ် (Success + Failed) ပြည့်ပါက Spare Key သို့ အလိုအလျောက် ဆက်လက် run ပေးပါမည်။ Google Quota သည် Pacific Time ညဉ့်သန်းခေါင် (00:00 PST/PDT)၊ မြန်မာစံတော်ချိန် ${mainKeyStatus.resetTimeDescription.split(" [").first()} တွင် အလိုအလျောက် Reset ဖြစ်ပါမည်။",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
