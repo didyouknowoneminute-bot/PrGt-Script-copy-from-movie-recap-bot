@@ -20,11 +20,13 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 @Composable
 fun ProcessingBlock(
+    mediaName: String = "",
     progress: Float,
     logs: List<String>,
     elapsedTime: Long,
@@ -55,7 +57,7 @@ fun ProcessingBlock(
         label = "alpha"
     )
 
-    val targetHeightFraction = if (isExpanded) 0.75f else 0.10f
+    val targetHeightFraction = if (isExpanded) 0.75f else 0.12f
     val animatedHeightFraction by animateFloatAsState(
         targetValue = targetHeightFraction,
         animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
@@ -84,7 +86,10 @@ fun ProcessingBlock(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                Row(
+                    modifier = Modifier.weight(1f).padding(end = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     Box(
                         modifier = Modifier
                             .size(12.dp)
@@ -92,12 +97,24 @@ fun ProcessingBlock(
                             .background(Color.Red.copy(alpha = alpha))
                     )
                     Spacer(modifier = Modifier.width(8.dp))
-                    Text(
-                        text = "NARRATING... $timeString",
-                        fontWeight = FontWeight.Bold,
-                        fontSize = 14.sp,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "NARRATING... $timeString",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 13.sp,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        if (mediaName.isNotBlank() && mediaName != "No file selected") {
+                            Text(
+                                text = "🎬 $mediaName",
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.sp,
+                                color = MaterialTheme.colorScheme.primary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Surface(

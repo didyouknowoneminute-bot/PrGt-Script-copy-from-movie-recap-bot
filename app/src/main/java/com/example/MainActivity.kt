@@ -3,6 +3,7 @@ package com.example
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.BackHandler
 import androidx.activity.enableEdgeToEdge
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -130,15 +131,22 @@ fun MainScreen(modifier: Modifier = Modifier) {
     // Generation State
     var generatedScript by remember { mutableStateOf("") }
     var isGenerating by remember { mutableStateOf(false) }
+    var activeGenerationMediaName by remember { mutableStateOf("") }
     var generationProgress by remember { mutableFloatStateOf(0f) }
     val generationLogs = remember { mutableStateListOf<String>() }
     var elapsedTime by remember { mutableLongStateOf(0L) }
     var showStopDialog by remember { mutableStateOf(false) }
     var generationJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var saveCurrentProgressAndStop by remember { mutableStateOf<(() -> Unit)?>(null) }
     
     var activeDecisionChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<Boolean>?>(null) }
+    var activeNewKeyChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<String>?>(null) }
     var showRetryDialog by remember { mutableStateOf<List<Int>?>(null) }
+    var showRpdKeyDialog by remember { mutableStateOf(false) }
+    var newKeyInput by remember { mutableStateOf("") }
+    var currentMissingParts by remember { mutableStateOf<List<Int>>(emptyList()) }
     var retryCountdown by remember { mutableIntStateOf(15) }
+    var rpdCountdown by remember { mutableIntStateOf(10) }
     
     val coroutineScope = rememberCoroutineScope()
 
@@ -178,15 +186,54 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var scriptToDelete by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var scriptToRegenerate by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var viewingHistoryScript by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
-    
     var currentScriptId by remember { mutableStateOf<Int?>(null) }
     var isEditingScript by remember { mutableStateOf(false) }
     val clipboardManager = LocalClipboardManager.current
     var showScriptInfo by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var errorMessageDialog by remember { mutableStateOf<String?>(null) }
+    var backPressedTime by remember { mutableLongStateOf(0L) }
+
+    BackHandler {
+        when {
+            showSettings -> {
+                showSettings = false
+            }
+            viewingHistoryScript != null -> {
+                viewingHistoryScript = null
+            }
+            scriptToRename != null -> {
+                scriptToRename = null
+            }
+            scriptToDelete != null -> {
+                scriptToDelete = null
+            }
+            scriptToRegenerate != null -> {
+                scriptToRegenerate = null
+            }
+            showScriptInfo != null -> {
+                showScriptInfo = null
+            }
+            errorMessageDialog != null -> {
+                errorMessageDialog = null
+            }
+            showHistory -> {
+                showHistory = false
+            }
+            else -> {
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - backPressedTime < 2000L) {
+                    (context as? android.app.Activity)?.finish()
+                } else {
+                    backPressedTime = currentTime
+                    android.widget.Toast.makeText(context, "ထွက်ရန် နောက်တစ်ကြိမ် ထပ်နှိပ်ပါ", android.widget.Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
 
     val launchGeneration: (com.example.db.PrGtScript?, List<Int>?) -> Unit = { existingScript, retryParts ->
         val generationStartTime = existingScript?.timestamp ?: System.currentTimeMillis()
+        activeGenerationMediaName = existingScript?.fileName ?: selectedMediaName
         isGenerating = true
         generatedScript = ""
         currentScriptId = null
@@ -195,7 +242,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
         showHistory = false // Close history if open
         
         val decisionChannel = kotlinx.coroutines.channels.Channel<Boolean>()
+        val newKeyChan = kotlinx.coroutines.channels.Channel<String>()
         activeDecisionChannel = decisionChannel
+        activeNewKeyChannel = newKeyChan
         
         generationJob = coroutineScope.launch {
             val scriptPartsMap = mutableMapOf<Int, String>()
@@ -241,6 +290,69 @@ fun MainScreen(modifier: Modifier = Modifier) {
             var finalScript = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
             generatedScript = finalScript
 
+            saveCurrentProgressAndStop = {
+                generationJob?.cancel()
+                val currentText = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
+                if (currentText.isNotBlank()) {
+                    val partsJson = org.json.JSONObject()
+                    scriptPartsMap.forEach { (k, v) -> partsJson.put(k.toString(), v) }
+
+                    if (existingScript != null) {
+                        val prevVersionObj = org.json.JSONObject()
+                        prevVersionObj.put("timestamp", System.currentTimeMillis())
+                        prevVersionObj.put("scriptText", existingScript.scriptText)
+                        previousVersionsArray.put(prevVersionObj)
+                    }
+
+                    val rpdJson = org.json.JSONObject().apply {
+                        put("rpdEnabled", rpdEnabled)
+                        put("rpdLimit", 20)
+                        put("usedSpareKey", localUsedSpareKey)
+                        put("mainTotal", localMainApiCalls)
+                        put("mainSuccess", localMainSuccessCalls)
+                        put("mainFailed", localMainFailedCalls)
+                        put("spareTotal", localSpareApiCalls)
+                        put("spareSuccess", localSpareSuccessCalls)
+                        put("spareFailed", localSpareFailedCalls)
+                    }
+
+                    val scriptEntity = com.example.db.PrGtScript(
+                        fileName = existingScript?.fileName ?: selectedMediaName,
+                        fileSize = "N/A",
+                        durationSec = if (savedDurationMs > 0) (savedDurationMs / 1000).toString() else "N/A",
+                        scriptText = currentText,
+                        timestamp = generationStartTime,
+                        language = activeLanguage,
+                        modelId = activeModel,
+                        targetLength = activeLength,
+                        pov = activePOV,
+                        tone = activeTone,
+                        geminiFileUri = savedGeminiFileUri,
+                        mimeType = savedMimeType,
+                        partsCount = savedPartsCount,
+                        scriptPartsJson = partsJson.toString(),
+                        totalApiCalls = localTotalApiCalls,
+                        successApiCalls = localSuccessApiCalls,
+                        failedApiCalls = localFailedApiCalls,
+                        previousVersionsJson = previousVersionsArray.toString(),
+                        rpdInfoJson = rpdJson.toString()
+                    )
+                    coroutineScope.launch {
+                        if (existingScript != null) {
+                            dao.deleteScriptById(existingScript.id)
+                        }
+                        val newId = dao.insertScript(scriptEntity)
+                        currentScriptId = newId.toInt()
+                        isEditingScript = false
+                        dao.keepLatestFifty()
+                    }
+                    generatedScript = currentText
+                    generationLogs.add("✅ လက်ရှိပြီးစီးသမျှ အပိုင်းများကို အောင်မြင်စွာ သိမ်းဆည်းထားပြီးပါပြီ။ နောက်မှ ကျန်အပိုင်းများကို ဆက်လက် Retry လုပ်နိုင်ပါသည်။")
+                }
+                isGenerating = false
+                saveCurrentProgressAndStop = null
+            }
+
             geminiApiClient.generateRecapScript(
                 apiKey = apiKey,
                 spareApiKey = spareApiKey,
@@ -255,6 +367,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 mediaUri = selectedMediaUri, // This might be null if retrying, but existingGeminiFileUri will handle it
                 mediaMimeType = savedMimeType ?: selectedMediaMimeType,
                 retryDecisionChannel = decisionChannel,
+                newKeyChannel = newKeyChan,
                 existingGeminiFileUri = savedGeminiFileUri,
                 existingDurationMs = if (savedDurationMs > 0) savedDurationMs else null,
                 specificPartsToGenerate = retryParts,
@@ -303,7 +416,19 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     }
                     is GenerationUpdate.RequireRetryDecision -> {
                         showRetryDialog = update.failedParts
+                        currentMissingParts = update.failedParts
                         retryCountdown = 15
+                    }
+                    is GenerationUpdate.RequireNewKeyForRpd -> {
+                        val missing = scriptPartsMap.filter { entry ->
+                            entry.value.isBlank() || 
+                            entry.value.contains("[အပိုင်း (") || 
+                            entry.value.contains("နေရာလွတ်") ||
+                            entry.value.contains("Error")
+                        }.keys.toList()
+                        currentMissingParts = if (update.failedParts.isNotEmpty()) update.failedParts else missing
+                        rpdCountdown = 10
+                        showRpdKeyDialog = true
                     }
                     is GenerationUpdate.ApiCallResult -> {
                         localTotalApiCalls++
@@ -378,9 +503,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 currentScriptId = newId.toInt()
                 isEditingScript = false
                 dao.keepLatestFifty()
+                // Automatically display the full script dialog on completion
+                val savedEntity = scriptEntity.copy(id = newId.toInt())
+                viewingHistoryScript = savedEntity
             }
             
             isGenerating = false
+            saveCurrentProgressAndStop = null
         }
     }
 
@@ -548,13 +677,39 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                     if (script.scriptText.contains("[အပိုင်း (${i + 1})") || 
                                         script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
                                         script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
-                                        script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:")) {
+                                        script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
+                                        script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]")
+                                    ) {
                                         failedParts.add(i)
                                     }
                                 }
                                 
                                 Spacer(modifier = Modifier.height(8.dp))
                                 if (failedParts.isNotEmpty()) {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+                                        shape = RoundedCornerShape(8.dp),
+                                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Warning,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.error,
+                                                modifier = Modifier.size(16.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "⚠️ မပြည့်စုံသေးသောအပိုင်း (${failedParts.size}) ပိုင်း ကျန်ရှိနေပါသည်: ${failedParts.map { it + 1 }.joinToString(", ")}",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = MaterialTheme.colorScheme.onErrorContainer
+                                            )
+                                        }
+                                    }
                                     androidx.compose.material3.OutlinedButton(
                                         onClick = { scriptToRegenerate = script },
                                         modifier = Modifier.fillMaxWidth()
@@ -664,83 +819,6 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 }
             }
             
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (generatedScript.isNotEmpty() || isGenerating) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(
-                        text = "Generated Script",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.primary
-                    )
-                    Row {
-                        if (!isGenerating && generatedScript.isNotEmpty()) {
-                            IconButton(onClick = {
-                                currentScriptId?.let { id ->
-                                    historyScripts.find { it.id == id }?.let { script ->
-                                        showScriptInfo = script
-                                    }
-                                }
-                            }) {
-                                Icon(Icons.Filled.Info, contentDescription = "Script Info")
-                            }
-                            IconButton(onClick = {
-                                clipboardManager.setText(AnnotatedString(generatedScript))
-                            }) {
-                                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
-                            }
-                            if (isEditingScript) {
-                                IconButton(onClick = {
-                                    isEditingScript = false
-                                    coroutineScope.launch {
-                                        currentScriptId?.let { id ->
-                                            dao.updateScriptText(id, generatedScript)
-                                        }
-                                    }
-                                }) {
-                                    Icon(Icons.Filled.Save, contentDescription = "Save")
-                                }
-                            } else {
-                                IconButton(onClick = {
-                                    isEditingScript = true
-                                }) {
-                                    Icon(Icons.Filled.Edit, contentDescription = "Edit")
-                                }
-                            }
-                        }
-                    }
-                }
-                Surface(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp),
-                    color = MaterialTheme.colorScheme.surface,
-                    tonalElevation = 2.dp
-                ) {
-                    if (isEditingScript) {
-                        OutlinedTextField(
-                            value = generatedScript,
-                            onValueChange = { generatedScript = it },
-                            modifier = Modifier.fillMaxWidth().padding(8.dp),
-                            textStyle = MaterialTheme.typography.bodyLarge
-                        )
-                    } else {
-                        SelectionContainer {
-                            Text(
-                                text = generatedScript,
-                                modifier = Modifier.padding(16.dp),
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = MaterialTheme.colorScheme.onSurface
-                            )
-                        }
-                    }
-                }
-            }
-
             Spacer(modifier = Modifier.height(32.dp))
         }
     } // End of else block for showHistory
@@ -756,6 +834,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 .fillMaxWidth()
         ) {
             ProcessingBlock(
+                mediaName = activeGenerationMediaName,
                 progress = generationProgress,
                 logs = generationLogs,
                 elapsedTime = elapsedTime,
@@ -860,6 +939,48 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         }
                     }
 
+                    val viewerMissingParts = remember(viewerText, script.partsCount) {
+                        val list = mutableListOf<Int>()
+                        for (i in 0 until script.partsCount) {
+                            if (viewerText.contains("[အပိုင်း (${i + 1})") || 
+                                viewerText.contains("[Final Retry Error in Part ${i + 1}:") ||
+                                viewerText.contains("[Error parsing final output for Part ${i + 1}:") ||
+                                viewerText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
+                                viewerText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]")
+                            ) {
+                                list.add(i)
+                            }
+                        }
+                        list
+                    }
+
+                    if (viewerMissingParts.isNotEmpty()) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Warning,
+                                    contentDescription = null,
+                                    tint = MaterialTheme.colorScheme.error,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = "⚠️ မပြည့်စုံသေးသောအပိုင်း (${viewerMissingParts.size}) ပိုင်း ကျန်ရှိနေပါသည်: ${viewerMissingParts.map { it + 1 }.joinToString(", ")}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                            }
+                        }
+                    }
+
                     // Main script scroll area
                     Surface(
                         modifier = Modifier
@@ -929,15 +1050,6 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedButton(onClick = {
-                            generatedScript = viewerText
-                            currentScriptId = script.id
-                            isEditingScript = false
-                            showHistory = false
-                            viewingHistoryScript = null
-                        }) {
-                            Text("Main Screen သို့ပို့မည်")
-                        }
                         Button(onClick = { viewingHistoryScript = null }) {
                             Text("ပိတ်မည်")
                         }
@@ -1190,16 +1302,38 @@ fun MainScreen(modifier: Modifier = Modifier) {
     if (showStopDialog) {
         AlertDialog(
             onDismissRequest = { showStopDialog = false },
-            title = { Text("ရပ်တန့်မည်လား") },
-            text = { Text("တွက်ချက်နေမှုကို ရပ်တန့်ချင်တာ သေချာပါသလား။") },
+            title = { Text("Script ထုတ်လုပ်မှု ရပ်တန့်မည်လား") },
+            text = { 
+                Text("တွက်ချက်နေမှုကို ရပ်တန့်ချင်တာ သေချာပါသလား။\n\n• 'ပြီးသလောက်ယူမည်' ကို ရွေးပါက လက်ရှိထွက်ထားသမျှကို မှတ်တမ်းတင်သိမ်းဆည်းပေးမည်ဖြစ်ပြီး မပြီးသေးသောအပိုင်းများကို နောက်မှ ဆက်လက် ထုတ်ယူနိုင်ပါမည်။\n• 'အကုန်ဖျက်မည်' ကို ရွေးပါက လက်ရှိ လုပ်ဆောင်ချက်အားလုံး ပျက်ပြယ်သွားပါမည်။") 
+            },
             confirmButton = {
-                TextButton(onClick = {
-                    generationJob?.cancel()
-                    isGenerating = false
-                    showStopDialog = false
-                    generationLogs.add("User cancelled generation.")
-                }) {
-                    Text("သေချာသည် (Stop)")
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            showStopDialog = false
+                            if (saveCurrentProgressAndStop != null) {
+                                saveCurrentProgressAndStop?.invoke()
+                            } else {
+                                generationJob?.cancel()
+                                isGenerating = false
+                                generationLogs.add("User stopped generation.")
+                            }
+                        }
+                    ) {
+                        Text("ပြီးသလောက်ယူမည် (Save)")
+                    }
+                    OutlinedButton(
+                        onClick = {
+                            generationJob?.cancel()
+                            isGenerating = false
+                            saveCurrentProgressAndStop = null
+                            showStopDialog = false
+                            generationLogs.add("User cancelled generation (Discarded).")
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("အကုန်ဖျက်မည်")
+                    }
                 }
             },
             dismissButton = {
@@ -1240,6 +1374,79 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     showRetryDialog = null
                 }) {
                     Text("လက်ရှိအတိုင်းယူမည်")
+                }
+            }
+        )
+    }
+
+    if (showRpdKeyDialog) {
+        LaunchedEffect(showRpdKeyDialog) {
+            while (rpdCountdown > 0) {
+                kotlinx.coroutines.delay(1000)
+                rpdCountdown--
+            }
+            if (showRpdKeyDialog) {
+                // Auto-save and accept current progress when timer expires
+                activeNewKeyChannel?.send("")
+                activeDecisionChannel?.send(false)
+                showRpdKeyDialog = false
+                newKeyInput = ""
+                generationLogs.add("⏱️ RPD Timeout: လက်ရှိရရှိထားသမျှ အပိုင်းများကို အလိုအလျောက် သိမ်းဆည်းလိုက်ပါပြီ။")
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { /* Prevent dismiss */ },
+            title = { 
+                Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
+            },
+            text = {
+                Column {
+                    Text(
+                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် API Key အသစ် ထည့်သွင်းပေးပါ (သို့မဟုတ်) လက်ရှိရရှိထားသော Script ကို သိမ်းဆည်းထားပြီး နောက်မှ Key အသစ်ဖြင့် လိုအပ်သောအပိုင်းများကိုသာ ပြန်လည်ထုတ်ယူနိုင်ပါသည် ခင်ဗျာ။\n\n(အချိန်ကုန်ဆုံးပါက $rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို အလိုအလျောက် Auto-Save လုပ်ပေးပါမည်)",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    OutlinedTextField(
+                        value = newKeyInput,
+                        onValueChange = { newKeyInput = it },
+                        label = { Text("API Key အသစ် ရိုက်ထည့်ပါ") },
+                        placeholder = { Text("AIzaSy...") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val trimmedKey = newKeyInput.trim()
+                        if (trimmedKey.isNotBlank()) {
+                            coroutineScope.launch {
+                                activeNewKeyChannel?.send(trimmedKey)
+                            }
+                            showRpdKeyDialog = false
+                            newKeyInput = ""
+                        }
+                    },
+                    enabled = newKeyInput.trim().isNotBlank()
+                ) {
+                    Text("API Key အသစ်ဖြင့် ဆက်လုပ်မည်")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        coroutineScope.launch {
+                            activeNewKeyChannel?.send("") // Signal to cancel/stop
+                            activeDecisionChannel?.send(false)
+                        }
+                        showRpdKeyDialog = false
+                        newKeyInput = ""
+                    }
+                ) {
+                    Text("လက်ရှိအတိုင်း သိမ်းဆည်းမည် (${rpdCountdown}s)")
                 }
             }
         )
