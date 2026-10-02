@@ -375,6 +375,7 @@ class GeminiApiClient(private val context: Context) {
             var spareFailedCalls = 0
             var hasSwitchedToSpare = false
             var isSpareMediaUploaded = false
+            val inFlightHttpRequests = java.util.concurrent.atomic.AtomicInteger(0)
 
             suspend fun getOrSwitchKeyAndFile(): Triple<String, String, Boolean> {
                 return keyMutex.withLock {
@@ -437,6 +438,16 @@ class GeminiApiClient(private val context: Context) {
                     )
 
                     if (isExhausted && newKeyChannel != null) {
+                        // If there are in-flight HTTP requests currently awaiting response from Gemini server,
+                        // do not send new requests and wait until all in-flight requests finish processing!
+                        if (inFlightHttpRequests.get() > 0) {
+                            send(GenerationUpdate.Log("⏳ RPD ပြည့်သွားပါပြီ။ လက်ရှိ ဆာဗာသို့ ပို့ထားပြီးသော Processing requests (${inFlightHttpRequests.get()} ခု) ၏ response များ အပြီးထိ စောင့်ဆိုင်းနေပါသည်..."))
+                            while (inFlightHttpRequests.get() > 0) {
+                                delay(500)
+                            }
+                            send(GenerationUpdate.Log("✅ လက်ရှိ Processing requests အားလုံး response ရရှိပြီးစီးပါပြီ။"))
+                        }
+
                         send(GenerationUpdate.Log("⚠️ API Keys အားလုံး၏ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ။ API Key အသစ် တောင်းခံနေပါသည်..."))
                         send(GenerationUpdate.RequireNewKeyForRpd(emptyList(), rpdLimit))
                         val userSuppliedKey = newKeyChannel.receive()
@@ -640,10 +651,12 @@ class GeminiApiClient(private val context: Context) {
                                 send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
                             }
                             
-                            acquireRateLimitSlot()
-                            
                             val (callApiKey, callFileUri, isSpareCall) = getOrSwitchKeyAndFile()
                             val keyLabel = if (isSpareCall) " [Spare Key]" else ""
+                            
+                            // Strictly enforce RPM slot right before sending the actual HTTP request
+                            acquireRateLimitSlot()
+                            
                             send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""}$keyLabel to AI..."))
                             
                             val requestBody = createSegmentRequestBody(
@@ -661,6 +674,7 @@ class GeminiApiClient(private val context: Context) {
                                 .build()
                             
                             recordRequestSent(isSpareCall, callApiKey)
+                            inFlightHttpRequests.incrementAndGet()
                             
                             try {
                                 client.newCall(request).execute().use { response ->
@@ -697,7 +711,7 @@ class GeminiApiClient(private val context: Context) {
                                             success = true
                                             recordCallOutcome(isSpareCall, true)
                                             val keyTag = if (isSpareCall) "[Spare Key]" else "[Main Key]"
-                                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed with $keyTag."))
+                                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed successfully with $keyTag."))
                                         } else {
                                             throw Exception("Empty response candidate text")
                                         }
@@ -716,6 +730,8 @@ class GeminiApiClient(private val context: Context) {
                                 if (attempts == maxAttempts) {
                                     send(GenerationUpdate.ScriptChunk(i, "Network Error in Part ${i + 1}: ${e.message}\n\n", isError = true))
                                 }
+                            } finally {
+                                inFlightHttpRequests.decrementAndGet()
                             }
                         }
                         
@@ -723,7 +739,6 @@ class GeminiApiClient(private val context: Context) {
                             val currentSuccess = successfulCount.incrementAndGet()
                             val currentProgress = 0.15f + (0.85f * (currentSuccess.toFloat() / maxOf(1, totalToProcess)))
                             send(GenerationUpdate.Progress(currentProgress))
-                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed successfully."))
                         } else {
                             failedCount.incrementAndGet()
                             failedParts.add(i)
@@ -836,10 +851,12 @@ class GeminiApiClient(private val context: Context) {
                                 send(GenerationUpdate.Log("Final Retry Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
                             }
                             
-                            acquireRateLimitSlot()
-                            
                             val (callApiKey, callFileUri, isSpareCall) = getOrSwitchKeyAndFile()
                             val keyLabel = if (isSpareCall) " [Spare Key]" else ""
+                            
+                            // Strictly enforce RPM slot right before sending the actual HTTP request
+                            acquireRateLimitSlot()
+                            
                             send(GenerationUpdate.Log("🚀 Sending Final Retry Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Attempt $attempts]" else ""}$keyLabel to AI..."))
                             
                             val requestBody = createSegmentRequestBody(
@@ -857,6 +874,7 @@ class GeminiApiClient(private val context: Context) {
                                 .build()
                             
                             recordRequestSent(isSpareCall, callApiKey)
+                            inFlightHttpRequests.incrementAndGet()
                             
                             try {
                                 client.newCall(request).execute().use { response ->
@@ -893,7 +911,7 @@ class GeminiApiClient(private val context: Context) {
                                             success = true
                                             recordCallOutcome(isSpareCall, true)
                                             val keyTag = if (isSpareCall) "[Spare Key]" else "[Main Key]"
-                                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts [$startStr - $endStr] recovered with $keyTag."))
+                                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts [$startStr - $endStr] recovered successfully with $keyTag."))
                                         } else {
                                             throw Exception("Empty response candidate text")
                                         }
@@ -912,6 +930,8 @@ class GeminiApiClient(private val context: Context) {
                                 if (attempts == maxAttempts) {
                                     send(GenerationUpdate.ScriptChunk(i, "\n[Network Error in Final Retry Part ${i + 1}: ${e.message}]\n", isError = true))
                                 }
+                            } finally {
+                                inFlightHttpRequests.decrementAndGet()
                             }
                         }
                     } finally {
@@ -922,7 +942,6 @@ class GeminiApiClient(private val context: Context) {
                             val currentSuccess = successfulCount.incrementAndGet()
                             val currentProgress = 0.15f + (0.85f * (currentSuccess.toFloat() / maxOf(1, totalToProcess)))
                             send(GenerationUpdate.Progress(currentProgress))
-                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts [$startStr - $endStr] recovered successfully."))
                         } else {
                             failedCount.incrementAndGet()
                             newlyFailed.add(i)

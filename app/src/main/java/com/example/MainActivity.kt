@@ -143,7 +143,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var activeNewKeyChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<String>?>(null) }
     var showRetryDialog by remember { mutableStateOf<List<Int>?>(null) }
     var showRpdKeyDialog by remember { mutableStateOf(false) }
-    var newKeyInput by remember { mutableStateOf("") }
+    var editMainKeyInput by remember { mutableStateOf("") }
+    var editSpareKeyInput by remember { mutableStateOf("") }
     var currentMissingParts by remember { mutableStateOf<List<Int>>(emptyList()) }
     var retryCountdown by remember { mutableIntStateOf(15) }
     var rpdCountdown by remember { mutableIntStateOf(10) }
@@ -292,6 +293,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
             saveCurrentProgressAndStop = {
                 generationJob?.cancel()
+                // Ensure all parts up to savedPartsCount exist in scriptPartsMap with a placeholder if missing
+                for (partIdx in 0 until savedPartsCount) {
+                    val existingVal = scriptPartsMap[partIdx]
+                    if (existingVal == null || existingVal.isBlank()) {
+                        scriptPartsMap[partIdx] = "[အပိုင်း ${partIdx + 1} - နေရာလွတ်...]\n"
+                    }
+                }
+
                 val currentText = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
                 if (currentText.isNotBlank()) {
                     val partsJson = org.json.JSONObject()
@@ -345,6 +354,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         currentScriptId = newId.toInt()
                         isEditingScript = false
                         dao.keepLatestFifty()
+                        val savedEntity = scriptEntity.copy(id = newId.toInt())
+                        viewingHistoryScript = savedEntity
                     }
                     generatedScript = currentText
                     generationLogs.add("✅ လက်ရှိပြီးစီးသမျှ အပိုင်းများကို အောင်မြင်စွာ သိမ်းဆည်းထားပြီးပါပြီ။ နောက်မှ ကျန်အပိုင်းများကို ဆက်လက် Retry လုပ်နိုင်ပါသည်။")
@@ -427,6 +438,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             entry.value.contains("Error")
                         }.keys.toList()
                         currentMissingParts = if (update.failedParts.isNotEmpty()) update.failedParts else missing
+                        editMainKeyInput = apiKey
+                        editSpareKeyInput = spareApiKey
                         rpdCountdown = 10
                         showRpdKeyDialog = true
                     }
@@ -673,13 +686,27 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                 val timeStr = "${remainingHours}h ${remainingMins}m"
 
                                 val failedParts = mutableListOf<Int>()
+                                val partsMap = try {
+                                    if (script.scriptPartsJson.isNotBlank()) {
+                                        val obj = org.json.JSONObject(script.scriptPartsJson)
+                                        obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                                    } else emptyMap()
+                                } catch (_: Exception) {
+                                    emptyMap()
+                                }
+
                                 for (i in 0 until script.partsCount) {
-                                    if (script.scriptText.contains("[အပိုင်း (${i + 1})") || 
+                                    val partContent = partsMap[i]
+                                    val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
+                                    val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
+                                    val isMarkerInText = script.scriptText.contains("[အပိုင်း (${i + 1})") || 
                                         script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
                                         script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
                                         script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
-                                        script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]")
-                                    ) {
+                                        script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
+                                        script.scriptText.contains("Part ${i + 1}") && (script.scriptText.contains("Error") || script.scriptText.contains("failed"))
+
+                                    if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
                                         failedParts.add(i)
                                     }
                                 }
@@ -939,15 +966,29 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         }
                     }
 
-                    val viewerMissingParts = remember(viewerText, script.partsCount) {
+                    val viewerMissingParts = remember(viewerText, script.partsCount, script.scriptPartsJson) {
                         val list = mutableListOf<Int>()
+                        val partsMap = try {
+                            if (script.scriptPartsJson.isNotBlank()) {
+                                val obj = org.json.JSONObject(script.scriptPartsJson)
+                                obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                            } else emptyMap()
+                        } catch (_: Exception) {
+                            emptyMap()
+                        }
+
                         for (i in 0 until script.partsCount) {
-                            if (viewerText.contains("[အပိုင်း (${i + 1})") || 
+                            val partContent = partsMap[i]
+                            val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
+                            val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
+                            val isMarkerInText = viewerText.contains("[အပိုင်း (${i + 1})") || 
                                 viewerText.contains("[Final Retry Error in Part ${i + 1}:") ||
                                 viewerText.contains("[Error parsing final output for Part ${i + 1}:") ||
                                 viewerText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
-                                viewerText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]")
-                            ) {
+                                viewerText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
+                                viewerText.contains("Part ${i + 1}") && (viewerText.contains("Error") || viewerText.contains("failed"))
+
+                            if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
                                 list.add(i)
                             }
                         }
@@ -961,22 +1002,45 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
                         ) {
                             Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                verticalAlignment = Alignment.CenterVertically
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Warning,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.size(16.dp)
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
-                                Text(
-                                    text = "⚠️ မပြည့်စုံသေးသောအပိုင်း (${viewerMissingParts.size}) ပိုင်း ကျန်ရှိနေပါသည်: ${viewerMissingParts.map { it + 1 }.joinToString(", ")}",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.onErrorContainer
-                                )
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Warning,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.error,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "⚠️ မပြည့်စုံသေးသောအပိုင်း (${viewerMissingParts.size}) ပိုင်း ကျန်ရှိနေပါသည်: ${viewerMissingParts.map { it + 1 }.joinToString(", ")}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                    )
+                                }
+                                if (script.geminiFileUri != null) {
+                                    Button(
+                                        onClick = {
+                                            val partsToRun = viewerMissingParts.toList()
+                                            viewingHistoryScript = null
+                                            launchGeneration(script, partsToRun)
+                                        },
+                                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.error,
+                                            contentColor = MaterialTheme.colorScheme.onError
+                                        ),
+                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                        modifier = Modifier.padding(start = 8.dp)
+                                    ) {
+                                        Text("Retry Failed Parts", style = MaterialTheme.typography.labelSmall)
+                                    }
+                                }
                             }
                         }
                     }
@@ -1387,12 +1451,24 @@ fun MainScreen(modifier: Modifier = Modifier) {
             }
             if (showRpdKeyDialog) {
                 // Auto-save and accept current progress when timer expires
-                activeNewKeyChannel?.send("")
-                activeDecisionChannel?.send(false)
                 showRpdKeyDialog = false
-                newKeyInput = ""
                 generationLogs.add("⏱️ RPD Timeout: လက်ရှိရရှိထားသမျှ အပိုင်းများကို အလိုအလျောက် သိမ်းဆည်းလိုက်ပါပြီ။")
+                if (saveCurrentProgressAndStop != null) {
+                    saveCurrentProgressAndStop?.invoke()
+                } else {
+                    activeNewKeyChannel?.send("")
+                    activeDecisionChannel?.send(false)
+                }
             }
+        }
+
+        val mainKeyStatus = remember(editMainKeyInput, rpdEnabled) { RpdTracker.getStatus(context, editMainKeyInput) }
+        val spareKeyStatus = remember(editSpareKeyInput, rpdEnabled) { RpdTracker.getStatus(context, editSpareKeyInput) }
+
+        val canProceed = remember(editMainKeyInput, editSpareKeyInput, apiKey, spareApiKey) {
+            val mainChangedAndValid = editMainKeyInput.trim().isNotBlank() && editMainKeyInput.trim() != apiKey.trim()
+            val spareChangedAndValid = editSpareKeyInput.trim().isNotBlank() && editSpareKeyInput.trim() != spareApiKey.trim()
+            mainChangedAndValid || spareChangedAndValid
         }
 
         AlertDialog(
@@ -1401,17 +1477,110 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
             },
             text = {
-                Column {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
                     Text(
-                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် API Key အသစ် ထည့်သွင်းပေးပါ (သို့မဟုတ်) လက်ရှိရရှိထားသော Script ကို သိမ်းဆည်းထားပြီး နောက်မှ Key အသစ်ဖြင့် လိုအပ်သောအပိုင်းများကိုသာ ပြန်လည်ထုတ်ယူနိုင်ပါသည် ခင်ဗျာ။\n\n(အချိန်ကုန်ဆုံးပါက $rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို အလိုအလျောက် Auto-Save လုပ်ပေးပါမည်)",
+                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် Settings ထဲက Main API Key (သို့မဟုတ်) Spare API Key အသစ် လဲလှယ်ထည့်သွင်းပေးပါ (အချိန်ကုန်ဆုံးပါက $rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို အလိုအလျောက် Auto-Save လုပ်ပေးပါမည်)။",
                         style = MaterialTheme.typography.bodyMedium
                     )
-                    Spacer(modifier = Modifier.height(16.dp))
+
+                    // Main Key Section
+                    if (editMainKeyInput.isNotBlank()) {
+                        if (mainKeyStatus.isLimitReached) {
+                            Card(
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Main Key RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ပြည့်ပြီး (Reset: ${mainKeyStatus.hoursUntilReset}h ${mainKeyStatus.minutesUntilReset}m)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        } else {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "Main Key RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                    }
+
                     OutlinedTextField(
-                        value = newKeyInput,
-                        onValueChange = { newKeyInput = it },
-                        label = { Text("API Key အသစ် ရိုက်ထည့်ပါ") },
+                        value = editMainKeyInput,
+                        onValueChange = { editMainKeyInput = it },
+                        label = { Text("Main API Key") },
                         placeholder = { Text("AIzaSy...") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    )
+
+                    // Spare Key Section
+                    if (editSpareKeyInput.isNotBlank()) {
+                        if (spareKeyStatus.isLimitReached) {
+                            Card(
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = "Spare Key RPD: ${spareKeyStatus.usedCount}/${spareKeyStatus.maxLimit} ပြည့်ပြီး (Reset: ${spareKeyStatus.hoursUntilReset}h ${spareKeyStatus.minutesUntilReset}m)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        } else {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(
+                                    text = "Spare Key RPD: ${spareKeyStatus.usedCount}/${spareKeyStatus.maxLimit} ကြိမ် (Available: ${spareKeyStatus.remainingCount} ကြိမ်)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.secondary,
+                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                )
+                            }
+                        }
+                    }
+
+                    OutlinedTextField(
+                        value = editSpareKeyInput,
+                        onValueChange = { editSpareKeyInput = it },
+                        label = { Text("Spare API Key") },
+                        placeholder = { Text("Enter spare API key (optional)") },
                         singleLine = true,
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp)
@@ -1421,29 +1590,48 @@ fun MainScreen(modifier: Modifier = Modifier) {
             confirmButton = {
                 Button(
                     onClick = {
-                        val trimmedKey = newKeyInput.trim()
-                        if (trimmedKey.isNotBlank()) {
+                        val trimmedMain = editMainKeyInput.trim()
+                        val trimmedSpare = editSpareKeyInput.trim()
+                        
+                        // Save both updated keys directly to settings / preferences
+                        apiKey = trimmedMain
+                        sharedPrefs.edit().putString("gemini_api_key", trimmedMain).apply()
+                        
+                        spareApiKey = trimmedSpare
+                        sharedPrefs.edit().putString("gemini_spare_api_key", trimmedSpare).apply()
+                        
+                        // Decide which key to feed into active generation channel
+                        val nextKeyToUse = when {
+                            trimmedSpare.isNotBlank() && trimmedSpare != spareApiKey.trim() -> trimmedSpare
+                            trimmedMain.isNotBlank() && trimmedMain != apiKey.trim() -> trimmedMain
+                            trimmedSpare.isNotBlank() && !spareKeyStatus.isLimitReached -> trimmedSpare
+                            else -> trimmedMain
+                        }
+
+                        if (nextKeyToUse.isNotBlank()) {
                             coroutineScope.launch {
-                                activeNewKeyChannel?.send(trimmedKey)
+                                activeNewKeyChannel?.send(nextKeyToUse)
                             }
                             showRpdKeyDialog = false
-                            newKeyInput = ""
                         }
                     },
-                    enabled = newKeyInput.trim().isNotBlank()
+                    enabled = canProceed
                 ) {
-                    Text("API Key အသစ်ဖြင့် ဆက်လုပ်မည်")
+                    Text("သိမ်းဆည်းပြီး ဆက်လုပ်မည်")
                 }
             },
             dismissButton = {
                 OutlinedButton(
                     onClick = {
-                        coroutineScope.launch {
-                            activeNewKeyChannel?.send("") // Signal to cancel/stop
-                            activeDecisionChannel?.send(false)
-                        }
                         showRpdKeyDialog = false
-                        newKeyInput = ""
+                        if (saveCurrentProgressAndStop != null) {
+                            saveCurrentProgressAndStop?.invoke()
+                        } else {
+                            coroutineScope.launch {
+                                activeNewKeyChannel?.send("") // Signal to cancel/stop
+                                activeDecisionChannel?.send(false)
+                            }
+                        }
                     }
                 ) {
                     Text("လက်ရှိအတိုင်း သိမ်းဆည်းမည် (${rpdCountdown}s)")
