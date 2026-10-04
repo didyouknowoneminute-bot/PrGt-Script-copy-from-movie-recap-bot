@@ -29,6 +29,13 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.util.concurrent.TimeUnit
 
+data class DetectedCharacter(
+    val nameAndAppearance: String,
+    val relationshipStatus: String = "",
+    val pronoun: String,
+    val isRecommendedMain: Boolean = false
+)
+
 sealed class GenerationUpdate {
     data class Log(val message: String) : GenerationUpdate()
     data class Progress(val progress: Float) : GenerationUpdate()
@@ -36,6 +43,15 @@ sealed class GenerationUpdate {
     data class ScriptChunk(val partIndex: Int, val text: String, val isError: Boolean = false, val clearFirst: Boolean = false) : GenerationUpdate()
     data class RequireRetryDecision(val failedParts: List<Int>) : GenerationUpdate()
     data class RequireNewKeyForRpd(val failedParts: List<Int>, val currentLimit: Int) : GenerationUpdate()
+    data class RequireCharacterConfirmation(
+        val characters: List<DetectedCharacter>,
+        val recommendedIndex: Int,
+        val rawProfileText: String
+    ) : GenerationUpdate()
+    data class CharacterProfileSaved(
+        val profileText: String,
+        val confirmedMainCharacter: String
+    ) : GenerationUpdate()
     data class FileInfo(val geminiFileUri: String, val mimeType: String, val durationMs: Long) : GenerationUpdate()
     data class Error(val message: String) : GenerationUpdate()
     data class ApiCallResult(
@@ -97,7 +113,12 @@ class GeminiApiClient(private val context: Context) {
         existingGeminiFileUri: String? = null,
         existingDurationMs: Long? = null,
         specificPartsToGenerate: List<Int>? = null,
-        rpm: Int = 20
+        rpm: Int = 20,
+        characterHint: String = "",
+        characterConfirmationChannel: kotlinx.coroutines.channels.ReceiveChannel<String>? = null,
+        mediaFileName: String = "",
+        priorSeriesProfiles: Map<Int, String> = emptyMap(),
+        existingCharacterProfile: String = ""
     ): Flow<GenerationUpdate> = channelFlow {
         send(GenerationUpdate.Progress(0.0f))
         
@@ -250,9 +271,14 @@ class GeminiApiClient(private val context: Context) {
                 else -> Pair(maxOf(55, (110 * segmentDurationMins).toInt()), maxOf(77, (155 * segmentDurationMins).toInt()))
             }
             
+            val isMainCharPov = pov.contains("Main Character", ignoreCase = true) || pov.contains("First", ignoreCase = true)
             val povDetail = when {
-                pov.contains("Main Character", ignoreCase = true) || pov.contains("First", ignoreCase = true) -> 
-                    "အဓိကဇာတ်ကောင်၏ ရှုထောင့်အမြင် (First-Person POV / 'ကျွန်တော်/ကျွန်မ/ငါ') မှ ကိုယ်တိုင်ကြုံတွေ့နေရသကဲ့သို့ စကားပြောသဘာဝအတိုင်း ခံစားချက်ပြင်းပြစွာ ပြန်ပြောပြရမည်။ (စာအရေးအသားပုံစံ လုံးဝမသုံးဘဲ ကိုယ်တွေ့ပြောစကားအတိုင်း ပြောပြရမည်။)"
+                isMainCharPov -> 
+                    """
+                    အဓိကဇာတ်ကောင်၏ ရှုထောင့်အမြင် (First-Person POV / 'ကျွန်တော်/ကျွန်မ') မှ ကိုယ်တိုင်ကြုံတွေ့နေရသကဲ့သို့ စကားပြောသဘာဝအတိုင်း ခံစားချက်ပြင်းပြစွာ ပြန်ပြောပြရမည်။ (စာအရေးအသားပုံစံ လုံးဝမသုံးဘဲ ကိုယ်တွေ့ပြောစကားအတိုင်း ပြောပြရမည်။)
+                    - ပင်မဇာတ်ဆောင် တစ်ဦးတည်းကိုသာ အစမှအဆုံး 'ကျွန်တော်/ကျွန်မ' အဖြစ် တသမတ်တည်း သုံးစွဲရမည်။
+                    - အကယ်၍ ဤစက္ကန့်ပိုင်းအတွင်း ပင်မဇာတ်ဆောင် ကိုယ်တိုင် မြင်ကွင်းထဲ မပါဝင်ဘဲ အခြားဇာတ်ကောင်များသာ ပေါ်နေပါက၊ အခြားဇာတ်ကောင်ကို 'ကျွန်တော်/ကျွန်မ' ဟု လုံးဝ မပြောင်းဘဲ၊ ပင်မဇာတ်ဆောင်က အဆိုပါအခြားဇာတ်ကောင်များ၏ လှုပ်ရှားမှုကို (သူက... / အဲ့ဒီလူက.../ (နာမည်)က ဟု) ပြန်ပြောပြသည့် ပုံစံဖြင့်သာ ရေးသားရန်။
+                    """.trimIndent()
                 pov.contains("Third", ignoreCase = true) || pov.contains("Omniscient", ignoreCase = true) -> 
                     "ပြင်ပဇာတ်ကြောင်းပြောသူအမြင် (Third-Person / Omniscient Narrator) မှ 'သူ'၊ 'သူမ'၊ 'သူတို့' စသည်ဖြင့် အရာအားလုံးကို ခြုံငုံသိမြင်နေသော ပုံစံဖြင့် မိတ်ဆွေတစ်ယောက်ကို ဇာတ်လမ်းပြန်ပြောပြနေသလို စကားပြောသဘာဝအတိုင်း ဇာတ်ကြောင်းပြောပြရမည်။ (စာအရေးအသားပုံစံ လုံးဝမသုံးရ။)"
                 pov.contains("Second", ignoreCase = true) -> 
@@ -377,148 +403,171 @@ class GeminiApiClient(private val context: Context) {
             var isSpareMediaUploaded = false
             val inFlightHttpRequests = java.util.concurrent.atomic.AtomicInteger(0)
 
-            suspend fun getOrSwitchKeyAndFile(): Triple<String, String, Boolean> {
+            data class ReservedKeySlot(
+                val apiKey: String,
+                val fileUri: String,
+                val isSpare: Boolean,
+                val slotNumber: Int,
+                val totalRpdUsed: Int
+            )
+
+            suspend fun getOrSwitchKeyAndFile(): ReservedKeySlot {
                 return keyMutex.withLock {
-                    if (rpdEnabled && !hasSwitchedToSpare && mainTotalCalls >= rpdLimit) {
-                        if (spareApiKey.isNotBlank()) {
-                            send(GenerationUpdate.Log("⚠️ Main API Key RPD limit ($rpdLimit) ပြည့်သွားပါပြီ (Total: $mainTotalCalls, Success: $mainSuccessCalls, Failed: $mainFailedCalls)။"))
-                            send(GenerationUpdate.Log("🔄 Spare API Key သို့ ပြောင်းလဲအသုံးပြုနေပါသည်..."))
-                            
-                            if (!isSpareMediaUploaded && mediaUri != null) {
-                                val cachedSpare = GeminiFileKeyCache.getCachedFile(context, mediaUri, spareApiKey)
-                                if (cachedSpare != null) {
-                                    send(GenerationUpdate.Log("✅ Spare API Key အတွက် သိမ်းဆည်းထားသော Media ဖိုင်အား ပြန်လည်အသုံးပြုပါမည်။"))
-                                    activeGeminiFileUri = cachedSpare.first
-                                    isSpareMediaUploaded = true
-                                } else {
-                                    send(GenerationUpdate.Log("📤 Spare API Key ဖြင့် Media ဖိုင်အား ဆာဗာသို့ ပြန်လည် Upload တင်နေပါသည်..."))
-                                    val uploadResult = uploadFile(spareApiKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
-                                    val spareFileUriInfo = when (uploadResult) {
-                                        is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
-                                        is UploadResult.Failure -> {
-                                            send(GenerationUpdate.Error("Spare API Key ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
-                                            throw Exception("Spare API Key upload failed: ${uploadResult.errorDetail}")
-                                        }
-                                    }
-                                    
-                                    if (mediaMimeType?.startsWith("video") == true) {
-                                        send(GenerationUpdate.Log("[Spare Key] Waiting for Gemini server to process video..."))
-                                        var isActive = false
-                                        while (!isActive) {
-                                            val state = checkFileState(spareApiKey, spareFileUriInfo.second)
-                                            if (state == "ACTIVE") {
-                                                isActive = true
-                                            } else if (state == "FAILED") {
-                                                send(GenerationUpdate.Error("Gemini server failed to process video with Spare API Key."))
-                                                throw Exception("Gemini server failed to process video with Spare API Key")
-                                            } else {
-                                                delay(3000)
+                    var reservedSlot: ReservedKeySlot? = null
+                    while (reservedSlot == null) {
+                        if (rpdEnabled && !hasSwitchedToSpare && mainTotalCalls >= rpdLimit) {
+                            if (spareApiKey.isNotBlank()) {
+                                send(GenerationUpdate.Log("⚠️ Main API Key RPD limit ($rpdLimit) ပြည့်သွားပါပြီ (Total: $mainTotalCalls, Success: $mainSuccessCalls, Failed: $mainFailedCalls)။"))
+                                send(GenerationUpdate.Log("🔄 Spare API Key သို့ ပြောင်းလဲအသုံးပြုနေပါသည်..."))
+                                
+                                if (!isSpareMediaUploaded && mediaUri != null) {
+                                    val cachedSpare = GeminiFileKeyCache.getCachedFile(context, mediaUri, spareApiKey)
+                                    if (cachedSpare != null) {
+                                        send(GenerationUpdate.Log("✅ Spare API Key အတွက် သိမ်းဆည်းထားသော Media ဖိုင်အား ပြန်လည်အသုံးပြုပါမည်။"))
+                                        activeGeminiFileUri = cachedSpare.first
+                                        isSpareMediaUploaded = true
+                                    } else {
+                                        send(GenerationUpdate.Log("📤 Spare API Key ဖြင့် Media ဖိုင်အား ဆာဗာသို့ ပြန်လည် Upload တင်နေပါသည်..."))
+                                        val uploadResult = uploadFile(spareApiKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
+                                        val spareFileUriInfo = when (uploadResult) {
+                                            is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
+                                            is UploadResult.Failure -> {
+                                                send(GenerationUpdate.Error("Spare API Key ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
+                                                throw Exception("Spare API Key upload failed: ${uploadResult.errorDetail}")
                                             }
                                         }
+                                        
+                                        if (mediaMimeType?.startsWith("video") == true) {
+                                            send(GenerationUpdate.Log("[Spare Key] Waiting for Gemini server to process video..."))
+                                            var isActive = false
+                                            while (!isActive) {
+                                                val state = checkFileState(spareApiKey, spareFileUriInfo.second)
+                                                if (state == "ACTIVE") {
+                                                    isActive = true
+                                                } else if (state == "FAILED") {
+                                                    send(GenerationUpdate.Error("Gemini server failed to process video with Spare API Key."))
+                                                    throw Exception("Gemini server failed to process video with Spare API Key")
+                                                } else {
+                                                    delay(3000)
+                                                }
+                                            }
+                                        }
+                                        GeminiFileKeyCache.saveCachedFile(context, mediaUri, spareApiKey, spareFileUriInfo.first, spareFileUriInfo.second)
+                                        activeGeminiFileUri = spareFileUriInfo.first
+                                        isSpareMediaUploaded = true
+                                        send(GenerationUpdate.Log("✅ Spare API Key ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
                                     }
-                                    GeminiFileKeyCache.saveCachedFile(context, mediaUri, spareApiKey, spareFileUriInfo.first, spareFileUriInfo.second)
-                                    activeGeminiFileUri = spareFileUriInfo.first
-                                    isSpareMediaUploaded = true
-                                    send(GenerationUpdate.Log("✅ Spare API Key ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
+                                }
+                                
+                                activeApiKey = spareApiKey
+                                hasSwitchedToSpare = true
+                                send(GenerationUpdate.Log("🚀 ကျန်ရှိသော Script အပိုင်းများကို Spare API Key ဖြင့် ဆက်လက်ထုတ်လုပ်ပါမည်။"))
+                            } else {
+                                send(GenerationUpdate.Log("⚠️ Main API Key RPD limit ($rpdLimit) ပြည့်သွားသော်လည်း Spare API Key ထည့်သွင်းထားခြင်း မရှိပါ။"))
+                            }
+                        }
+
+                        // Check if both keys (or active key) are exhausted
+                        val isExhausted = rpdEnabled && (
+                            (hasSwitchedToSpare && spareTotalCalls >= rpdLimit) ||
+                            (!hasSwitchedToSpare && spareApiKey.isBlank() && mainTotalCalls >= rpdLimit)
+                        )
+
+                        if (isExhausted && newKeyChannel != null) {
+                            // If there are in-flight HTTP requests currently awaiting response from Gemini server,
+                            // do not send new requests and wait until all in-flight requests finish processing!
+                            if (inFlightHttpRequests.get() > 0) {
+                                send(GenerationUpdate.Log("⏳ RPD ပြည့်သွားပါပြီ။ လက်ရှိ ဆာဗာသို့ ပို့ထားပြီးသော Processing requests (${inFlightHttpRequests.get()} ခု) ၏ response များ အပြီးထိ စောင့်ဆိုင်းနေပါသည်..."))
+                                while (inFlightHttpRequests.get() > 0) {
+                                    delay(500)
+                                }
+                                send(GenerationUpdate.Log("✅ လက်ရှိ Processing requests အားလုံး response ရရှိပြီးစီးပါပြီ။"))
+                            }
+
+                            send(GenerationUpdate.Log("⚠️ API Keys အားလုံး၏ RPD Limit ($rpdLimit/$rpdLimit ကြိမ်) ပြည့်သွားပါပြီ။ API Key အသစ် တောင်းခံနေပါသည်..."))
+                            send(GenerationUpdate.RequireNewKeyForRpd(emptyList(), rpdLimit))
+                            val userSuppliedKey = newKeyChannel.receive()
+                            if (userSuppliedKey.isNotBlank()) {
+                                send(GenerationUpdate.Log("🔑 API Key အသစ် ရရှိပါပြီ။ Media ဖိုင်အား API Key အသစ်ဖြင့် စစ်ဆေး/Upload တင်နေပါသည်..."))
+                                activeApiKey = userSuppliedKey
+                                if (mediaUri != null) {
+                                    val cachedNewKey = GeminiFileKeyCache.getCachedFile(context, mediaUri, userSuppliedKey)
+                                    if (cachedNewKey != null) {
+                                        send(GenerationUpdate.Log("✅ API Key အသစ်အတွက် Cached Media ဖိုင်အား ချက်ချင်းအသုံးပြုပါမည်။"))
+                                        activeGeminiFileUri = cachedNewKey.first
+                                    } else {
+                                        send(GenerationUpdate.Log("📤 API Key အသစ်ဆီသို့ Media ဖိုင် အသစ်ပြန်လည် Upload တင်နေပါသည်..."))
+                                        val uploadResult = uploadFile(userSuppliedKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
+                                        val newFileUriInfo = when (uploadResult) {
+                                            is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
+                                            is UploadResult.Failure -> {
+                                                send(GenerationUpdate.Error("API Key အသစ်ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
+                                                throw Exception("New API Key upload failed: ${uploadResult.errorDetail}")
+                                            }
+                                        }
+                                        if (mediaMimeType?.startsWith("video") == true) {
+                                            send(GenerationUpdate.Log("[New Key] Waiting for Gemini server to process video..."))
+                                            var isActive = false
+                                            while (!isActive) {
+                                                val state = checkFileState(userSuppliedKey, newFileUriInfo.second)
+                                                if (state == "ACTIVE") {
+                                                    isActive = true
+                                                } else if (state == "FAILED") {
+                                                    send(GenerationUpdate.Error("Gemini server failed to process video with new API Key."))
+                                                    throw Exception("Gemini server failed to process video with new API Key")
+                                                } else {
+                                                    delay(3000)
+                                                }
+                                            }
+                                        }
+                                        GeminiFileKeyCache.saveCachedFile(context, mediaUri, userSuppliedKey, newFileUriInfo.first, newFileUriInfo.second)
+                                        activeGeminiFileUri = newFileUriInfo.first
+                                        send(GenerationUpdate.Log("✅ API Key အသစ်ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
+                                    }
+                                }
+                                // Reset key call tracker for this new key session
+                                hasSwitchedToSpare = true
+                                spareTotalCalls = RpdTracker.getStatus(context, userSuppliedKey, rpdLimit).usedCount
+                                if (spareTotalCalls >= rpdLimit) {
+                                    send(GenerationUpdate.Log("⚠️ ထည့်သွင်းလိုက်သော API Key အသစ်သည်လည်း ယနေ့အတွက် RPD Limit ($spareTotalCalls/$rpdLimit) ပြည့်နေပြီးသား ဖြစ်နေပါသည်။ နောက်ထပ် Key အသစ် ထပ်မံတောင်းခံပါမည်..."))
+                                    continue
                                 }
                             }
-                            
-                            activeApiKey = spareApiKey
-                            hasSwitchedToSpare = true
-                            send(GenerationUpdate.Log("🚀 ကျန်ရှိသော Script အပိုင်းများကို Spare API Key ဖြင့် ဆက်လက်ထုတ်လုပ်ပါမည်။"))
+                        }
+
+                        // Atomically reserve and record the RPD call slot right inside keyMutex so no concurrent caller can exceed rpdLimit
+                        val slotNum = if (!hasSwitchedToSpare) {
+                            mainTotalCalls++
+                            if (rpdEnabled) {
+                                RpdTracker.recordCall(context, activeApiKey)
+                            }
+                            mainTotalCalls
                         } else {
-                            send(GenerationUpdate.Log("⚠️ Main API Key RPD limit ($rpdLimit) ပြည့်သွားသော်လည်း Spare API Key ထည့်သွင်းထားခြင်း မရှိပါ။"))
-                        }
-                    }
-
-                    // Check if both keys (or active key) are exhausted
-                    val isExhausted = rpdEnabled && (
-                        (hasSwitchedToSpare && spareTotalCalls >= rpdLimit) ||
-                        (!hasSwitchedToSpare && spareApiKey.isBlank() && mainTotalCalls >= rpdLimit)
-                    )
-
-                    if (isExhausted && newKeyChannel != null) {
-                        // If there are in-flight HTTP requests currently awaiting response from Gemini server,
-                        // do not send new requests and wait until all in-flight requests finish processing!
-                        if (inFlightHttpRequests.get() > 0) {
-                            send(GenerationUpdate.Log("⏳ RPD ပြည့်သွားပါပြီ။ လက်ရှိ ဆာဗာသို့ ပို့ထားပြီးသော Processing requests (${inFlightHttpRequests.get()} ခု) ၏ response များ အပြီးထိ စောင့်ဆိုင်းနေပါသည်..."))
-                            while (inFlightHttpRequests.get() > 0) {
-                                delay(500)
+                            spareTotalCalls++
+                            if (rpdEnabled) {
+                                RpdTracker.recordCall(context, activeApiKey)
                             }
-                            send(GenerationUpdate.Log("✅ လက်ရှိ Processing requests အားလုံး response ရရှိပြီးစီးပါပြီ။"))
+                            spareTotalCalls
                         }
+                        val totalUsed = mainTotalCalls + spareTotalCalls
 
-                        send(GenerationUpdate.Log("⚠️ API Keys အားလုံး၏ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ။ API Key အသစ် တောင်းခံနေပါသည်..."))
-                        send(GenerationUpdate.RequireNewKeyForRpd(emptyList(), rpdLimit))
-                        val userSuppliedKey = newKeyChannel.receive()
-                        if (userSuppliedKey.isNotBlank()) {
-                            send(GenerationUpdate.Log("🔑 API Key အသစ် ရရှိပါပြီ။ Media ဖိုင်အား API Key အသစ်ဖြင့် စစ်ဆေး/Upload တင်နေပါသည်..."))
-                            activeApiKey = userSuppliedKey
-                            if (mediaUri != null) {
-                                val cachedNewKey = GeminiFileKeyCache.getCachedFile(context, mediaUri, userSuppliedKey)
-                                if (cachedNewKey != null) {
-                                    send(GenerationUpdate.Log("✅ API Key အသစ်အတွက် Cached Media ဖိုင်အား ချက်ချင်းအသုံးပြုပါမည်။"))
-                                    activeGeminiFileUri = cachedNewKey.first
-                                } else {
-                                    send(GenerationUpdate.Log("📤 API Key အသစ်ဆီသို့ Media ဖိုင် အသစ်ပြန်လည် Upload တင်နေပါသည်..."))
-                                    val uploadResult = uploadFile(userSuppliedKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
-                                    val newFileUriInfo = when (uploadResult) {
-                                        is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
-                                        is UploadResult.Failure -> {
-                                            send(GenerationUpdate.Error("API Key အသစ်ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
-                                            throw Exception("New API Key upload failed: ${uploadResult.errorDetail}")
-                                        }
-                                    }
-                                    if (mediaMimeType?.startsWith("video") == true) {
-                                        send(GenerationUpdate.Log("[New Key] Waiting for Gemini server to process video..."))
-                                        var isActive = false
-                                        while (!isActive) {
-                                            val state = checkFileState(userSuppliedKey, newFileUriInfo.second)
-                                            if (state == "ACTIVE") {
-                                                isActive = true
-                                            } else if (state == "FAILED") {
-                                                send(GenerationUpdate.Error("Gemini server failed to process video with new API Key."))
-                                                throw Exception("Gemini server failed to process video with new API Key")
-                                            } else {
-                                                delay(3000)
-                                            }
-                                        }
-                                    }
-                                    GeminiFileKeyCache.saveCachedFile(context, mediaUri, userSuppliedKey, newFileUriInfo.first, newFileUriInfo.second)
-                                    activeGeminiFileUri = newFileUriInfo.first
-                                    send(GenerationUpdate.Log("✅ API Key အသစ်ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
-                                }
-                            }
-                            // Reset key call tracker for this new key session
-                            hasSwitchedToSpare = true
-                            spareTotalCalls = RpdTracker.getStatus(context, userSuppliedKey, rpdLimit).usedCount
-                        }
+                        reservedSlot = ReservedKeySlot(
+                            apiKey = activeApiKey,
+                            fileUri = activeGeminiFileUri,
+                            isSpare = hasSwitchedToSpare,
+                            slotNumber = slotNum,
+                            totalRpdUsed = totalUsed
+                        )
                     }
-
-                    Triple(activeApiKey, activeGeminiFileUri, hasSwitchedToSpare)
+                    reservedSlot!!
                 }
             }
 
-            suspend fun recordRequestSent(isSpare: Boolean, callApiKey: String) {
-                keyMutex.withLock {
-                    if (!isSpare) {
-                        mainTotalCalls++
-                        if (rpdEnabled) {
-                            RpdTracker.recordCall(context, callApiKey)
-                        }
-                    } else {
-                        spareTotalCalls++
-                        if (rpdEnabled) {
-                            RpdTracker.recordCall(context, callApiKey)
-                        }
-                    }
-                    val currentRpdTotal = mainTotalCalls + spareTotalCalls
-                    if (rpdEnabled) {
-                        val keyName = if (isSpare) "Spare Key" else "Main Key"
-                        val countOnKey = if (isSpare) spareTotalCalls else mainTotalCalls
-                        val remainingOnKey = (rpdLimit - countOnKey).coerceAtLeast(0)
-                        send(GenerationUpdate.Log("ℹ️ RPD [$keyName]: Outgoing Request Sent #$countOnKey/$rpdLimit (Available: $remainingOnKey, Total: $currentRpdTotal)"))
-                    }
+            suspend fun logReservedRequestSent(slot: ReservedKeySlot) {
+                if (rpdEnabled) {
+                    val keyName = if (slot.isSpare) "Spare Key" else "Main Key"
+                    val remainingOnKey = (rpdLimit - slot.slotNumber).coerceAtLeast(0)
+                    send(GenerationUpdate.Log("ℹ️ RPD [$keyName]: Outgoing Request Sent #${slot.slotNumber}/$rpdLimit (Available: $remainingOnKey, Total: ${slot.totalRpdUsed})"))
                 }
             }
 
@@ -543,6 +592,236 @@ class GeminiApiClient(private val context: Context) {
                 }
             }
 
+            // Pre-Analysis Step: Extract Character Profile & Protagonist Identity (Plot Spoiler Free)
+            var confirmedMainCharacter = characterHint.trim()
+            val seriesInfo = GeminiFileKeyCache.parseSeriesInfo(mediaFileName)
+            val combinedPriorMap = priorSeriesProfiles
+                .filterKeys { k -> seriesInfo.partNumber == null || k != seriesInfo.partNumber }
+                .toSortedMap()
+
+            val priorContextKey = if (combinedPriorMap.isNotEmpty()) {
+                combinedPriorMap.entries.joinToString("|") { "${it.key}:${it.value.hashCode()}" }
+            } else ""
+
+            var extractedCharacterProfile = existingCharacterProfile.trim().ifBlank {
+                GeminiFileKeyCache.getCachedCharacterProfile(
+                    context = context,
+                    mediaUri = mediaUri,
+                    geminiFileUri = finalGeminiFileUri,
+                    characterHint = priorContextKey,
+                    language = language,
+                    fileName = mediaFileName
+                ) ?: ""
+            }
+
+            if (extractedCharacterProfile.isNotBlank()) {
+                send(GenerationUpdate.Log("✅ Cached Character Profile & Relationship Status အား ပြန်လည်အသုံးပြုပါမည်။"))
+            } else {
+                if (combinedPriorMap.isNotEmpty()) {
+                    val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
+                    send(GenerationUpdate.Log("🔗 အရှေ့အပိုင်းများ ($priorPartNames) မှ Character List နှင့် Relationship Status များကို ဆွဲယူပြီး ယခုအပိုင်းနှင့် ပေါင်းစည်းစစ်ဆေးနေပါသည်..."))
+                } else {
+                    send(GenerationUpdate.Log("🔍 ဗီဒီယိုတစ်ပုဒ်လုံး၏ Character Profile နှင့် ပင်မဇာတ်ဆောင် (Main Protagonist) သတ်မှတ်ချက်ကို ဦးစွာ စစ်ဆေးထုတ်ယူနေပါသည်..."))
+                }
+                val preSlot = getOrSwitchKeyAndFile()
+                acquireRateLimitSlot()
+                val hintInstruction = if (characterHint.isNotBlank()) {
+                    "User သတ်မှတ်ပေးထားသော အဓိကဇာတ်ဆောင် (User Hint): \"$characterHint\" — ဤသတ်မှတ်ချက်ကို အဓိက ဦးစားပေးအတည်ပြု၍ ပင်မဇာတ်ဆောင်အဖြစ် သတ်မှတ်ပေးပါ။"
+                } else {
+                    "ဗီဒီယို/အသံဖိုင် တစ်ခုလုံးတွင် အဓိကအကျဆုံး ပင်မဇာတ်ဆောင် (Main Protagonist) တစ်ဦးတည်းကို အတိအကျ ရွေးချယ်သတ်မှတ်ပေးပါ။"
+                }
+                val priorSeriesInstruction = if (combinedPriorMap.isNotEmpty()) {
+                    buildString {
+                        appendLine("အရေးကြီးသော အရှေ့အပိုင်းများ၏ ဇာတ်ကောင်နှင့် ဆက်ဆံရေး မှတ်တမ်း (Previous Parts Character & Relationship Reference):")
+                        combinedPriorMap.forEach { (partNum, pText) ->
+                            appendLine("--- [Part $partNum မှတ်တမ်း] ---")
+                            appendLine(pText.trim())
+                        }
+                        appendLine()
+                        appendLine("ပေါင်းစည်းရန် စည်းကမ်းချက် (Smart Merge & Deduplication Rule):")
+                        appendLine("1. အထက်ပါ အရှေ့အပိုင်းများမှ ဇာတ်ကောင်များနှင့် ယခု Video Part တွင် ပါဝင်သော ဇာတ်ကောင်များကို ပေါင်းစပ်၍ စုစုပေါင်း Unified Character List တစ်ခုတည်းအဖြစ် ထုတ်ပေးပါ။")
+                        appendLine("2. ထပ်နေသော ဇာတ်ကောင်များ (Duplicate Characters) ကို လုံးဝ နှစ်ကြောင်းမရေးဘဲ တစ်ကြောင်းတည်းအဖြစ် ပေါင်းစည်း (Merge) ပေးပါ။")
+                        appendLine("3. ဇာတ်ကောင်များ၏ အမည်၊ နာမ်စား နှင့် ပင်မဇာတ်ဆောင် (MAIN) သတ်မှတ်ချက်ကို အရှေ့အပိုင်းများနှင့် တသမတ်တည်း (Consistent) ဖြစ်အောင် ထိန်းသိမ်းပါ။")
+                        appendLine("4. အကယ်၍ ယခုအပိုင်းတွင် ဇာတ်ကောင်အချင်းချင်း Relationship Status ပြောင်းလဲ/တိုးတက်သွားပါက နောက်ဆုံးအခြေအနေ (Updated Relationship Status) ကို ရေးပေးပြီး၊ ဇာတ်ကောင်အသစ်များ ပါလာပါက အသစ်ထပ်ပေါင်းထည့်ပေးပါ။")
+                    }
+                } else ""
+
+                val profilePrompt = """
+                    ဤ Media ဖိုင်တစ်ခုလုံးကို စစ်ဆေးပြီး အဓိကဇာတ်ကောင်များစာရင်းနှင့် ၎င်းတို့အချင်းချင်း တော်စပ်ပုံ/ဆက်ဆံရေး (Relationship Status) ကို အောက်ပါ သတ်မှတ်ထားသော Format အတိုင်း တိကျရှင်းလင်းစွာ ထုတ်ပေးပါ။
+                    (အရေးကြီးသတိပေးချက်: ဇာတ်လမ်းအဖြစ်အပျက်များ / Plot Summary / Spoiler လုံးဝ (လုံးဝ) မထည့်ရပါ။ ဇာတ်ကောင်များ၏ အချက်အလက်နှင့် တော်စပ်ပုံ သက်သက်ကိုသာ ထုတ်ပေးရမည်။)
+
+                    $hintInstruction
+
+                    $priorSeriesInstruction
+
+                    Output Format (ဇာတ်ကောင်တစ်ဦးချင်းစီကို အောက်ပါပုံစံအတိုင်း တစ်ကြောင်းစီ ရေးပေးပါ):
+                    CHARACTER_ITEM: [MAIN သို့မဟုတ် SUPPORT] | [အမည်/ခေါ်ဝေါ်ပုံ နှင့် ဝတ်စုံအရောင်/ပုံပန်းသဏ္ဌာန် အမှတ်အသား] | [Relationship Status - ပင်မဇာတ်ဆောင်နှင့် တော်စပ်ပုံ/ဆက်ဆံရေး] | [First-Person POV သုံးရမည့် နာမ်စား - ကျွန်တော် သို့မဟုတ် ကျွန်မ]
+
+                    ဥပမာ:
+                    CHARACTER_ITEM: MAIN | ဂျွန် (အင်္ကျီအနက်ဝတ်ထားသော လူငယ်) | အဓိကဇာတ်ဆောင် (မေရီ၏ ချစ်သူ / မိုက်ခ်၏ သူငယ်ချင်း) | ကျွန်တော်
+                    CHARACTER_ITEM: SUPPORT | မိုက်ခ် (ဦးထုပ်အဖြူဆောင်းထားသော အဖော်) | ဂျွန်၏ အချစ်ဆုံးသူငယ်ချင်း | ကျွန်တော်
+                    CHARACTER_ITEM: SUPPORT | မေရီ (အင်္ကျီအနီဝတ် အမျိုးသမီး) | ဂျွန်၏ ချစ်သူ/ဇနီး | ကျွန်မ
+
+                    (မှတ်ချက် - ပင်မဇာတ်ဆောင် အဖြစ် အသင့်တော်ဆုံး တစ်ဦးတည်းကိုသာ MAIN ဟု သတ်မှတ်ပြီး ကျန်ဇာတ်ကောင်များကို SUPPORT ဟု သတ်မှတ်ပါ။ ဇာတ်ကောင်တစ်ဦးလျှင် တစ်ကြောင်းသာ ရေးပါ။)
+                """.trimIndent()
+
+                val profileBodyJson = JSONObject().apply {
+                    put("contents", JSONArray().apply {
+                        put(JSONObject().apply {
+                            put("role", "user")
+                            put("parts", JSONArray().apply {
+                                put(JSONObject().apply {
+                                    put("file_data", JSONObject().apply {
+                                        put("mime_type", mediaMimeType ?: "video/mp4")
+                                        put("file_uri", preSlot.fileUri)
+                                    })
+                                })
+                                put(JSONObject().apply {
+                                    put("text", profilePrompt)
+                                })
+                            })
+                        })
+                    })
+                }
+                val profileReqBody = profileBodyJson.toString().toRequestBody("application/json".toMediaTypeOrNull())
+                val profileReq = Request.Builder()
+                    .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:generateContent?key=${preSlot.apiKey}")
+                    .post(profileReqBody)
+                    .build()
+
+                logReservedRequestSent(preSlot)
+                workingCount.incrementAndGet()
+                inFlightHttpRequests.incrementAndGet()
+                try {
+                    client.newCall(profileReq).execute().use { resp ->
+                        if (resp.isSuccessful) {
+                            val bodyStr = resp.body?.string() ?: "{}"
+                            val rootObj = JSONObject(bodyStr)
+                            val candidates = rootObj.optJSONArray("candidates")
+                            val sb = StringBuilder()
+                            if (candidates != null && candidates.length() > 0) {
+                                val partsArr = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
+                                if (partsArr != null) {
+                                    for (pIdx in 0 until partsArr.length()) {
+                                        sb.append(partsArr.getJSONObject(pIdx).optString("text", ""))
+                                    }
+                                }
+                            }
+                            val textOut = sb.toString().trim()
+                            if (textOut.isNotBlank()) {
+                                extractedCharacterProfile = textOut
+                                recordCallOutcome(preSlot.isSpare, true)
+                                GeminiFileKeyCache.saveCachedCharacterProfile(
+                                    context = context,
+                                    mediaUri = mediaUri,
+                                    geminiFileUri = finalGeminiFileUri,
+                                    characterHint = priorContextKey,
+                                    language = language,
+                                    profileText = textOut,
+                                    fileName = mediaFileName
+                                )
+                                send(GenerationUpdate.Log("✅ Character Profile & Relationship Status ရရှိပြီးစီးပါပြီ။"))
+                            } else {
+                                recordCallOutcome(preSlot.isSpare, false)
+                                send(GenerationUpdate.Log("⚠️ Character Profile အလွတ်ဖြစ်နေသဖြင့် သတ်မှတ်ထားသော POV စည်းကမ်းချက်ဖြင့် ဆက်လက်လုပ်ဆောင်ပါမည်။"))
+                            }
+                        } else {
+                            recordCallOutcome(preSlot.isSpare, false)
+                            val errBody = resp.body?.string() ?: ""
+                            val errMsg = extractApiErrorMessage(resp.code, resp.message, errBody)
+                            send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးမှု မအောင်မြင်ပါ (HTTP ${resp.code} - $errMsg)။ သတ်မှတ်ထားသော POV စည်းကမ်းချက်ဖြင့် ဆက်လက်လုပ်ဆောင်ပါမည်။"))
+                        }
+                    }
+                } catch (e: Exception) {
+                    recordCallOutcome(preSlot.isSpare, false)
+                    send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးစဉ် Network Error (${e.message}) ဖြစ်ပေါ်ခဲ့သော်လည်း ဆက်လက်လုပ်ဆောင်ပါမည်။"))
+                } finally {
+                    workingCount.decrementAndGet()
+                    inFlightHttpRequests.decrementAndGet()
+                }
+            }
+
+            // Parse detected characters for user confirmation dialog when Main Character POV is selected
+            if (isMainCharPov && extractedCharacterProfile.isNotBlank() && specificPartsToGenerate == null) {
+                val parsedCharacters = mutableListOf<DetectedCharacter>()
+                extractedCharacterProfile.lines().forEach { line ->
+                    val trimmed = line.trim().removePrefix("-").removePrefix("*").trim()
+                    if (trimmed.contains("CHARACTER_ITEM:", ignoreCase = true) || trimmed.contains("|")) {
+                        val content = trimmed.substringAfter("CHARACTER_ITEM:", trimmed).trim()
+                        val segments = content.split("|").map { it.trim() }
+                        if (segments.size >= 4) {
+                            val roleTag = segments[0].uppercase()
+                            val isMain = roleTag.contains("MAIN")
+                            val desc = segments[1]
+                            val relationship = segments[2]
+                            val pronoun = segments[3].ifBlank { "ကျွန်တော်" }
+                            if (desc.isNotBlank()) {
+                                parsedCharacters.add(DetectedCharacter(desc, relationship, pronoun, isMain))
+                            }
+                        } else if (segments.size >= 2) {
+                            val roleTag = segments[0].uppercase()
+                            val isMain = roleTag.contains("MAIN")
+                            val desc = segments[1]
+                            val pronoun = if (segments.size >= 3 && segments[2].isNotBlank()) segments[2] else "ကျွန်တော်"
+                            if (desc.isNotBlank()) {
+                                parsedCharacters.add(DetectedCharacter(desc, "", pronoun, isMain))
+                            }
+                        }
+                    }
+                }
+                if (parsedCharacters.isEmpty()) {
+                    // Fallback single item from non-empty lines if model didn't strictly use pipes
+                    val firstMeaningful = extractedCharacterProfile.lines()
+                        .map { it.trim() }
+                        .firstOrNull { it.isNotBlank() && !it.startsWith("1.") && !it.startsWith("2.") }
+                        ?: extractedCharacterProfile.lines().firstOrNull { it.isNotBlank() }?.trim()
+                        ?: ""
+                    if (firstMeaningful.isNotBlank()) {
+                        val pronoun = if (extractedCharacterProfile.contains("ကျွန်မ")) "ကျွန်မ" else "ကျွန်တော်"
+                        parsedCharacters.add(DetectedCharacter(firstMeaningful.take(120), "", pronoun, true))
+                    }
+                }
+
+                if (parsedCharacters.isNotEmpty() && characterConfirmationChannel != null) {
+                    val recIdx = parsedCharacters.indexOfFirst { it.isRecommendedMain }.let { if (it >= 0) it else 0 }
+                    send(GenerationUpdate.Log("⏳ User ထံမှ Main Character အတည်ပြုချက် (10s Auto-Continue) စောင့်ဆိုင်းနေပါသည်..."))
+                    send(GenerationUpdate.RequireCharacterConfirmation(
+                        characters = parsedCharacters,
+                        recommendedIndex = recIdx,
+                        rawProfileText = extractedCharacterProfile
+                    ))
+                    val selectedCharSummary = characterConfirmationChannel.receive()
+                    if (selectedCharSummary.isNotBlank()) {
+                        confirmedMainCharacter = selectedCharSummary.trim()
+                        send(GenerationUpdate.Log("👤 အတည်ပြုလိုက်သော ပင်မဇာတ်ဆောင် (Main Character): $confirmedMainCharacter"))
+                    }
+                }
+            }
+
+            if (extractedCharacterProfile.isNotBlank()) {
+                send(GenerationUpdate.CharacterProfileSaved(
+                    profileText = extractedCharacterProfile,
+                    confirmedMainCharacter = confirmedMainCharacter
+                ))
+            }
+
+            val characterContinuityRules = buildString {
+                if (confirmedMainCharacter.isNotBlank()) {
+                    appendLine("- အတည်ပြုထားသော ပင်မဇာတ်ဆောင် (Confirmed Main Protagonist): $confirmedMainCharacter (ဤဇာတ်ကောင် တစ်ဦးတည်းကိုသာ ပင်မဇာတ်ဆောင်အဖြစ် သတ်မှတ်ရန်)")
+                }
+                if (extractedCharacterProfile.isNotBlank()) {
+                    appendLine("- ဗီဒီယိုတစ်ပုဒ်လုံး၏ Character Profile & Supporting Characters:")
+                    appendLine(extractedCharacterProfile)
+                }
+                if (isMainCharPov) {
+                    appendLine("- Main Character Continuity စည်းကမ်းချက်: အထက်ပါ အတည်ပြုထားသော ပင်မဇာတ်ဆောင် (Main Protagonist) တစ်ဦးတည်းကိုသာ Part 1 မှ နောက်ဆုံး Part အထိ 'ကျွန်တော်/ကျွန်မ' အဖြစ် တသမတ်တည်း သုံးစွဲရမည်။")
+                    appendLine("- Relationship Status အသုံးပြုရန် စည်းကမ်းချက်: အခြားဇာတ်ကောင်များကို ရည်ညွှန်းရာတွင် အထက်ပါ Character Profile ရှိ ပင်မဇာတ်ဆောင်နှင့် တော်စပ်ပုံ/ဆက်ဆံရေး (Relationship Status - ဥပမာ ကျွန်တော့်အမေ၊ ကျွန်တော့်ချစ်သူ၊ ကျွန်တော့်သူငယ်ချင်း စသည်) အတိုင်း သဘာဝကျကျ တသမတ်တည်း ခေါ်ဝေါ်ရေးသားရန်။")
+                    appendLine("- မြင်ကွင်းထဲ မပါချိန် စည်းကမ်းချက် (Off-Screen Continuity Rule): အကယ်၍ ဤစက္ကန့်ပိုင်းအတွင်း ပင်မဇာတ်ဆောင် ကိုယ်တိုင် မြင်ကွင်းထဲ မပါဝင်ဘဲ အခြားဇာတ်ကောင်များသာ ပေါ်နေပါက၊ အခြားဇာတ်ကောင်ကို 'ကျွန်တော်/ကျွန်မ' ဟု လုံးဝ မပြောင်းဘဲ၊ ပင်မဇာတ်ဆောင်က အဆိုပါအခြားဇာတ်ကောင်များ၏ လှုပ်ရှားမှုကို (သူက... / အဲ့ဒီလူက.../ (နာမည်/တော်စပ်ပုံ)က ဟု) ပြန်ပြောပြသည့် ပုံစံဖြင့်သာ ရေးသားရန်။")
+                } else {
+                    appendLine("- Character & Relationship Continuity စည်းကမ်းချက်: အပိုင်းတိုင်းတွင် ဇာတ်ကောင်များ၏ အမည်၊ ခေါ်ဝေါ်ပုံနှင့် အချင်းချင်း တော်စပ်ပုံ (Relationship Status) များကို အထက်ပါ Character Profile အတိုင်း တသမတ်တည်း သုံးစွဲရန်။")
+                }
+            }.trim()
+
             var remainingFailedParts = listOf<Int>()
             coroutineScope {
                 val statusTimerJob = launch {
@@ -562,17 +841,27 @@ class GeminiApiClient(private val context: Context) {
 
                 try {
                     coroutineScope {
+                        // Queue all parts upfront so the user sees them queued before sequential rate-limited dispatch
+                        partsToProcess.forEach { i ->
+                            val startMs = i * segmentDurationMs
+                            val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
+                            val startStr = formatTime(startMs)
+                            val endStr = formatTime(endMs)
+                            send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true))
+                            send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
+                        }
+
                         partsToProcess.forEachIndexed { index, i ->
                             val startMs = i * segmentDurationMs
                             val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
                             val startStr = formatTime(startMs)
                             val endStr = formatTime(endMs)
 
-                            send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true))
-                            send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
+                            // Acquire key and rate-limit slot sequentially BEFORE launching so Part 1, Part 2, Part 3... always send in strict order
+                            val initialKeyAndFile = getOrSwitchKeyAndFile()
+                            acquireRateLimitSlot()
 
                             launch {
-                                workingCount.incrementAndGet()
                                 try {
 
                         val timingConstraint = if (isVideo) {
@@ -596,11 +885,13 @@ class GeminiApiClient(private val context: Context) {
                             1. Input Media Analysis:
                             $modalityInstruction
                             2. Narrator POV: $povDetail
-                            3. Script Tone: $toneDetail
-                            4. Length Constraint: $lengthInstruction
-                            5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
-                            6. Timing & Context: $timingConstraint
-                            7. Language Constraints: $languageConstraint
+                            3. Character Profile & Continuity:
+                            $characterContinuityRules
+                            4. Script Tone: $toneDetail
+                            5. Length Constraint: $lengthInstruction
+                            6. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
+                            7. Timing & Context: $timingConstraint
+                            8. Language Constraints: $languageConstraint
                         """.trimIndent()
 
                         val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို PrGt's Script ရေးသားပေးပါ။"
@@ -647,15 +938,18 @@ class GeminiApiClient(private val context: Context) {
                         
                         while (!success && attempts < maxAttempts) {
                             attempts++
-                            if (attempts > 1) {
+                            val activeSlot = if (attempts == 1) {
+                                initialKeyAndFile
+                            } else {
                                 send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
+                                val retryKeyAndFile = getOrSwitchKeyAndFile()
+                                acquireRateLimitSlot()
+                                retryKeyAndFile
                             }
-                            
-                            val (callApiKey, callFileUri, isSpareCall) = getOrSwitchKeyAndFile()
+                            val callApiKey = activeSlot.apiKey
+                            val callFileUri = activeSlot.fileUri
+                            val isSpareCall = activeSlot.isSpare
                             val keyLabel = if (isSpareCall) " [Spare Key]" else ""
-                            
-                            // Strictly enforce RPM slot right before sending the actual HTTP request
-                            acquireRateLimitSlot()
                             
                             send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""}$keyLabel to AI..."))
                             
@@ -673,7 +967,8 @@ class GeminiApiClient(private val context: Context) {
                                 .post(requestBody)
                                 .build()
                             
-                            recordRequestSent(isSpareCall, callApiKey)
+                            logReservedRequestSent(activeSlot)
+                            workingCount.incrementAndGet()
                             inFlightHttpRequests.incrementAndGet()
                             
                             try {
@@ -731,6 +1026,7 @@ class GeminiApiClient(private val context: Context) {
                                     send(GenerationUpdate.ScriptChunk(i, "Network Error in Part ${i + 1}: ${e.message}\n\n", isError = true))
                                 }
                             } finally {
+                                workingCount.decrementAndGet()
                                 inFlightHttpRequests.decrementAndGet()
                             }
                         }
@@ -746,7 +1042,7 @@ class GeminiApiClient(private val context: Context) {
                             send(GenerationUpdate.ScriptChunk(i, "\n[အပိုင်း (${i + 1}) အား ၃ ကြိမ်တိုင်တိုင် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။]\n", isError = true))
                         }
                     } finally {
-                        workingCount.decrementAndGet()
+                        // workingCount is managed per in-flight HTTP request
                     }
                 }
             }
@@ -765,13 +1061,22 @@ class GeminiApiClient(private val context: Context) {
                     val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
                     val startStr = formatTime(startMs)
                     val endStr = formatTime(endMs)
-                    
+                    failedCount.decrementAndGet()
                     send(GenerationUpdate.Log("Queued Retry Part ${i + 1}/$parts [$startStr - $endStr]..."))
                     send(GenerationUpdate.ScriptChunk(i, "", clearFirst = true)) // Clear error message
+                }
+
+                for (i in remainingFailedParts) {
+                    val startMs = i * segmentDurationMs
+                    val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
+                    val startStr = formatTime(startMs)
+                    val endStr = formatTime(endMs)
+
+                    // Acquire key and rate-limit slot sequentially BEFORE launching so retry parts also send in strict order
+                    val initialRetryKeyAndFile = getOrSwitchKeyAndFile()
+                    acquireRateLimitSlot()
 
                     launch {
-                        workingCount.incrementAndGet()
-                        failedCount.decrementAndGet()
                         var success = false
                         try {
 
@@ -796,11 +1101,13 @@ class GeminiApiClient(private val context: Context) {
                             1. Input Media Analysis:
                             $modalityInstruction
                             2. Narrator POV: $povDetail
-                            3. Script Tone: $toneDetail
-                            4. Length Constraint: $lengthInstruction
-                            5. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
-                            6. Timing & Context: $timingConstraint
-                            7. Language Constraints: $languageConstraint
+                            3. Character Profile & Continuity:
+                            $characterContinuityRules
+                            4. Script Tone: $toneDetail
+                            5. Length Constraint: $lengthInstruction
+                            6. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
+                            7. Timing & Context: $timingConstraint
+                            8. Language Constraints: $languageConstraint
                         """.trimIndent()
 
                         val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို PrGt's Script ရေးသားပေးပါ။"
@@ -847,15 +1154,18 @@ class GeminiApiClient(private val context: Context) {
                         
                         while (!success && attempts < maxAttempts) {
                             attempts++
-                            if (attempts > 1) {
+                            val activeSlot = if (attempts == 1) {
+                                initialRetryKeyAndFile
+                            } else {
                                 send(GenerationUpdate.Log("Final Retry Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
+                                val retryKeyAndFile = getOrSwitchKeyAndFile()
+                                acquireRateLimitSlot()
+                                retryKeyAndFile
                             }
-                            
-                            val (callApiKey, callFileUri, isSpareCall) = getOrSwitchKeyAndFile()
+                            val callApiKey = activeSlot.apiKey
+                            val callFileUri = activeSlot.fileUri
+                            val isSpareCall = activeSlot.isSpare
                             val keyLabel = if (isSpareCall) " [Spare Key]" else ""
-                            
-                            // Strictly enforce RPM slot right before sending the actual HTTP request
-                            acquireRateLimitSlot()
                             
                             send(GenerationUpdate.Log("🚀 Sending Final Retry Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Attempt $attempts]" else ""}$keyLabel to AI..."))
                             
@@ -873,7 +1183,8 @@ class GeminiApiClient(private val context: Context) {
                                 .post(requestBody)
                                 .build()
                             
-                            recordRequestSent(isSpareCall, callApiKey)
+                            logReservedRequestSent(activeSlot)
+                            workingCount.incrementAndGet()
                             inFlightHttpRequests.incrementAndGet()
                             
                             try {
@@ -931,11 +1242,12 @@ class GeminiApiClient(private val context: Context) {
                                     send(GenerationUpdate.ScriptChunk(i, "\n[Network Error in Final Retry Part ${i + 1}: ${e.message}]\n", isError = true))
                                 }
                             } finally {
+                                workingCount.decrementAndGet()
                                 inFlightHttpRequests.decrementAndGet()
                             }
                         }
                     } finally {
-                        workingCount.decrementAndGet()
+                        // workingCount is managed per in-flight HTTP request
                     }
                         
                         if (success) {

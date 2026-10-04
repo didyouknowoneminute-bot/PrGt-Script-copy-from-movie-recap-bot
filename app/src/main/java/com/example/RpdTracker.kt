@@ -138,7 +138,7 @@ object RpdTracker {
         prefs.edit()
             .putString("date_$keyHash", todayDate)
             .putInt("count_$keyHash", newCount)
-            .apply()
+            .commit()
         return newCount
     }
 }

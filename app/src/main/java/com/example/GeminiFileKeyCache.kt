@@ -68,4 +68,94 @@ object GeminiFileKeyCache {
             .putLong("${cacheKey}_time", System.currentTimeMillis())
             .apply()
     }
+
+    private fun getCharacterProfileCacheKey(context: Context, mediaUri: Uri?, geminiFileUri: String?, characterHint: String, language: String, fileName: String = ""): String {
+        val mediaId = when {
+            fileName.isNotBlank() -> fileName.trim().lowercase()
+            mediaUri != null -> getMediaIdentifier(context, mediaUri)
+            else -> geminiFileUri ?: "unknown_file"
+        }
+        val hintHash = hashString(characterHint.trim() + "_" + language.trim())
+        val mediaHash = hashString(mediaId)
+        return "char_profile_${mediaHash}_$hintHash"
+    }
+
+    fun getCachedCharacterProfile(context: Context, mediaUri: Uri?, geminiFileUri: String?, characterHint: String, language: String, fileName: String = ""): String? {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val key = getCharacterProfileCacheKey(context, mediaUri, geminiFileUri, characterHint, language, fileName)
+        val profile = prefs.getString("${key}_text", null)
+        val timestamp = prefs.getLong("${key}_time", 0L)
+        val maxAgeMs = 46L * 60 * 60 * 1000
+        if (!profile.isNullOrBlank() && (System.currentTimeMillis() - timestamp < maxAgeMs)) {
+            return profile
+        }
+        return null
+    }
+
+    fun saveCachedCharacterProfile(context: Context, mediaUri: Uri?, geminiFileUri: String?, characterHint: String, language: String, profileText: String, fileName: String = "") {
+        if (profileText.isBlank()) return
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val key = getCharacterProfileCacheKey(context, mediaUri, geminiFileUri, characterHint, language, fileName)
+        prefs.edit()
+            .putString("${key}_text", profileText)
+            .putLong("${key}_time", System.currentTimeMillis())
+            .apply()
+    }
+
+    data class SeriesPartInfo(
+        val baseTitle: String,
+        val partNumber: Int?
+    )
+
+    fun parseSeriesInfo(fileName: String): SeriesPartInfo {
+        val trimmed = fileName.trim()
+        // Match prefix patterns like: "Part 1 - Title.mp4", "Part 2: Title.mp4", "EP 3 - Title", "အပိုင်း ၁ - Title"
+        val prefixRegex = Regex("""^(?:part|ep|episode|အပိုင်း)\s*(\d+)\s*[-_:–—]+\s*(.+)$""", RegexOption.IGNORE_CASE)
+        val prefixMatch = prefixRegex.find(trimmed)
+        if (prefixMatch != null) {
+            val partNum = prefixMatch.groupValues[1].toIntOrNull()
+            val rest = prefixMatch.groupValues[2].trim()
+            if (rest.isNotBlank()) {
+                return SeriesPartInfo(baseTitle = rest, partNumber = partNum)
+            }
+        }
+
+        // Match suffix patterns before extension like: "Title - Part 1.mp4", "Title_Part_2.mp4"
+        val nameWithoutExt = trimmed.substringBeforeLast(".")
+        val ext = if (trimmed.contains(".")) "." + trimmed.substringAfterLast(".") else ""
+        val suffixRegex = Regex("""^(.+?)\s*[-_:–—\s]+\s*(?:part|ep|episode|အပိုင်း)\s*(\d+)$""", RegexOption.IGNORE_CASE)
+        val suffixMatch = suffixRegex.find(nameWithoutExt)
+        if (suffixMatch != null) {
+            val base = suffixMatch.groupValues[1].trim() + ext
+            val partNum = suffixMatch.groupValues[2].toIntOrNull()
+            if (base.isNotBlank()) {
+                return SeriesPartInfo(baseTitle = base, partNumber = partNum)
+            }
+        }
+
+        return SeriesPartInfo(baseTitle = trimmed, partNumber = null)
+    }
+
+    fun deleteSeriesPartCharacterProfile(context: Context, fileName: String, geminiFileUri: String? = null) {
+        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val editor = prefs.edit()
+
+        if (fileName.isNotBlank()) {
+            val fileHash = hashString(fileName.trim().lowercase())
+            val filePrefix = "char_profile_${fileHash}_"
+            prefs.all.keys.filter { it.startsWith(filePrefix) }.forEach { k ->
+                editor.remove(k)
+            }
+        }
+
+        if (!geminiFileUri.isNullOrBlank()) {
+            val mediaHash = hashString(geminiFileUri)
+            val prefix = "char_profile_${mediaHash}_"
+            prefs.all.keys.filter { it.startsWith(prefix) }.forEach { k ->
+                editor.remove(k)
+            }
+        }
+
+        editor.apply()
+    }
 }

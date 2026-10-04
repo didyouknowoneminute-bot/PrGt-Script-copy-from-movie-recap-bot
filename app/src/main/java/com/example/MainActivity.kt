@@ -88,23 +88,36 @@ private fun getMediaFileName(context: android.content.Context, uri: Uri, fallbac
 fun MainScreen(modifier: Modifier = Modifier) {
     var showSettings by remember { mutableStateOf(false) }
     
-    // States
-    var parts by remember { mutableStateOf(20f) }
-    
-    val scriptLengths = listOf("Short", "Medium", "Long", "TTS match")
-    var selectedLength by remember { mutableStateOf(scriptLengths[1]) }
-    
-    val narratorPOVs = listOf("Storyteller Script", "Main Character POV")
-    var selectedPOV by remember { mutableStateOf(narratorPOVs[0]) }
-    
-    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful")
-    var selectedTone by remember { mutableStateOf(scriptTones[0]) }
-
-    val outputLanguages = listOf("Myanmar", "English")
-    var selectedLanguage by remember { mutableStateOf(outputLanguages[0]) }
-
     val context = LocalContext.current
     val sharedPrefs = remember { context.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE) }
+
+    // States (Loaded from Last Presets Cache)
+    var parts by remember { mutableStateOf(sharedPrefs.getFloat("preset_parts", 20f).coerceIn(5f, 50f)) }
+    
+    val scriptLengths = listOf("Short", "Medium", "Long", "TTS match")
+    var selectedLength by remember {
+        val saved = sharedPrefs.getString("preset_length", scriptLengths[1]) ?: scriptLengths[1]
+        mutableStateOf(if (scriptLengths.contains(saved)) saved else scriptLengths[1])
+    }
+    
+    val narratorPOVs = listOf("Storyteller Script", "Main Character POV")
+    var selectedPOV by remember {
+        val saved = sharedPrefs.getString("preset_pov", narratorPOVs[0]) ?: narratorPOVs[0]
+        mutableStateOf(if (narratorPOVs.contains(saved)) saved else narratorPOVs[0])
+    }
+    var characterHint by remember { mutableStateOf(sharedPrefs.getString("preset_character_hint", "") ?: "") }
+    
+    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful")
+    var selectedTone by remember {
+        val saved = sharedPrefs.getString("preset_tone", scriptTones[0]) ?: scriptTones[0]
+        mutableStateOf(if (scriptTones.contains(saved)) saved else scriptTones[0])
+    }
+
+    val outputLanguages = listOf("Myanmar", "English")
+    var selectedLanguage by remember {
+        val saved = sharedPrefs.getString("preset_language", outputLanguages[0]) ?: outputLanguages[0]
+        mutableStateOf(if (outputLanguages.contains(saved)) saved else outputLanguages[0])
+    }
 
     // Settings State
     val modelOptions = listOf(
@@ -141,6 +154,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
     
     var activeDecisionChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<Boolean>?>(null) }
     var activeNewKeyChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<String>?>(null) }
+    var activeCharacterConfirmChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<String>?>(null) }
+    var showCharacterConfirmDialog by remember { mutableStateOf<GenerationUpdate.RequireCharacterConfirmation?>(null) }
+    var selectedCharacterDialogIndex by remember { mutableIntStateOf(0) }
+    var customCharacterDialogInput by remember { mutableStateOf("") }
+    var characterConfirmCountdown by remember { mutableIntStateOf(10) }
     var showRetryDialog by remember { mutableStateOf<List<Int>?>(null) }
     var showRpdKeyDialog by remember { mutableStateOf(false) }
     var editMainKeyInput by remember { mutableStateOf("") }
@@ -244,8 +262,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
         
         val decisionChannel = kotlinx.coroutines.channels.Channel<Boolean>()
         val newKeyChan = kotlinx.coroutines.channels.Channel<String>()
+        val charConfirmChan = kotlinx.coroutines.channels.Channel<String>()
         activeDecisionChannel = decisionChannel
         activeNewKeyChannel = newKeyChan
+        activeCharacterConfirmChannel = charConfirmChan
         
         generationJob = coroutineScope.launch {
             val scriptPartsMap = mutableMapOf<Int, String>()
@@ -275,7 +295,56 @@ fun MainScreen(modifier: Modifier = Modifier) {
             var localSpareSuccessCalls = 0
             var localSpareFailedCalls = 0
             var localUsedSpareKey = false
+            var localCharacterProfile = ""
+            var localConfirmedMainChar = ""
+            if (existingScript != null && existingScript.rpdInfoJson.isNotBlank()) {
+                try {
+                    val existingRpdObj = org.json.JSONObject(existingScript.rpdInfoJson)
+                    localCharacterProfile = existingRpdObj.optString("characterProfile", "")
+                    localConfirmedMainChar = existingRpdObj.optString("confirmedMainCharacter", "")
+                } catch (_: Exception) {
+                }
+            }
             var previousVersionsArray = org.json.JSONArray(existingScript?.previousVersionsJson ?: "[]")
+
+            val activeFileName = existingScript?.fileName ?: selectedMediaName
+            val currentSeriesInfo = GeminiFileKeyCache.parseSeriesInfo(activeFileName)
+            val historySeriesProfiles = mutableMapOf<Int, String>()
+            if (currentSeriesInfo.baseTitle.isNotBlank()) {
+                historyScripts.forEach { scriptItem ->
+                    val itemSeriesInfo = GeminiFileKeyCache.parseSeriesInfo(scriptItem.fileName)
+                    if (itemSeriesInfo.baseTitle.equals(currentSeriesInfo.baseTitle, ignoreCase = true) &&
+                        itemSeriesInfo.partNumber != null &&
+                        itemSeriesInfo.partNumber != currentSeriesInfo.partNumber
+                    ) {
+                        try {
+                            if (scriptItem.rpdInfoJson.isNotBlank()) {
+                                val rObj = org.json.JSONObject(scriptItem.rpdInfoJson)
+                                val savedCharProf = rObj.optString("characterProfile", "")
+                                if (savedCharProf.isNotBlank()) {
+                                    historySeriesProfiles[itemSeriesInfo.partNumber] = savedCharProf
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    } else if (localCharacterProfile.isBlank() && scriptItem.fileName.equals(activeFileName, ignoreCase = true)) {
+                        try {
+                            if (scriptItem.rpdInfoJson.isNotBlank()) {
+                                val rObj = org.json.JSONObject(scriptItem.rpdInfoJson)
+                                val savedCharProf = rObj.optString("characterProfile", "")
+                                val savedMain = rObj.optString("confirmedMainCharacter", "")
+                                if (savedCharProf.isNotBlank()) {
+                                    localCharacterProfile = savedCharProf
+                                }
+                                if (localConfirmedMainChar.isBlank() && savedMain.isNotBlank()) {
+                                    localConfirmedMainChar = savedMain
+                                }
+                            }
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+            }
             
             if (existingScript != null && retryParts != null && existingScript.scriptPartsJson.isNotBlank()) {
                 try {
@@ -323,6 +392,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         put("spareTotal", localSpareApiCalls)
                         put("spareSuccess", localSpareSuccessCalls)
                         put("spareFailed", localSpareFailedCalls)
+                        put("characterProfile", localCharacterProfile)
+                        put("confirmedMainCharacter", localConfirmedMainChar)
                     }
 
                     val scriptEntity = com.example.db.PrGtScript(
@@ -382,7 +453,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 existingGeminiFileUri = savedGeminiFileUri,
                 existingDurationMs = if (savedDurationMs > 0) savedDurationMs else null,
                 specificPartsToGenerate = retryParts,
-                rpm = rpmSetting.toInt()
+                rpm = rpmSetting.toInt(),
+                characterHint = if (activePOV.contains("Main Character", ignoreCase = true)) {
+                    localConfirmedMainChar.ifBlank { characterHint.trim() }
+                } else "",
+                characterConfirmationChannel = charConfirmChan,
+                mediaFileName = activeFileName,
+                priorSeriesProfiles = historySeriesProfiles,
+                existingCharacterProfile = localCharacterProfile
             ).collect { update ->
                 when (update) {
                     is GenerationUpdate.Log -> generationLogs.add(update.message)
@@ -429,6 +507,23 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         showRetryDialog = update.failedParts
                         currentMissingParts = update.failedParts
                         retryCountdown = 15
+                    }
+                    is GenerationUpdate.RequireCharacterConfirmation -> {
+                        val recIdx = update.recommendedIndex.coerceIn(0, (update.characters.size - 1).coerceAtLeast(0))
+                        selectedCharacterDialogIndex = recIdx
+                        val defaultChar = update.characters.getOrNull(recIdx)
+                        customCharacterDialogInput = if (defaultChar != null) {
+                            val relPart = if (defaultChar.relationshipStatus.isNotBlank()) " [${defaultChar.relationshipStatus}]" else ""
+                            "${defaultChar.nameAndAppearance}$relPart - ${defaultChar.pronoun} နာမ်စားသုံးရန်"
+                        } else {
+                            characterHint
+                        }
+                        characterConfirmCountdown = 10
+                        showCharacterConfirmDialog = update
+                    }
+                    is GenerationUpdate.CharacterProfileSaved -> {
+                        localCharacterProfile = update.profileText
+                        localConfirmedMainChar = update.confirmedMainCharacter
                     }
                     is GenerationUpdate.RequireNewKeyForRpd -> {
                         val missing = scriptPartsMap.filter { entry ->
@@ -483,6 +578,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     put("spareTotal", localSpareApiCalls)
                     put("spareSuccess", localSpareSuccessCalls)
                     put("spareFailed", localSpareFailedCalls)
+                    put("characterProfile", localCharacterProfile)
+                    put("confirmedMainCharacter", localConfirmedMainChar)
                 }
 
                 val scriptEntity = com.example.db.PrGtScript(
@@ -786,7 +883,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 SliderSection(
                     title = "Number of parts the video",
                     value = parts,
-                    onValueChange = { parts = it },
+                    onValueChange = {
+                        parts = it
+                        sharedPrefs.edit().putFloat("preset_parts", it).apply()
+                    },
                     valueRange = 5f..50f
                 )
                 if (selectedMediaDurationMs > 0) {
@@ -806,7 +906,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     title = "Script Length",
                     options = scriptLengths,
                     selectedOption = selectedLength,
-                    onOptionSelected = { selectedLength = it }
+                    onOptionSelected = {
+                        selectedLength = it
+                        sharedPrefs.edit().putString("preset_length", it).apply()
+                    }
                 )
 
                 // Narrator POV
@@ -814,15 +917,62 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     title = "Narrator POV",
                     options = narratorPOVs,
                     selectedOption = selectedPOV,
-                    onOptionSelected = { selectedPOV = it }
+                    onOptionSelected = {
+                        selectedPOV = it
+                        sharedPrefs.edit().putString("preset_pov", it).apply()
+                    }
                 )
+
+                if (selectedPOV.contains("Main Character", ignoreCase = true)) {
+                    Column(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            text = "Main Character Hint (Optional - မထည့်လည်း AI က အလိုအလျောက် စစ်ဆေးပေးပါမည်)",
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(bottom = 8.dp)
+                        )
+                        OutlinedTextField(
+                            value = characterHint,
+                            onValueChange = {
+                                characterHint = it
+                                sharedPrefs.edit().putString("preset_character_hint", it).apply()
+                            },
+                            placeholder = {
+                                Text(
+                                    text = "ဥပမာ - အင်္ကျီအနက်ဝတ်ထားသော လူငယ် (ဂျွန်) - ကျွန်တော် နာမ်စားသုံးရန်",
+                                    fontSize = 13.sp
+                                )
+                            },
+                            trailingIcon = {
+                                if (characterHint.isNotBlank()) {
+                                    IconButton(onClick = {
+                                        characterHint = ""
+                                        sharedPrefs.edit().putString("preset_character_hint", "").apply()
+                                    }) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Close,
+                                            contentDescription = "Clear Character Hint"
+                                        )
+                                    }
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(12.dp),
+                            singleLine = false,
+                            maxLines = 2
+                        )
+                    }
+                }
 
                 // Script Tone
                 DropdownSection(
                     title = "Script Tone",
                     options = scriptTones,
                     selectedOption = selectedTone,
-                    onOptionSelected = { selectedTone = it }
+                    onOptionSelected = {
+                        selectedTone = it
+                        sharedPrefs.edit().putString("preset_tone", it).apply()
+                    }
                 )
 
                 // Output Language
@@ -830,7 +980,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     title = "Output Language",
                     options = outputLanguages,
                     selectedOption = selectedLanguage,
-                    onOptionSelected = { selectedLanguage = it }
+                    onOptionSelected = {
+                        selectedLanguage = it
+                        sharedPrefs.edit().putString("preset_language", it).apply()
+                    }
                 )
                 
                 Spacer(modifier = Modifier.height(32.dp))
@@ -1172,6 +1325,35 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             Text("Spare API Key Used: No")
                         }
                         Text("Total Calls (Main + Spare): $totalCalls (Success: $successCalls, Failed: $failedCalls)")
+
+                        val savedMainChar = rpdObj.optString("confirmedMainCharacter", "")
+                        val savedCharList = rpdObj.optString("characterProfile", "")
+                        if (savedMainChar.isNotBlank() || savedCharList.isNotBlank()) {
+                            Spacer(modifier = Modifier.height(16.dp))
+                            Text("Character List & Relationship Status:", fontWeight = FontWeight.Bold)
+                            if (savedMainChar.isNotBlank()) {
+                                Text(
+                                    text = "⭐ Main Character: $savedMainChar",
+                                    color = MaterialTheme.colorScheme.primary,
+                                    fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.padding(top = 4.dp)
+                                )
+                            }
+                            if (savedCharList.isNotBlank()) {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+                                ) {
+                                    Text(
+                                        text = savedCharList,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        modifier = Modifier.padding(10.dp)
+                                    )
+                                }
+                            }
+                        }
                     } else {
                         Text("Total Calls: $totalCalls")
                         Text("Success Calls: $successCalls", color = MaterialTheme.colorScheme.primary)
@@ -1264,7 +1446,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
             confirmButton = {
                 TextButton(onClick = {
                     coroutineScope.launch {
-                        scriptToDelete?.let { dao.deleteScriptById(it.id) }
+                        scriptToDelete?.let {
+                            GeminiFileKeyCache.deleteSeriesPartCharacterProfile(
+                                context = context,
+                                fileName = it.fileName,
+                                geminiFileUri = it.geminiFileUri
+                            )
+                            dao.deleteScriptById(it.id)
+                        }
                         scriptToDelete = null
                     }
                 }) {
@@ -1403,6 +1592,171 @@ fun MainScreen(modifier: Modifier = Modifier) {
             dismissButton = {
                 TextButton(onClick = { showStopDialog = false }) {
                     Text("မလုပ်ပါ (Cancel)")
+                }
+            }
+        )
+    }
+
+    if (showCharacterConfirmDialog != null) {
+        val confirmData = showCharacterConfirmDialog!!
+        LaunchedEffect(confirmData) {
+            while (characterConfirmCountdown > 0) {
+                kotlinx.coroutines.delay(1000L)
+                characterConfirmCountdown--
+            }
+            if (showCharacterConfirmDialog != null) {
+                val finalSelection = customCharacterDialogInput.trim().ifBlank {
+                    val c = confirmData.characters.getOrNull(selectedCharacterDialogIndex)
+                    if (c != null) {
+                        val relPart = if (c.relationshipStatus.isNotBlank()) " [${c.relationshipStatus}]" else ""
+                        "${c.nameAndAppearance}$relPart - ${c.pronoun} နာမ်စားသုံးရန်"
+                    } else ""
+                }
+                if (finalSelection.isNotBlank()) {
+                    characterHint = finalSelection
+                    sharedPrefs.edit().putString("preset_character_hint", finalSelection).apply()
+                }
+                showCharacterConfirmDialog = null
+                activeCharacterConfirmChannel?.send(finalSelection)
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { /* Prevent outside click dismiss */ },
+            title = {
+                Column {
+                    Text(
+                        text = "ပင်မဇာတ်ဆောင် (Main Character) အတည်ပြုရန်",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "⏱️ $characterConfirmCountdown စက္ကန့်အတွင်း မရွေးချယ်ပါက AI သတ်မှတ်ထားသည့်အတိုင်း အလိုအလျောက် ဆက်လက်လုပ်ဆောင်ပါမည်။",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "ဗီဒီယိုထဲတွင် တွေ့ရှိရသော ဇာတ်ကောင်များနှင့် တော်စပ်ပုံ (တစ်ဦးကို ရွေးချယ်ပါ):",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    confirmData.characters.forEachIndexed { idx, charItem ->
+                        val isSelected = selectedCharacterDialogIndex == idx
+                        val formattedSummary = buildString {
+                            append(charItem.nameAndAppearance)
+                            if (charItem.relationshipStatus.isNotBlank()) {
+                                append(" [${charItem.relationshipStatus}]")
+                            }
+                            append(" - ${charItem.pronoun} နာမ်စားသုံးရန်")
+                        }
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    selectedCharacterDialogIndex = idx
+                                    customCharacterDialogInput = formattedSummary
+                                },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            border = if (isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                androidx.compose.material3.RadioButton(
+                                    selected = isSelected,
+                                    onClick = {
+                                        selectedCharacterDialogIndex = idx
+                                        customCharacterDialogInput = formattedSummary
+                                    }
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    if (charItem.isRecommendedMain) {
+                                        Text(
+                                            text = "⭐ AI သတ်မှတ်ထားသော ပင်မဇာတ်ဆောင်",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                    Text(
+                                        text = charItem.nameAndAppearance,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                    )
+                                    if (charItem.relationshipStatus.isNotBlank()) {
+                                        Text(
+                                            text = "ဆက်ဆံရေး/တော်စပ်ပုံ: ${charItem.relationshipStatus}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.secondary,
+                                            fontWeight = FontWeight.Medium
+                                        )
+                                    }
+                                    Text(
+                                        text = "နာမ်စား: ${charItem.pronoun}",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "သတ်မှတ်မည့် Main Character Hint (လိုအပ်ပါက ပြင်ဆင်နိုင်သည်):",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    OutlinedTextField(
+                        value = customCharacterDialogInput,
+                        onValueChange = { customCharacterDialogInput = it },
+                        trailingIcon = {
+                            if (customCharacterDialogInput.isNotBlank()) {
+                                IconButton(onClick = { customCharacterDialogInput = "" }) {
+                                    Icon(Icons.Filled.Close, contentDescription = "Clear")
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        maxLines = 2
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val finalSelection = customCharacterDialogInput.trim().ifBlank {
+                            val c = confirmData.characters.getOrNull(selectedCharacterDialogIndex)
+                            if (c != null) {
+                                val relPart = if (c.relationshipStatus.isNotBlank()) " [${c.relationshipStatus}]" else ""
+                                "${c.nameAndAppearance}$relPart - ${c.pronoun} နာမ်စားသုံးရန်"
+                            } else ""
+                        }
+                        if (finalSelection.isNotBlank()) {
+                            characterHint = finalSelection
+                            sharedPrefs.edit().putString("preset_character_hint", finalSelection).apply()
+                        }
+                        showCharacterConfirmDialog = null
+                        coroutineScope.launch {
+                            activeCharacterConfirmChannel?.send(finalSelection)
+                        }
+                    }
+                ) {
+                    Text("အတည်ပြုမည် (${characterConfirmCountdown}s)")
                 }
             }
         )
