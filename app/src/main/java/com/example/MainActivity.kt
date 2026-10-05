@@ -107,7 +107,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
     var characterHint by remember { mutableStateOf(sharedPrefs.getString("preset_character_hint", "") ?: "") }
     
-    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful")
+    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful", "Cute & Adorable")
     var selectedTone by remember {
         val saved = sharedPrefs.getString("preset_tone", scriptTones[0]) ?: scriptTones[0]
         mutableStateOf(if (scriptTones.contains(saved)) saved else scriptTones[0])
@@ -133,7 +133,54 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val modelDisplayToKey = { display: String -> modelOptions.find { it.second == display }?.first ?: display }
 
     var apiKey by remember { mutableStateOf(sharedPrefs.getString("gemini_api_key", "") ?: "") }
+    var mainKeyEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("gemini_main_key_enabled", true)) }
     var spareApiKey by remember { mutableStateOf(sharedPrefs.getString("gemini_spare_api_key", "") ?: "") }
+    var spareKeySlots by remember {
+        val slotsJsonStr = sharedPrefs.getString("gemini_spare_key_slots_json", null)
+        val loaded = mutableListOf<SpareKeySlot>()
+        if (!slotsJsonStr.isNullOrBlank()) {
+            try {
+                val arr = org.json.JSONArray(slotsJsonStr)
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i)
+                    if (obj != null) {
+                        loaded.add(
+                            SpareKeySlot(
+                                key = obj.optString("key", ""),
+                                enabled = obj.optBoolean("enabled", true)
+                            )
+                        )
+                    }
+                }
+            } catch (_: Exception) {
+            }
+        }
+        if (loaded.isEmpty()) {
+            val legacySpare = sharedPrefs.getString("gemini_spare_api_key", "") ?: ""
+            loaded.add(SpareKeySlot(key = legacySpare, enabled = true))
+        }
+        mutableStateOf(loaded.take(19))
+    }
+
+    val saveSpareKeySlots: (List<SpareKeySlot>) -> Unit = { updatedList ->
+        val capped = updatedList.take(19)
+        spareKeySlots = capped
+        val firstSpare = capped.firstOrNull()?.key ?: ""
+        spareApiKey = firstSpare
+        val arr = org.json.JSONArray()
+        capped.forEach { item ->
+            val obj = org.json.JSONObject().apply {
+                put("key", item.key)
+                put("enabled", item.enabled)
+            }
+            arr.put(obj)
+        }
+        sharedPrefs.edit()
+            .putString("gemini_spare_key_slots_json", arr.toString())
+            .putString("gemini_spare_api_key", firstSpare)
+            .apply()
+    }
+
     var rpdEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("gemini_rpd_enabled", true)) }
     var selectedModelKey by remember { 
         val saved = sharedPrefs.getString("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
@@ -435,9 +482,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 saveCurrentProgressAndStop = null
             }
 
+            val enabledSpareKeys = spareKeySlots.filter { it.enabled && it.key.isNotBlank() }.map { it.key.trim() }
+
             geminiApiClient.generateRecapScript(
                 apiKey = apiKey,
-                spareApiKey = spareApiKey,
+                spareApiKey = enabledSpareKeys.firstOrNull() ?: "",
                 rpdEnabled = rpdEnabled,
                 rpdLimit = 20,
                 modelName = activeModel,
@@ -460,7 +509,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 characterConfirmationChannel = charConfirmChan,
                 mediaFileName = activeFileName,
                 priorSeriesProfiles = historySeriesProfiles,
-                existingCharacterProfile = localCharacterProfile
+                existingCharacterProfile = localCharacterProfile,
+                mainKeyEnabled = mainKeyEnabled,
+                spareApiKeysList = enabledSpareKeys
             ).collect { update ->
                 when (update) {
                     is GenerationUpdate.Log -> generationLogs.add(update.message)
@@ -679,23 +730,116 @@ fun MainScreen(modifier: Modifier = Modifier) {
             .background(MaterialTheme.colorScheme.background)
     ) {
         Column(modifier = Modifier.fillMaxSize()) {
-        // Top Bar
-        TopAppBar(
-            title = { Text(if (showHistory) "History" else "PrGt's Script", fontWeight = FontWeight.Bold) },
-            actions = {
-                IconButton(onClick = { showHistory = !showHistory }) {
-                    Icon(if (showHistory) Icons.Filled.Close else Icons.Filled.History, contentDescription = "History")
+        var showClearAllConfirmDialog by remember { mutableStateOf(false) }
+
+        if (showClearAllConfirmDialog) {
+            AlertDialog(
+                onDismissRequest = { showClearAllConfirmDialog = false },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "⚠️ Clear All Cache & History",
+                            color = MaterialTheme.colorScheme.error,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
+                },
+                text = {
+                    Text(
+                        text = "သိမ်းဆည်းထားသော Script မှတ်တမ်းအားလုံး (History)၊ Character Profile Cache များနှင့် Uploaded Media Cache အားလုံးကို အပြီးတိုင် ဖျက်ပစ်ပါမည်။\n\nသေချာပါသလား? (API Keys နှင့် RPD မှတ်တမ်းများ ပျက်မသွားပါ)",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                },
+                confirmButton = {
+                    Button(
+                        onClick = {
+                            coroutineScope.launch {
+                                dao.deleteAllScripts()
+                                GeminiFileKeyCache.clearAllCache(context)
+                                cachedUploadedGeminiUri = null
+                                cachedUploadedDurationMs = null
+                                cachedUploadedMimeType = null
+                                cachedUploadedApiKey = null
+                            }
+                            showClearAllConfirmDialog = false
+                            android.widget.Toast.makeText(
+                                context,
+                                "✅ History နှင့် Cache အားလုံး ရှင်းလင်းပြီးပါပြီ။",
+                                android.widget.Toast.LENGTH_SHORT
+                            ).show()
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    ) {
+                        Text("⚠️ အကုန်ဖျက်မည်", color = MaterialTheme.colorScheme.onError, fontWeight = FontWeight.Bold)
+                    }
+                },
+                dismissButton = {
+                    OutlinedButton(onClick = { showClearAllConfirmDialog = false }) {
+                        Text("မလုပ်ပါ")
+                    }
                 }
-                IconButton(onClick = { showSettings = true }) {
-                    Icon(Icons.Filled.Settings, contentDescription = "Settings")
-                }
-            },
-            colors = TopAppBarDefaults.topAppBarColors(
-                containerColor = MaterialTheme.colorScheme.background,
-                titleContentColor = MaterialTheme.colorScheme.onBackground,
-                actionIconContentColor = MaterialTheme.colorScheme.onBackground
             )
-        )
+        }
+
+        // Top Bar
+        if (showHistory) {
+            CenterAlignedTopAppBar(
+                navigationIcon = {
+                    OutlinedButton(
+                        onClick = { showClearAllConfirmDialog = true },
+                        modifier = Modifier.padding(start = 8.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = MaterialTheme.colorScheme.error.copy(alpha = 0.08f),
+                            contentColor = MaterialTheme.colorScheme.error
+                        ),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                    ) {
+                        Text(
+                            text = "⚠️ Clear All",
+                            color = MaterialTheme.colorScheme.error,
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                },
+                title = {
+                    Text("History", fontWeight = FontWeight.Bold)
+                },
+                actions = {
+                    IconButton(onClick = { showHistory = !showHistory }) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close History")
+                    }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
+                },
+                colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    titleContentColor = MaterialTheme.colorScheme.onBackground,
+                    actionIconContentColor = MaterialTheme.colorScheme.onBackground
+                )
+            )
+        } else {
+            TopAppBar(
+                title = { Text("PrGt's Script", fontWeight = FontWeight.Bold) },
+                actions = {
+                    IconButton(onClick = { showHistory = !showHistory }) {
+                        Icon(Icons.Filled.History, contentDescription = "History")
+                    }
+                    IconButton(onClick = { showSettings = true }) {
+                        Icon(Icons.Filled.Settings, contentDescription = "Settings")
+                    }
+                },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    titleContentColor = MaterialTheme.colorScheme.onBackground,
+                    actionIconContentColor = MaterialTheme.colorScheme.onBackground
+                )
+            )
+        }
 
         if (showHistory) {
             LazyColumn(
@@ -1762,41 +1906,6 @@ fun MainScreen(modifier: Modifier = Modifier) {
         )
     }
 
-    if (showRetryDialog != null) {
-        LaunchedEffect(showRetryDialog) {
-            while (retryCountdown > 0) {
-                kotlinx.coroutines.delay(1000)
-                retryCountdown--
-            }
-            if (showRetryDialog != null) {
-                activeDecisionChannel?.send(false)
-                showRetryDialog = null
-            }
-        }
-
-        AlertDialog(
-            onDismissRequest = { /* Prevent dismiss */ },
-            title = { Text("အပိုင်းတချို့ မအောင်မြင်ပါ") },
-            text = { Text("အပိုင်း ${showRetryDialog!!.map { it + 1 }.joinToString(", ")} ကို ထပ်မံ ကြိုးစားသော်လည်း မအောင်မြင်ပါ။\n\n- လက်ရှိရသမျှကိုပဲ ယူမလား?\n- ထပ်ပြီး ကြိုးစားခိုင်းမလား?\n\n(အလိုအလျောက် ရွေးချယ်မှုအတွက် $retryCountdown စက္ကန့် ကျန်ပါသေးသည်)") },
-            confirmButton = {
-                Button(onClick = {
-                    coroutineScope.launch { activeDecisionChannel?.send(true) }
-                    showRetryDialog = null
-                }) {
-                    Text("ထပ်ကြိုးစားမည် (Retry)")
-                }
-            },
-            dismissButton = {
-                OutlinedButton(onClick = {
-                    coroutineScope.launch { activeDecisionChannel?.send(false) }
-                    showRetryDialog = null
-                }) {
-                    Text("လက်ရှိအတိုင်းယူမည်")
-                }
-            }
-        )
-    }
-
     if (showRpdKeyDialog) {
         LaunchedEffect(showRpdKeyDialog) {
             while (rpdCountdown > 0) {
@@ -1949,10 +2058,21 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         
                         // Save both updated keys directly to settings / preferences
                         apiKey = trimmedMain
-                        sharedPrefs.edit().putString("gemini_api_key", trimmedMain).apply()
+                        mainKeyEnabled = true
+                        sharedPrefs.edit()
+                            .putString("gemini_api_key", trimmedMain)
+                            .putBoolean("gemini_main_key_enabled", true)
+                            .apply()
                         
-                        spareApiKey = trimmedSpare
-                        sharedPrefs.edit().putString("gemini_spare_api_key", trimmedSpare).apply()
+                        if (trimmedSpare.isNotBlank()) {
+                            val updatedSlots = spareKeySlots.toMutableList()
+                            if (updatedSlots.isEmpty()) {
+                                updatedSlots.add(SpareKeySlot(key = trimmedSpare, enabled = true))
+                            } else {
+                                updatedSlots[0] = SpareKeySlot(key = trimmedSpare, enabled = true)
+                            }
+                            saveSpareKeySlots(updatedSlots)
+                        }
                         
                         // Decide which key to feed into active generation channel
                         val nextKeyToUse = when {
@@ -2001,10 +2121,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 apiKey = newKey
                 sharedPrefs.edit().putString("gemini_api_key", newKey).apply()
             },
-            spareApiKey = spareApiKey,
-            onSpareApiKeyChange = { newKey ->
-                spareApiKey = newKey
-                sharedPrefs.edit().putString("gemini_spare_api_key", newKey).apply()
+            mainKeyEnabled = mainKeyEnabled,
+            onMainKeyEnabledChange = { enabled ->
+                mainKeyEnabled = enabled
+                sharedPrefs.edit().putBoolean("gemini_main_key_enabled", enabled).apply()
+            },
+            spareKeySlots = spareKeySlots,
+            onSpareKeySlotsChange = { updatedSlots ->
+                saveSpareKeySlots(updatedSlots)
             },
             rpdEnabled = rpdEnabled,
             onRpdEnabledChange = { newEnabled ->
@@ -2230,8 +2354,10 @@ fun DropdownSection(
 fun SettingsDialog(
     apiKey: String,
     onApiKeyChange: (String) -> Unit,
-    spareApiKey: String,
-    onSpareApiKeyChange: (String) -> Unit,
+    mainKeyEnabled: Boolean,
+    onMainKeyEnabledChange: (Boolean) -> Unit,
+    spareKeySlots: List<SpareKeySlot>,
+    onSpareKeySlotsChange: (List<SpareKeySlot>) -> Unit,
     rpdEnabled: Boolean,
     onRpdEnabledChange: (Boolean) -> Unit,
     selectedModel: String,
@@ -2243,155 +2369,351 @@ fun SettingsDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Settings", fontWeight = FontWeight.Bold) },
+        title = {
+            val context = LocalContext.current
+            val headerResetStatus = remember(rpdEnabled) { RpdTracker.getStatus(context, apiKey) }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Settings", fontWeight = FontWeight.Bold)
+                    val totalKeyCount = 1 + spareKeySlots.size
+                    val activeCount = (if (mainKeyEnabled && apiKey.isNotBlank()) 1 else 0) +
+                        spareKeySlots.count { it.enabled && it.key.isNotBlank() }
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer
+                    ) {
+                        Text(
+                            text = "Active Keys: $activeCount/$totalKeyCount (Max 20)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                        )
+                    }
+                }
+                if (rpdEnabled) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "🕒 Daily Quota Reset: ${headerResetStatus.resetTimeDescription.split(" [").first()} (${headerResetStatus.hoursUntilReset}h ${headerResetStatus.minutesUntilReset}m အကြာ)",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Medium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                        )
+                    }
+                }
+            }
+        },
         text = {
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .verticalScroll(rememberScrollState())
                     .padding(vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+                verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 val context = LocalContext.current
                 val mainKeyStatus = remember(apiKey, rpdEnabled) { RpdTracker.getStatus(context, apiKey) }
-                val spareKeyStatus = remember(spareApiKey, rpdEnabled) { RpdTracker.getStatus(context, spareApiKey) }
+                val allKeysEnabled = mainKeyEnabled && spareKeySlots.all { it.enabled }
 
-                if (rpdEnabled && apiKey.isNotBlank()) {
-                    if (mainKeyStatus.isLimitReached) {
-                        Card(
-                            shape = RoundedCornerShape(10.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                            modifier = Modifier.fillMaxWidth()
+                // Master Switch: All API Keys ON/OFF
+                Surface(
+                    shape = RoundedCornerShape(12.dp),
+                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.primary.copy(alpha = 0.4f)
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "All API Keys (Master Switch)",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = if (allKeysEnabled) "API Key အားလုံး ဖွင့်ထားသည် (All ON)" else "အားလုံး တစ်ပြိုင်နက် ဖွင့်/ပိတ် ရန်",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        Switch(
+                            checked = allKeysEnabled,
+                            onCheckedChange = { turnAllOn ->
+                                onMainKeyEnabledChange(turnAllOn)
+                                val updatedList = spareKeySlots.map { it.copy(enabled = turnAllOn) }
+                                onSpareKeySlotsChange(updatedList)
+                            }
+                        )
+                    }
+                }
+
+                // Main API Key Card with ON/OFF Toggle
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (mainKeyEnabled) 0.45f else 0.2f),
+                    border = androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        if (mainKeyEnabled) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outlineVariant
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                modifier = Modifier.padding(10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Warning,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.size(22.dp)
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Text(
+                                    text = "Key #1 (Main API Key)",
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (mainKeyEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
                                 )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Column {
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Text(
+                                    text = if (mainKeyEnabled) "[ON]" else "[OFF]",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = if (mainKeyEnabled) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
+                                )
+                            }
+                            Switch(
+                                checked = mainKeyEnabled,
+                                onCheckedChange = onMainKeyEnabledChange
+                            )
+                        }
+
+                        if (rpdEnabled && apiKey.isNotBlank()) {
+                            if (mainKeyStatus.isLimitReached) {
+                                Card(
+                                    shape = RoundedCornerShape(8.dp),
+                                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(8.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Warning,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(18.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ပြည့်သွားပါပြီ",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
+                                    }
+                                }
+                            } else {
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
                                     Text(
-                                        text = "⚠️ Main Key: RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ",
-                                        style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onErrorContainer
-                                    )
-                                    Text(
-                                        text = "Google Daily Quota reset ဖြစ်မည့်အချိန်: ${mainKeyStatus.resetTimeDescription} (${mainKeyStatus.hoursUntilReset} နာရီ ${mainKeyStatus.minutesUntilReset} မိနစ်အကြာ)။ Spare Key ထည့်သွင်းထားပါက အလိုအလျောက် ဆက်လက် run ပေးပါမည်။",
+                                        text = "RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.primary,
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
                                     )
                                 }
                             }
                         }
-                    } else {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Main Key RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.primary
-                                )
-                                Text(
-                                    text = "Reset: ${mainKeyStatus.hoursUntilReset}h ${mainKeyStatus.minutesUntilReset}m",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
-                            }
-                        }
+
+                        OutlinedTextField(
+                            value = apiKey,
+                            onValueChange = onApiKeyChange,
+                            label = { Text("Main API Key") },
+                            placeholder = { Text("AIzaSy...") },
+                            singleLine = true,
+                            enabled = mainKeyEnabled,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        )
                     }
                 }
 
-                OutlinedTextField(
-                    value = apiKey,
-                    onValueChange = onApiKeyChange,
-                    label = { Text("Main API Key") },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                )
+                // Dynamic Spare API Key Slots (up to 19 Spare Keys => Total 20 Keys max)
+                spareKeySlots.forEachIndexed { index, slot ->
+                    val slotKeyStatus = remember(slot.key, rpdEnabled) { RpdTracker.getStatus(context, slot.key) }
+                    val keyDisplayNum = index + 2 // Key #2 .. Key #20
+                    val spareNum = index + 1     // Spare #1 .. Spare #19
 
-                if (rpdEnabled && spareApiKey.isNotBlank()) {
-                    if (spareKeyStatus.isLimitReached) {
-                        Card(
-                            shape = RoundedCornerShape(10.dp),
-                            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                            modifier = Modifier.fillMaxWidth()
+                    Surface(
+                        shape = RoundedCornerShape(14.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = if (slot.enabled) 0.45f else 0.2f),
+                        border = androidx.compose.foundation.BorderStroke(
+                            1.dp,
+                            if (slot.enabled) MaterialTheme.colorScheme.secondary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.outlineVariant
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
                             Row(
-                                modifier = Modifier.padding(10.dp),
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(
-                                    imageVector = Icons.Filled.Warning,
-                                    contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.error,
-                                    modifier = Modifier.size(22.dp)
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Column {
+                                Row(verticalAlignment = Alignment.CenterVertically) {
                                     Text(
-                                        text = "⚠️ Spare Key: RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ",
-                                        style = MaterialTheme.typography.bodyMedium,
+                                        text = "Key #$keyDisplayNum (Spare Key #$spareNum)",
+                                        style = MaterialTheme.typography.labelLarge,
                                         fontWeight = FontWeight.Bold,
-                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                        color = if (slot.enabled) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant
                                     )
+                                    Spacer(modifier = Modifier.width(6.dp))
                                     Text(
-                                        text = "Reset အချိန်: ${spareKeyStatus.resetTimeDescription} (${spareKeyStatus.hoursUntilReset} နာရီ ${spareKeyStatus.minutesUntilReset} မိနစ်အကြာ)။ Key အသစ် လဲလှယ်ပေးပါ။",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onErrorContainer
+                                        text = if (slot.enabled) "[ON]" else "[OFF]",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (slot.enabled) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.error
                                     )
                                 }
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Switch(
+                                        checked = slot.enabled,
+                                        onCheckedChange = { newEnabled ->
+                                            val list = spareKeySlots.toMutableList()
+                                            list[index] = slot.copy(enabled = newEnabled)
+                                            onSpareKeySlotsChange(list)
+                                        }
+                                    )
+                                    if (spareKeySlots.size > 1 || slot.key.isNotBlank()) {
+                                        IconButton(
+                                            onClick = {
+                                                val list = spareKeySlots.toMutableList()
+                                                if (list.size > 1) {
+                                                    list.removeAt(index)
+                                                } else {
+                                                    list[0] = SpareKeySlot(key = "", enabled = true)
+                                                }
+                                                onSpareKeySlotsChange(list)
+                                            }
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Delete,
+                                                contentDescription = "Remove Spare Key Slot",
+                                                tint = MaterialTheme.colorScheme.error
+                                            )
+                                        }
+                                    }
+                                }
                             }
-                        }
-                    } else {
-                        Surface(
-                            shape = RoundedCornerShape(8.dp),
-                            color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = "Spare Key RPD: ${spareKeyStatus.usedCount}/${spareKeyStatus.maxLimit} ကြိမ် (Available: ${spareKeyStatus.remainingCount} ကြိမ်)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.secondary
-                                )
-                                Text(
-                                    text = "Reset: ${spareKeyStatus.hoursUntilReset}h ${spareKeyStatus.minutesUntilReset}m",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                                )
+
+                            if (rpdEnabled && slot.key.isNotBlank()) {
+                                if (slotKeyStatus.isLimitReached) {
+                                    Card(
+                                        shape = RoundedCornerShape(8.dp),
+                                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Row(
+                                            modifier = Modifier.padding(8.dp),
+                                            verticalAlignment = Alignment.CenterVertically
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Warning,
+                                                contentDescription = null,
+                                                tint = MaterialTheme.colorScheme.error,
+                                                modifier = Modifier.size(18.dp)
+                                            )
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "RPD: ${slotKeyStatus.usedCount}/${slotKeyStatus.maxLimit} ပြည့်သွားပါပြီ",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.onErrorContainer
+                                            )
+                                        }
+                                    }
+                                } else {
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.5f),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(
+                                            text = "RPD: ${slotKeyStatus.usedCount}/${slotKeyStatus.maxLimit} ကြိမ် (Available: ${slotKeyStatus.remainingCount} ကြိမ်)",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.secondary,
+                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+                                        )
+                                    }
+                                }
                             }
+
+                            OutlinedTextField(
+                                value = slot.key,
+                                onValueChange = { updatedText ->
+                                    val list = spareKeySlots.toMutableList()
+                                    list[index] = slot.copy(key = updatedText)
+                                    onSpareKeySlotsChange(list)
+                                },
+                                label = { Text("Spare API Key #$spareNum") },
+                                placeholder = { Text("Enter spare API key #$spareNum") },
+                                singleLine = true,
+                                enabled = slot.enabled,
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(10.dp)
+                            )
                         }
                     }
                 }
 
-                OutlinedTextField(
-                    value = spareApiKey,
-                    onValueChange = onSpareApiKeyChange,
-                    label = { Text("Spare API Key") },
-                    placeholder = { Text("Enter spare API key (optional)") },
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(12.dp)
-                )
+                // Add Spare API Key Button (up to 19 Spare Keys = 20 Total Keys)
+                val totalKeysNow = 1 + spareKeySlots.size
+                if (totalKeysNow < 20) {
+                    OutlinedButton(
+                        onClick = {
+                            val list = spareKeySlots.toMutableList()
+                            list.add(SpareKeySlot(key = "", enabled = true))
+                            onSpareKeySlotsChange(list)
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text("+ Add Spare API Key (${totalKeysNow}/20)")
+                    }
+                } else {
+                    Text(
+                        text = "✅ အများဆုံး API Key (၂၀) ခု ပြည့်သွားပါပြီ။",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
 
                 Card(
                     shape = RoundedCornerShape(12.dp),
