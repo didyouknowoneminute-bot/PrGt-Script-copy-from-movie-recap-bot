@@ -59,6 +59,7 @@ sealed class GenerationUpdate {
     ) : GenerationUpdate()
     data class FileInfo(val geminiFileUri: String, val mimeType: String, val durationMs: Long) : GenerationUpdate()
     data class Error(val message: String) : GenerationUpdate()
+    data class ProfileFatalError(val message: String) : GenerationUpdate()
     data class ApiCallResult(
         val success: Boolean,
         val isSpare: Boolean = false,
@@ -125,7 +126,8 @@ class GeminiApiClient(private val context: Context) {
         priorSeriesProfiles: Map<Int, String> = emptyMap(),
         existingCharacterProfile: String = "",
         mainKeyEnabled: Boolean = true,
-        spareApiKeysList: List<String> = emptyList()
+        spareApiKeysList: List<String> = emptyList(),
+        spareKeySlots: List<SpareKeySlot> = emptyList()
     ): Flow<GenerationUpdate> = channelFlow {
         send(GenerationUpdate.Progress(0.0f))
 
@@ -147,9 +149,18 @@ class GeminiApiClient(private val context: Context) {
         if (mainKeyEnabled && apiKey.isNotBlank()) {
             activeKeyQueue.add(ActiveKeyEntry("Main Key", apiKey.trim(), isSpare = false))
         }
-        resolvedSpareKeys.forEachIndexed { idx, sKey ->
-            if (activeKeyQueue.none { it.key == sKey }) {
-                activeKeyQueue.add(ActiveKeyEntry("Spare Key #${idx + 1}", sKey, isSpare = true))
+        if (spareKeySlots.isNotEmpty()) {
+            spareKeySlots.forEachIndexed { idx, slot ->
+                val sKey = slot.key.trim()
+                if (slot.enabled && sKey.isNotBlank() && activeKeyQueue.none { it.key == sKey }) {
+                    activeKeyQueue.add(ActiveKeyEntry("Spare Key #${idx + 1}", sKey, isSpare = true))
+                }
+            }
+        } else {
+            resolvedSpareKeys.forEachIndexed { idx, sKey ->
+                if (activeKeyQueue.none { it.key == sKey }) {
+                    activeKeyQueue.add(ActiveKeyEntry("Spare Key #${idx + 1}", sKey, isSpare = true))
+                }
             }
         }
 
@@ -699,20 +710,20 @@ class GeminiApiClient(private val context: Context) {
             if (extractedCharacterProfile.isNotBlank()) {
                 send(GenerationUpdate.Log("✅ Cached Character Profile & Relationship Status အား ပြန်လည်အသုံးပြုပါမည်။"))
             } else {
-                if (combinedPriorMap.isNotEmpty()) {
+                val hasPriorProfiles = combinedPriorMap.isNotEmpty()
+                if (hasPriorProfiles) {
                     val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
                     send(GenerationUpdate.Log("🔗 အရှေ့အပိုင်းများ ($priorPartNames) မှ Character List နှင့် Relationship Status များကို ဆွဲယူပြီး ယခုအပိုင်းနှင့် ပေါင်းစည်းစစ်ဆေးနေပါသည်..."))
                 } else {
                     send(GenerationUpdate.Log("🔍 ဗီဒီယိုတစ်ပုဒ်လုံး၏ Character Profile နှင့် ပင်မဇာတ်ဆောင် (Main Protagonist) သတ်မှတ်ချက်ကို ဦးစွာ စစ်ဆေးထုတ်ယူနေပါသည်..."))
                 }
-                val preSlot = getOrSwitchKeyAndFile()
-                acquireRateLimitSlot()
+
                 val hintInstruction = if (characterHint.isNotBlank()) {
                     "User သတ်မှတ်ပေးထားသော အဓိကဇာတ်ဆောင် (User Hint): \"$characterHint\" — ဤသတ်မှတ်ချက်ကို အဓိက ဦးစားပေးအတည်ပြု၍ ပင်မဇာတ်ဆောင်အဖြစ် သတ်မှတ်ပေးပါ။"
                 } else {
                     "ဗီဒီယို/အသံဖိုင် တစ်ခုလုံးတွင် အဓိကအကျဆုံး ပင်မဇာတ်ဆောင် (Main Protagonist) တစ်ဦးတည်းကို အတိအကျ ရွေးချယ်သတ်မှတ်ပေးပါ။"
                 }
-                val priorSeriesInstruction = if (combinedPriorMap.isNotEmpty()) {
+                val priorSeriesInstruction = if (hasPriorProfiles) {
                     buildString {
                         appendLine("အရေးကြီးသော အရှေ့အပိုင်းများ၏ ဇာတ်ကောင်နှင့် ဆက်ဆံရေး မှတ်တမ်း (Previous Parts Character & Relationship Reference):")
                         combinedPriorMap.forEach { (partNum, pText) ->
@@ -754,79 +765,136 @@ class GeminiApiClient(private val context: Context) {
                     (မှတ်ချက် - ပင်မဇာတ်ဆောင် အဖြစ် အသင့်တော်ဆုံး တစ်ဦးတည်းကိုသာ MAIN ဟု သတ်မှတ်ပြီး ကျန်ဇာတ်ကောင်များကို SUPPORT ဟု သတ်မှတ်ပါ။ ဇာတ်ကောင်တစ်ဦးလျှင် တစ်ကြောင်းသာ ရေးပါ။)
                 """.trimIndent()
 
-                val profileBodyJson = JSONObject().apply {
-                    put("contents", JSONArray().apply {
-                        put(JSONObject().apply {
-                            put("role", "user")
-                            put("parts", JSONArray().apply {
-                                put(JSONObject().apply {
-                                    put("file_data", JSONObject().apply {
-                                        put("mime_type", mediaMimeType ?: "video/mp4")
-                                        put("file_uri", preSlot.fileUri)
+                // If prior series profiles exist: 1 initial attempt + 1 retry (total 2).
+                // If no prior series profiles exist: retry up to 5 attempts based on RPM & RPD.
+                val maxProfileAttempts = if (hasPriorProfiles) 2 else 5
+                var profileAttempt = 0
+                var lastProfileErrorDetail = "Unknown Error"
+
+                while (extractedCharacterProfile.isBlank() && profileAttempt < maxProfileAttempts && !rpdExhaustedAndStoppedByUser) {
+                    profileAttempt++
+                    if (profileAttempt > 1) {
+                        val retryCount = profileAttempt - 1
+                        val maxRetries = maxProfileAttempts - 1
+                        send(GenerationUpdate.Log("🔄 Character Profile & Relationship Status ပြန်လည်ကြိုးစားနေပါသည် (Retry $retryCount/$maxRetries - Attempt $profileAttempt/$maxProfileAttempts)..."))
+                    }
+
+                    val preSlot = try {
+                        val slot = getOrSwitchKeyAndFile()
+                        acquireRateLimitSlot()
+                        slot
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        if (rpdExhaustedAndStoppedByUser || ce.message == "RPD_EXHAUSTED_STOP") {
+                            lastProfileErrorDetail = "RPD Limit ပြည့်သွားသောကြောင့် ရပ်နားလိုက်ပါသည်"
+                            break
+                        } else {
+                            throw ce
+                        }
+                    }
+
+                    val profileBodyJson = JSONObject().apply {
+                        put("contents", JSONArray().apply {
+                            put(JSONObject().apply {
+                                put("role", "user")
+                                put("parts", JSONArray().apply {
+                                    put(JSONObject().apply {
+                                        put("file_data", JSONObject().apply {
+                                            put("mime_type", mediaMimeType ?: "video/mp4")
+                                            put("file_uri", preSlot.fileUri)
+                                        })
                                     })
-                                })
-                                put(JSONObject().apply {
-                                    put("text", profilePrompt)
+                                    put(JSONObject().apply {
+                                        put("text", profilePrompt)
+                                    })
                                 })
                             })
                         })
-                    })
-                }
-                val profileReqBody = profileBodyJson.toString().toRequestBody("application/json".toMediaTypeOrNull())
-                val profileReq = Request.Builder()
-                    .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:generateContent?key=${preSlot.apiKey}")
-                    .post(profileReqBody)
-                    .build()
+                    }
+                    val profileReqBody = profileBodyJson.toString().toRequestBody("application/json".toMediaTypeOrNull())
+                    val profileReq = Request.Builder()
+                        .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:generateContent?key=${preSlot.apiKey}")
+                        .post(profileReqBody)
+                        .build()
 
-                logReservedRequestSent(preSlot)
-                workingCount.incrementAndGet()
-                inFlightHttpRequests.incrementAndGet()
-                try {
-                    client.newCall(profileReq).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val bodyStr = resp.body?.string() ?: "{}"
-                            val rootObj = JSONObject(bodyStr)
-                            val candidates = rootObj.optJSONArray("candidates")
-                            val sb = StringBuilder()
-                            if (candidates != null && candidates.length() > 0) {
-                                val partsArr = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
-                                if (partsArr != null) {
-                                    for (pIdx in 0 until partsArr.length()) {
-                                        sb.append(partsArr.getJSONObject(pIdx).optString("text", ""))
+                    logReservedRequestSent(preSlot)
+                    workingCount.incrementAndGet()
+                    inFlightHttpRequests.incrementAndGet()
+                    try {
+                        client.newCall(profileReq).execute().use { resp ->
+                            if (resp.isSuccessful) {
+                                val bodyStr = resp.body?.string() ?: "{}"
+                                val rootObj = JSONObject(bodyStr)
+                                val candidates = rootObj.optJSONArray("candidates")
+                                val sb = StringBuilder()
+                                if (candidates != null && candidates.length() > 0) {
+                                    val partsArr = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
+                                    if (partsArr != null) {
+                                        for (pIdx in 0 until partsArr.length()) {
+                                            sb.append(partsArr.getJSONObject(pIdx).optString("text", ""))
+                                        }
                                     }
                                 }
-                            }
-                            val textOut = sb.toString().trim()
-                            if (textOut.isNotBlank()) {
-                                extractedCharacterProfile = textOut
-                                recordCallOutcome(preSlot.isSpare, true)
-                                GeminiFileKeyCache.saveCachedCharacterProfile(
-                                    context = context,
-                                    mediaUri = mediaUri,
-                                    geminiFileUri = finalGeminiFileUri,
-                                    characterHint = priorContextKey,
-                                    language = language,
-                                    profileText = textOut,
-                                    fileName = mediaFileName
-                                )
-                                send(GenerationUpdate.Log("✅ Character Profile & Relationship Status ရရှိပြီးစီးပါပြီ။"))
+                                val textOut = sb.toString().trim()
+                                if (textOut.isNotBlank()) {
+                                    extractedCharacterProfile = textOut
+                                    recordCallOutcome(preSlot.isSpare, true)
+                                    GeminiFileKeyCache.saveCachedCharacterProfile(
+                                        context = context,
+                                        mediaUri = mediaUri,
+                                        geminiFileUri = finalGeminiFileUri,
+                                        characterHint = priorContextKey,
+                                        language = language,
+                                        profileText = textOut,
+                                        fileName = mediaFileName
+                                    )
+                                    send(GenerationUpdate.Log("✅ Character Profile & Relationship Status ရရှိပြီးစီးပါပြီ [${preSlot.keyLabel}]။"))
+                                } else {
+                                    recordCallOutcome(preSlot.isSpare, false)
+                                    lastProfileErrorDetail = "Empty Response (AI မှ Character စာရင်း ပြန်မပို့ပါ)"
+                                    send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးမှု (Attempt $profileAttempt/$maxProfileAttempts) အလွတ်ဖြစ်နေပါသည်။"))
+                                }
                             } else {
                                 recordCallOutcome(preSlot.isSpare, false)
-                                send(GenerationUpdate.Log("⚠️ Character Profile အလွတ်ဖြစ်နေသဖြင့် သတ်မှတ်ထားသော POV စည်းကမ်းချက်ဖြင့် ဆက်လက်လုပ်ဆောင်ပါမည်။"))
+                                val errBody = resp.body?.string() ?: ""
+                                val errMsg = extractApiErrorMessage(resp.code, resp.message, errBody)
+                                lastProfileErrorDetail = "HTTP ${resp.code} - $errMsg"
+                                send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးမှု (Attempt $profileAttempt/$maxProfileAttempts) မအောင်မြင်ပါ ($lastProfileErrorDetail)။"))
                             }
-                        } else {
-                            recordCallOutcome(preSlot.isSpare, false)
-                            val errBody = resp.body?.string() ?: ""
-                            val errMsg = extractApiErrorMessage(resp.code, resp.message, errBody)
-                            send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးမှု မအောင်မြင်ပါ (HTTP ${resp.code} - $errMsg)။ သတ်မှတ်ထားသော POV စည်းကမ်းချက်ဖြင့် ဆက်လက်လုပ်ဆောင်ပါမည်။"))
                         }
+                    } catch (e: Exception) {
+                        recordCallOutcome(preSlot.isSpare, false)
+                        lastProfileErrorDetail = "Network Error (${e.javaClass.simpleName}: ${e.message ?: "Connection failed"})"
+                        send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးစဉ် (Attempt $profileAttempt/$maxProfileAttempts) $lastProfileErrorDetail ဖြစ်ပေါ်ခဲ့ပါသည်။"))
+                    } finally {
+                        workingCount.decrementAndGet()
+                        inFlightHttpRequests.decrementAndGet()
                     }
-                } catch (e: Exception) {
-                    recordCallOutcome(preSlot.isSpare, false)
-                    send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးစဉ် Network Error (${e.message}) ဖြစ်ပေါ်ခဲ့သော်လည်း ဆက်လက်လုပ်ဆောင်ပါမည်။"))
-                } finally {
-                    workingCount.decrementAndGet()
-                    inFlightHttpRequests.decrementAndGet()
+                }
+
+                if (extractedCharacterProfile.isBlank()) {
+                    if (hasPriorProfiles) {
+                        // Fallback to prior series parts' character list & relationship status
+                        val fallbackPriorText = combinedPriorMap.values.last().trim()
+                        extractedCharacterProfile = fallbackPriorText
+                        val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
+                        send(GenerationUpdate.Log("ℹ️ Character Profile အသစ်ရယူမှု မအောင်မြင်သဖြင့် အရှေ့အပိုင်း ($priorPartNames) မှ Character List နှင့် Relationship Status အား တိုက်ရိုက် ယူသုံးပါမည်။"))
+                    } else {
+                        // No prior series profiles available and all 5 attempts failed: end processing, show 15s auto-close dialog, and leave failed record in History
+                        val fatalMsg = "Character List နှင့် Relationship Status ရယူမှု ($maxProfileAttempts) ကြိမ်တိုင်တိုင် မအောင်မြင်ပါ။\n\nError Code: $lastProfileErrorDetail\n\nProcessing ကို ရပ်နားလိုက်ပါပြီ။ ခေတ္တစောင့်ဆိုင်းပြီးမှ History ထဲမှနေ၍ ပြန်လည်ကြိုးစားပေးပါ။"
+                        send(GenerationUpdate.Log("❌ $fatalMsg"))
+                        val firstPartIdx = partsToProcess.firstOrNull() ?: 0
+                        send(
+                            GenerationUpdate.ScriptChunk(
+                                partIndex = firstPartIdx,
+                                text = "❌ [Failed: Character List နှင့် Relationship Status ရယူမှု ($maxProfileAttempts) ကြိမ် မအောင်မြင်ပါ — $lastProfileErrorDetail]\n[အပိုင်း ${firstPartIdx + 1} - နေရာလွတ်...]\n",
+                                isError = true,
+                                clearFirst = true
+                            )
+                        )
+                        send(GenerationUpdate.ProfileFatalError(fatalMsg))
+                        send(GenerationUpdate.Complete)
+                        return@channelFlow
+                    }
                 }
             }
 

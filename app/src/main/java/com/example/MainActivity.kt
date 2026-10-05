@@ -257,6 +257,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val clipboardManager = LocalClipboardManager.current
     var showScriptInfo by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var errorMessageDialog by remember { mutableStateOf<String?>(null) }
+    var errorDialogCountdown by remember { mutableIntStateOf(15) }
     var backPressedTime by remember { mutableLongStateOf(0L) }
 
     BackHandler {
@@ -344,6 +345,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
             var localUsedSpareKey = false
             var localCharacterProfile = ""
             var localConfirmedMainChar = ""
+            var hadFatalProfileError = false
             if (existingScript != null && existingScript.rpdInfoJson.isNotBlank()) {
                 try {
                     val existingRpdObj = org.json.JSONObject(existingScript.rpdInfoJson)
@@ -511,7 +513,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 priorSeriesProfiles = historySeriesProfiles,
                 existingCharacterProfile = localCharacterProfile,
                 mainKeyEnabled = mainKeyEnabled,
-                spareApiKeysList = enabledSpareKeys
+                spareApiKeysList = enabledSpareKeys,
+                spareKeySlots = spareKeySlots
             ).collect { update ->
                 when (update) {
                     is GenerationUpdate.Log -> generationLogs.add(update.message)
@@ -552,6 +555,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     is GenerationUpdate.Error -> {
                         generationLogs.add("ERROR: ${update.message}")
                         finalScript += "\nError: ${update.message}"
+                        errorDialogCountdown = 15
+                        errorMessageDialog = update.message
+                    }
+                    is GenerationUpdate.ProfileFatalError -> {
+                        hadFatalProfileError = true
+                        errorDialogCountdown = 15
                         errorMessageDialog = update.message
                     }
                     is GenerationUpdate.RequireRetryDecision -> {
@@ -664,9 +673,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 currentScriptId = newId.toInt()
                 isEditingScript = false
                 dao.keepLatestFifty()
-                // Automatically display the full script dialog on completion
+                // Automatically display the full script dialog on completion unless it terminated due to fatal profile error
                 val savedEntity = scriptEntity.copy(id = newId.toInt())
-                viewingHistoryScript = savedEntity
+                if (!hadFatalProfileError) {
+                    viewingHistoryScript = savedEntity
+                }
             }
             
             isGenerating = false
@@ -2152,6 +2163,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
 
     if (errorMessageDialog != null) {
+        LaunchedEffect(errorMessageDialog) {
+            errorDialogCountdown = 15
+            while (errorDialogCountdown > 0) {
+                kotlinx.coroutines.delay(1000L)
+                errorDialogCountdown--
+            }
+            errorMessageDialog = null
+        }
         AlertDialog(
             onDismissRequest = { errorMessageDialog = null },
             title = {
@@ -2173,7 +2192,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     )
                     Spacer(modifier = Modifier.height(12.dp))
                     Text(
-                        text = "အကြံပြုချက်: API Key မှန်ကန်မှု ရှိ/မရှိ Settings တွင် စစ်ဆေးပါ သို့မဟုတ် အင်တာနက် လိုင်းကောင်းမွန်မှု ရှိ/မရှိ ပြန်လည်စစ်ဆေးပေးပါ။",
+                        text = "အကြံပြုချက်: မှတ်တမ်းအား History ထဲတွင် သိမ်းဆည်းထားပြီး ဖြစ်ပါသည်။ ခေတ္တစောင့်ဆိုင်းပြီးမှ History ထဲမှနေ၍ ပြန်လည်ကြိုးစားနိုင်ပါသည် (${errorDialogCountdown}s အတွင်း အလိုအလျောက် ပိတ်ပါမည်)။",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -2181,7 +2200,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
             },
             confirmButton = {
                 Button(onClick = { errorMessageDialog = null }) {
-                    Text("နားလည်ပါပြီ")
+                    Text("နားလည်ပါပြီ (${errorDialogCountdown}s)")
                 }
             }
         )
