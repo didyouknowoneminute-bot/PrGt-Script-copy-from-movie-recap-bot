@@ -898,8 +898,9 @@ class GeminiApiClient(private val context: Context) {
                 }
             }
 
-            // Parse detected characters for user confirmation dialog when Main Character POV is selected
-            if (isMainCharPov && extractedCharacterProfile.isNotBlank() && specificPartsToGenerate == null) {
+            // Parse detected characters for user confirmation & custom name editing dialog
+            var customCharacterNameRules = listOf<String>()
+            if (extractedCharacterProfile.isNotBlank() && specificPartsToGenerate == null) {
                 val parsedCharacters = mutableListOf<DetectedCharacter>()
                 extractedCharacterProfile.lines().forEach { line ->
                     val trimmed = line.trim().removePrefix("-").removePrefix("*").trim()
@@ -946,15 +947,56 @@ class GeminiApiClient(private val context: Context) {
 
                 if (parsedCharacters.isNotEmpty() && characterConfirmationChannel != null) {
                     val recIdx = parsedCharacters.indexOfFirst { it.isRecommendedMain }.let { if (it >= 0) it else 0 }
-                    send(GenerationUpdate.Log("⏳ User ထံမှ Main Character အတည်ပြုချက် (10s Auto-Continue) စောင့်ဆိုင်းနေပါသည်..."))
+                    send(GenerationUpdate.Log("⏳ User ထံမှ Character စာရင်း အတည်ပြုချက် (10s Auto-Continue) စောင့်ဆိုင်းနေပါသည်..."))
                     send(GenerationUpdate.RequireCharacterConfirmation(
                         characters = parsedCharacters,
                         recommendedIndex = recIdx,
                         rawProfileText = extractedCharacterProfile
                     ))
-                    val selectedCharSummary = characterConfirmationChannel.receive()
-                    if (selectedCharSummary.isNotBlank()) {
-                        confirmedMainCharacter = selectedCharSummary.trim()
+                    val rawConfirmationResponse = characterConfirmationChannel.receive().trim()
+                    if (rawConfirmationResponse.startsWith("{")) {
+                        try {
+                            val respObj = JSONObject(rawConfirmationResponse)
+                            val selectedMain = respObj.optString("selectedMainSummary", "").trim()
+                            val updatedProfile = respObj.optString("updatedProfileText", "").trim()
+                            val rulesJsonArr = respObj.optJSONArray("customNameRules")
+                            val rulesList = mutableListOf<String>()
+                            if (rulesJsonArr != null) {
+                                for (rIdx in 0 until rulesJsonArr.length()) {
+                                    val rStr = rulesJsonArr.optString(rIdx, "").trim()
+                                    if (rStr.isNotBlank()) rulesList.add(rStr)
+                                }
+                            }
+                            customCharacterNameRules = rulesList
+                            if (updatedProfile.isNotBlank()) {
+                                extractedCharacterProfile = updatedProfile
+                                GeminiFileKeyCache.saveCachedCharacterProfile(
+                                    context = context,
+                                    mediaUri = mediaUri,
+                                    geminiFileUri = finalGeminiFileUri,
+                                    characterHint = priorContextKey,
+                                    language = language,
+                                    profileText = updatedProfile,
+                                    fileName = mediaFileName
+                                )
+                            }
+                            if (isMainCharPov && selectedMain.isNotBlank()) {
+                                confirmedMainCharacter = selectedMain
+                                send(GenerationUpdate.Log("👤 အတည်ပြုလိုက်သော ပင်မဇာတ်ဆောင် (Main Character): $confirmedMainCharacter"))
+                            }
+                            if (customCharacterNameRules.isNotEmpty()) {
+                                customCharacterNameRules.forEach { rule ->
+                                    send(GenerationUpdate.Log("✏️ Custom Character Name သတ်မှတ်ချက်: $rule"))
+                                }
+                            }
+                        } catch (_: Exception) {
+                            if (isMainCharPov && rawConfirmationResponse.isNotBlank()) {
+                                confirmedMainCharacter = rawConfirmationResponse
+                                send(GenerationUpdate.Log("👤 အတည်ပြုလိုက်သော ပင်မဇာတ်ဆောင် (Main Character): $confirmedMainCharacter"))
+                            }
+                        }
+                    } else if (isMainCharPov && rawConfirmationResponse.isNotBlank()) {
+                        confirmedMainCharacter = rawConfirmationResponse
                         send(GenerationUpdate.Log("👤 အတည်ပြုလိုက်သော ပင်မဇာတ်ဆောင် (Main Character): $confirmedMainCharacter"))
                     }
                 }
@@ -968,12 +1010,18 @@ class GeminiApiClient(private val context: Context) {
             }
 
             val characterContinuityRules = buildString {
-                if (confirmedMainCharacter.isNotBlank()) {
+                if (isMainCharPov && confirmedMainCharacter.isNotBlank()) {
                     appendLine("- အတည်ပြုထားသော ပင်မဇာတ်ဆောင် (Confirmed Main Protagonist): $confirmedMainCharacter (ဤဇာတ်ကောင် တစ်ဦးတည်းကိုသာ ပင်မဇာတ်ဆောင်အဖြစ် သတ်မှတ်ရန်)")
                 }
                 if (extractedCharacterProfile.isNotBlank()) {
                     appendLine("- ဗီဒီယိုတစ်ပုဒ်လုံး၏ Character Profile & Supporting Characters:")
                     appendLine(extractedCharacterProfile)
+                }
+                if (customCharacterNameRules.isNotEmpty()) {
+                    appendLine("- ဇာတ်ကောင်အမည် ပြောင်းလဲရေးသားရန် အထူးညွှန်ကြားချက် (Custom Character Name Override Rules):")
+                    customCharacterNameRules.forEach { rule ->
+                        appendLine("  * $rule")
+                    }
                 }
                 if (isMainCharPov) {
                     appendLine("- Main Character Continuity စည်းကမ်းချက်: အထက်ပါ အတည်ပြုထားသော ပင်မဇာတ်ဆောင် (Main Protagonist) တစ်ဦးတည်းကိုသာ Part 1 မှ နောက်ဆုံး Part အထိ သတ်မှတ်ထားသော နာမ်စား ('ကျွန်တော်/ကျွန်မ' သို့မဟုတ် ကလေးငယ်ဖြစ်ပါက ယောက်ျားလေး 'သား' / မိန်းကလေး 'သမီး') အဖြစ် တသမတ်တည်း သုံးစွဲရမည်။")

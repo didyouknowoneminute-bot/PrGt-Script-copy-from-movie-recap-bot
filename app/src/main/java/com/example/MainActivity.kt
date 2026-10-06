@@ -206,6 +206,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var selectedCharacterDialogIndex by remember { mutableIntStateOf(0) }
     var customCharacterDialogInput by remember { mutableStateOf("") }
     var characterConfirmCountdown by remember { mutableIntStateOf(10) }
+    var isEditingCharacterNames by remember { mutableStateOf(false) }
+    val customCharacterNamesMap = remember { androidx.compose.runtime.mutableStateMapOf<Int, String>() }
     var showRetryDialog by remember { mutableStateOf<List<Int>?>(null) }
     var showRpdKeyDialog by remember { mutableStateOf(false) }
     var editMainKeyInput by remember { mutableStateOf("") }
@@ -578,6 +580,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         } else {
                             characterHint
                         }
+                        isEditingCharacterNames = false
+                        customCharacterNamesMap.clear()
                         characterConfirmCountdown = 10
                         showCharacterConfirmDialog = update
                     }
@@ -1754,25 +1758,76 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
     if (showCharacterConfirmDialog != null) {
         val confirmData = showCharacterConfirmDialog!!
-        LaunchedEffect(confirmData) {
-            while (characterConfirmCountdown > 0) {
-                kotlinx.coroutines.delay(1000L)
-                characterConfirmCountdown--
+        val isMainPovSelected = selectedPOV.contains("Main Character", ignoreCase = true)
+
+        val buildConfirmationPayload: () -> Pair<String, String> = {
+            val selectedChar = confirmData.characters.getOrNull(selectedCharacterDialogIndex)
+            val selectedCustomName = customCharacterNamesMap[selectedCharacterDialogIndex]?.trim() ?: ""
+            val baseSelection = customCharacterDialogInput.trim().ifBlank {
+                if (selectedChar != null) {
+                    val relPart = if (selectedChar.relationshipStatus.isNotBlank()) " [${selectedChar.relationshipStatus}]" else ""
+                    "${selectedChar.nameAndAppearance}$relPart - ${selectedChar.pronoun} နာမ်စားသုံးရန်"
+                } else ""
             }
-            if (showCharacterConfirmDialog != null) {
-                val finalSelection = customCharacterDialogInput.trim().ifBlank {
-                    val c = confirmData.characters.getOrNull(selectedCharacterDialogIndex)
-                    if (c != null) {
-                        val relPart = if (c.relationshipStatus.isNotBlank()) " [${c.relationshipStatus}]" else ""
-                        "${c.nameAndAppearance}$relPart - ${c.pronoun} နာမ်စားသုံးရန်"
-                    } else ""
+            val finalMainSelection = if (selectedCustomName.isNotBlank() && !baseSelection.contains("ပြောင်းရေးရန်")) {
+                "$baseSelection (နာမည်ကို '$selectedCustomName' အဖြစ် ပြောင်းရေးရန်)"
+            } else {
+                baseSelection
+            }
+
+            val customRulesArray = org.json.JSONArray()
+            val updatedLines = confirmData.characters.mapIndexed { idx, c ->
+                val roleStr = if (isMainPovSelected) {
+                    if (idx == selectedCharacterDialogIndex) "MAIN" else "SUPPORT"
+                } else {
+                    if (c.isRecommendedMain) "MAIN" else "SUPPORT"
                 }
-                if (finalSelection.isNotBlank()) {
-                    characterHint = finalSelection
-                    sharedPrefs.edit().putString("preset_character_hint", finalSelection).apply()
+                val cCustomName = customCharacterNamesMap[idx]?.trim() ?: ""
+                val relPart = if (c.relationshipStatus.isNotBlank()) " [${c.relationshipStatus}]" else ""
+                if (cCustomName.isNotBlank()) {
+                    customRulesArray.put(
+                        "${c.nameAndAppearance}$relPart (နာမ်စား: ${c.pronoun}) ၏ နာမည်ကို ဗီဒီယိုထဲတွင် မူရင်းအမည်ဖြင့် ခေါ်ဝေါ်နေသော်လည်း သင်ရေးသားမည့် Script ထဲတွင် '$cCustomName' အဖြစ် အစမှအဆုံး ပြောင်းလဲခေါ်ဝေါ်ရေးသားရန်"
+                    )
                 }
-                showCharacterConfirmDialog = null
-                activeCharacterConfirmChannel?.send(finalSelection)
+                val descWithCustom = if (cCustomName.isNotBlank()) {
+                    "${c.nameAndAppearance} 👉 [နာမည်ကို '$cCustomName' အဖြစ် ပြောင်းရေးရန်]"
+                } else {
+                    c.nameAndAppearance
+                }
+                "CHARACTER_ITEM: $roleStr | $descWithCustom | ${c.relationshipStatus} | ${c.pronoun}"
+            }
+            val updatedProfileStr = if (updatedLines.isNotEmpty()) {
+                updatedLines.joinToString("\n")
+            } else {
+                confirmData.rawProfileText
+            }
+
+            val payloadJson = org.json.JSONObject().apply {
+                put("selectedMainSummary", finalMainSelection)
+                put("updatedProfileText", updatedProfileStr)
+                put("customNameRules", customRulesArray)
+            }.toString()
+
+            Pair(finalMainSelection, payloadJson)
+        }
+
+        LaunchedEffect(confirmData, isEditingCharacterNames) {
+            if (!isEditingCharacterNames) {
+                while (characterConfirmCountdown > 0 && !isEditingCharacterNames) {
+                    kotlinx.coroutines.delay(1000L)
+                    if (!isEditingCharacterNames) {
+                        characterConfirmCountdown--
+                    }
+                }
+                if (!isEditingCharacterNames && characterConfirmCountdown <= 0 && showCharacterConfirmDialog != null) {
+                    val (finalSelection, payloadJson) = buildConfirmationPayload()
+                    if (isMainPovSelected && finalSelection.isNotBlank()) {
+                        characterHint = finalSelection
+                        sharedPrefs.edit().putString("preset_character_hint", finalSelection).apply()
+                    }
+                    showCharacterConfirmDialog = null
+                    activeCharacterConfirmChannel?.send(payloadJson)
+                }
             }
         }
 
@@ -1780,16 +1835,44 @@ fun MainScreen(modifier: Modifier = Modifier) {
             onDismissRequest = { /* Prevent outside click dismiss */ },
             title = {
                 Column {
-                    Text(
-                        text = "ပင်မဇာတ်ဆောင် (Main Character) အတည်ပြုရန်",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = if (isMainPovSelected) "ပင်မဇာတ်ဆောင်နှင့် နာမည် အတည်ပြုရန်" else "ဇာတ်ကောင်စာရင်းနှင့် နာမည် အတည်ပြုရန်",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.Bold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        OutlinedButton(
+                            onClick = { isEditingCharacterNames = !isEditingCharacterNames },
+                            contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Edit,
+                                contentDescription = "Edit Character Names",
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (isEditingCharacterNames) "Done" else "Edit",
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.height(4.dp))
                     Text(
-                        text = "⏱️ $characterConfirmCountdown စက္ကန့်အတွင်း မရွေးချယ်ပါက AI သတ်မှတ်ထားသည့်အတိုင်း အလိုအလျောက် ဆက်လက်လုပ်ဆောင်ပါမည်။",
+                        text = if (isEditingCharacterNames) {
+                            "✏️ နာမည်ပြင်ဆင်နေစဉ် Countdown ရပ်ထားပေးပါသည်။ ဇာတ်ကောင်ဘေးရှိ အကွက်တွင် ပြောင်းလိုသော နာမည်သစ် ထည့်သွင်းနိုင်ပါသည်။"
+                        } else {
+                            "⏱️ $characterConfirmCountdown စက္ကန့်အတွင်း မရွေးချယ်ပါက AI သတ်မှတ်ထားသည့်အတိုင်း အလိုအလျောက် ဆက်လက်လုပ်ဆောင်ပါမည်။ (နာမည်ပြင်လိုပါက Edit ကိုနှိပ်ပါ)"
+                        },
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.primary
+                        color = if (isEditingCharacterNames) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.primary
                     )
                 }
             },
@@ -1801,42 +1884,54 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Text(
-                        text = "ဗီဒီယိုထဲတွင် တွေ့ရှိရသော ဇာတ်ကောင်များနှင့် တော်စပ်ပုံ (တစ်ဦးကို ရွေးချယ်ပါ):",
+                        text = if (isMainPovSelected) {
+                            "ဗီဒီယိုထဲတွင် တွေ့ရှိရသော ဇာတ်ကောင်များ (ပင်မဇာတ်ဆောင် ရွေးချယ်ရန် / နာမည်ပြင်ရန်):"
+                        } else {
+                            "ဗီဒီယိုထဲတွင် တွေ့ရှိရသော ဇာတ်ကောင်များနှင့် တော်စပ်ပုံ:"
+                        },
                         style = MaterialTheme.typography.labelLarge,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     confirmData.characters.forEachIndexed { idx, charItem ->
                         val isSelected = selectedCharacterDialogIndex == idx
+                        val customNameVal = customCharacterNamesMap[idx] ?: ""
                         val formattedSummary = buildString {
                             append(charItem.nameAndAppearance)
                             if (charItem.relationshipStatus.isNotBlank()) {
                                 append(" [${charItem.relationshipStatus}]")
                             }
                             append(" - ${charItem.pronoun} နာမ်စားသုံးရန်")
+                            if (customNameVal.isNotBlank()) {
+                                append(" (နာမည်ကို '${customNameVal.trim()}' အဖြစ် ပြောင်းရေးရန်)")
+                            }
                         }
                         Surface(
                             modifier = Modifier
                                 .fillMaxWidth()
                                 .clickable {
-                                    selectedCharacterDialogIndex = idx
-                                    customCharacterDialogInput = formattedSummary
-                                },
-                            shape = RoundedCornerShape(10.dp),
-                            color = if (isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-                            border = if (isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                androidx.compose.material3.RadioButton(
-                                    selected = isSelected,
-                                    onClick = {
+                                    if (isMainPovSelected) {
                                         selectedCharacterDialogIndex = idx
                                         customCharacterDialogInput = formattedSummary
                                     }
-                                )
-                                Spacer(modifier = Modifier.width(6.dp))
+                                },
+                            shape = RoundedCornerShape(10.dp),
+                            color = if (isMainPovSelected && isSelected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                            border = if (isMainPovSelected && isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (isMainPovSelected) {
+                                    androidx.compose.material3.RadioButton(
+                                        selected = isSelected,
+                                        onClick = {
+                                            selectedCharacterDialogIndex = idx
+                                            customCharacterDialogInput = formattedSummary
+                                        }
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                }
                                 Column(modifier = Modifier.weight(1f)) {
                                     if (charItem.isRecommendedMain) {
                                         Text(
@@ -1849,7 +1944,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                     Text(
                                         text = charItem.nameAndAppearance,
                                         style = MaterialTheme.typography.bodyMedium,
-                                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+                                        fontWeight = if (isMainPovSelected && isSelected) FontWeight.Bold else FontWeight.Normal
                                     )
                                     if (charItem.relationshipStatus.isNotBlank()) {
                                         Text(
@@ -1864,54 +1959,80 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant
                                     )
+                                    if (customNameVal.isNotBlank()) {
+                                        Text(
+                                            text = "👉 နာမည်ကို '${customNameVal.trim()}' အဖြစ် ပြောင်းရေးမည်",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                    }
+                                }
+                                if (isEditingCharacterNames) {
+                                    Spacer(modifier = Modifier.width(8.dp))
+                                    OutlinedTextField(
+                                        value = customNameVal,
+                                        onValueChange = { newCustom ->
+                                            customCharacterNamesMap[idx] = newCustom
+                                            if (isMainPovSelected && selectedCharacterDialogIndex == idx) {
+                                                val relPart = if (charItem.relationshipStatus.isNotBlank()) " [${charItem.relationshipStatus}]" else ""
+                                                val suffix = if (newCustom.trim().isNotBlank()) " (နာမည်ကို '${newCustom.trim()}' အဖြစ် ပြောင်းရေးရန်)" else ""
+                                                customCharacterDialogInput = "${charItem.nameAndAppearance}$relPart - ${charItem.pronoun} နာမ်စားသုံးရန်$suffix"
+                                            }
+                                        },
+                                        label = { Text("နာမည်သစ်", fontSize = 11.sp) },
+                                        placeholder = { Text("ဥပမာ-သီရိ", fontSize = 11.sp) },
+                                        singleLine = true,
+                                        textStyle = androidx.compose.ui.text.TextStyle(fontSize = 13.sp),
+                                        modifier = Modifier.width(120.dp),
+                                        shape = RoundedCornerShape(8.dp)
+                                    )
                                 }
                             }
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Text(
-                        text = "သတ်မှတ်မည့် Main Character Hint (လိုအပ်ပါက ပြင်ဆင်နိုင်သည်):",
-                        style = MaterialTheme.typography.labelMedium,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                    )
-                    OutlinedTextField(
-                        value = customCharacterDialogInput,
-                        onValueChange = { customCharacterDialogInput = it },
-                        trailingIcon = {
-                            if (customCharacterDialogInput.isNotBlank()) {
-                                IconButton(onClick = { customCharacterDialogInput = "" }) {
-                                    Icon(Icons.Filled.Close, contentDescription = "Clear")
+                    if (isMainPovSelected) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "သတ်မှတ်မည့် Main Character Hint (လိုအပ်ပါက ပြင်ဆင်နိုင်သည်):",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        OutlinedTextField(
+                            value = customCharacterDialogInput,
+                            onValueChange = { customCharacterDialogInput = it },
+                            trailingIcon = {
+                                if (customCharacterDialogInput.isNotBlank()) {
+                                    IconButton(onClick = { customCharacterDialogInput = "" }) {
+                                        Icon(Icons.Filled.Close, contentDescription = "Clear")
+                                    }
                                 }
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp),
-                        maxLines = 2
-                    )
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            maxLines = 2
+                        )
+                    }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val finalSelection = customCharacterDialogInput.trim().ifBlank {
-                            val c = confirmData.characters.getOrNull(selectedCharacterDialogIndex)
-                            if (c != null) {
-                                val relPart = if (c.relationshipStatus.isNotBlank()) " [${c.relationshipStatus}]" else ""
-                                "${c.nameAndAppearance}$relPart - ${c.pronoun} နာမ်စားသုံးရန်"
-                            } else ""
-                        }
-                        if (finalSelection.isNotBlank()) {
+                        val (finalSelection, payloadJson) = buildConfirmationPayload()
+                        if (isMainPovSelected && finalSelection.isNotBlank()) {
                             characterHint = finalSelection
                             sharedPrefs.edit().putString("preset_character_hint", finalSelection).apply()
                         }
                         showCharacterConfirmDialog = null
                         coroutineScope.launch {
-                            activeCharacterConfirmChannel?.send(finalSelection)
+                            activeCharacterConfirmChannel?.send(payloadJson)
                         }
                     }
                 ) {
-                    Text("အတည်ပြုမည် (${characterConfirmCountdown}s)")
+                    Text(
+                        if (isEditingCharacterNames) "အတည်ပြုမည်" else "အတည်ပြုမည် (${characterConfirmCountdown}s)"
+                    )
                 }
             }
         )
