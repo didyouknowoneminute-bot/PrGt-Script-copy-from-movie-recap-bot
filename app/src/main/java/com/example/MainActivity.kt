@@ -10,11 +10,13 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
@@ -280,6 +282,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var newNameInput by remember { mutableStateOf("") }
     var scriptToDelete by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var scriptToRegenerate by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
+    var scriptForSpecialParts by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
+    var pendingRetryScript by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
+    var pendingRetryParts by remember { mutableStateOf<List<Int>?>(null) }
     var viewingHistoryScript by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var currentScriptId by remember { mutableStateOf<Int?>(null) }
     var isEditingScript by remember { mutableStateOf(false) }
@@ -306,6 +311,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
             scriptToRegenerate != null -> {
                 scriptToRegenerate = null
             }
+            scriptForSpecialParts != null -> {
+                scriptForSpecialParts = null
+            }
             showScriptInfo != null -> {
                 showScriptInfo = null
             }
@@ -327,9 +335,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
         }
     }
 
-    val launchGeneration: (com.example.db.PrGtScript?, List<Int>?) -> Unit = { existingScript, retryParts ->
+    val launchGenerationWithUri: (com.example.db.PrGtScript?, List<Int>?, Uri?) -> Unit = { existingScript, retryParts, overrideMediaUri ->
         val generationStartTime = existingScript?.timestamp ?: System.currentTimeMillis()
-        activeGenerationMediaName = existingScript?.fileName ?: selectedMediaName
+        activeGenerationMediaName = if (overrideMediaUri != null) {
+            getMediaFileName(context, overrideMediaUri, existingScript?.fileName ?: selectedMediaName)
+        } else {
+            existingScript?.fileName ?: selectedMediaName
+        }
         isGenerating = true
         generatedScript = ""
         currentScriptId = null
@@ -354,11 +366,27 @@ fun MainScreen(modifier: Modifier = Modifier) {
             val activeTone = existingScript?.tone ?: selectedTone
             val activeLanguage = existingScript?.language ?: selectedLanguage
             
-            var savedGeminiFileUri = existingScript?.geminiFileUri ?: if (cachedUploadedApiKey == apiKey) cachedUploadedGeminiUri else null
-            var savedMimeType = existingScript?.mimeType ?: if (cachedUploadedApiKey == apiKey && cachedUploadedMimeType != null) cachedUploadedMimeType else selectedMediaMimeType
-            var savedDurationMs = (existingScript?.durationSec?.toLongOrNull() ?: 0L) * 1000
-            if (savedDurationMs <= 0L && cachedUploadedApiKey == apiKey && cachedUploadedDurationMs != null && cachedUploadedDurationMs!! > 0L) {
-                savedDurationMs = cachedUploadedDurationMs!!
+            var savedGeminiFileUri = if (overrideMediaUri != null) null else (existingScript?.geminiFileUri ?: if (cachedUploadedApiKey == apiKey) cachedUploadedGeminiUri else null)
+            var savedMimeType = if (overrideMediaUri != null) {
+                context.contentResolver.getType(overrideMediaUri) ?: (existingScript?.mimeType ?: selectedMediaMimeType)
+            } else {
+                existingScript?.mimeType ?: if (cachedUploadedApiKey == apiKey && cachedUploadedMimeType != null) cachedUploadedMimeType else selectedMediaMimeType
+            }
+            var savedDurationMs = if (overrideMediaUri != null) {
+                var dur = 0L
+                try {
+                    val retriever = android.media.MediaMetadataRetriever()
+                    retriever.setDataSource(context, overrideMediaUri)
+                    val timeString = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                    dur = timeString?.toLongOrNull() ?: 0L
+                    retriever.release()
+                } catch (_: Exception) {}
+                dur
+            } else {
+                val d = (existingScript?.durationSec?.toLongOrNull() ?: 0L) * 1000
+                if (d <= 0L && cachedUploadedApiKey == apiKey && cachedUploadedDurationMs != null && cachedUploadedDurationMs!! > 0L) {
+                    cachedUploadedDurationMs!!
+                } else d
             }
             var savedPartsCount = existingScript?.partsCount ?: parts.toInt()
             
@@ -492,6 +520,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             put("spareFailed", localSpareFailedCalls)
                             put("characterProfile", localCharacterProfile)
                             put("confirmedMainCharacter", localConfirmedMainChar)
+                            put("uploadApiKey", apiKey)
                         }
 
                         val scriptEntity = com.example.db.PrGtScript(
@@ -580,7 +609,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 pov = activePOV,
                 tone = activeTone,
                 language = activeLanguage,
-                mediaUri = selectedMediaUri, // This might be null if retrying, but existingGeminiFileUri will handle it
+                mediaUri = overrideMediaUri ?: selectedMediaUri, // This might be null if retrying, but existingGeminiFileUri will handle it
                 mediaMimeType = savedMimeType ?: selectedMediaMimeType,
                 retryDecisionChannel = decisionChannel,
                 newKeyChannel = newKeyChan,
@@ -723,6 +752,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    val launchGeneration: (com.example.db.PrGtScript?, List<Int>?) -> Unit = { existingScript, retryParts ->
+        launchGenerationWithUri(existingScript, retryParts, null)
+    }
+
     val videoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -769,6 +802,74 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 retriever.release()
             } catch (e: Exception) {
                 selectedMediaDurationMs = 0L
+            }
+        }
+    }
+
+    val retryMediaPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        val script = pendingRetryScript
+        val partsToRun = pendingRetryParts
+        pendingRetryScript = null
+        pendingRetryParts = null
+        if (uri != null && script != null) {
+            selectedMediaUri = uri
+            selectedMediaMimeType = context.contentResolver.getType(uri) ?: (script.mimeType ?: "video/mp4")
+            selectedMediaName = getMediaFileName(context, uri, script.fileName)
+            try {
+                val retriever = android.media.MediaMetadataRetriever()
+                retriever.setDataSource(context, uri)
+                val timeString = retriever.extractMetadata(android.media.MediaMetadataRetriever.METADATA_KEY_DURATION)
+                selectedMediaDurationMs = timeString?.toLongOrNull() ?: 0L
+                retriever.release()
+            } catch (_: Exception) {
+                selectedMediaDurationMs = 0L
+            }
+            launchGenerationWithUri(script, partsToRun, uri)
+        }
+    }
+
+    val triggerScriptAction: (com.example.db.PrGtScript, List<Int>?) -> Unit = { targetScript, targetParts ->
+        val timeSinceSaved = System.currentTimeMillis() - targetScript.timestamp
+        val isExpired48h = timeSinceSaved >= (48L * 60 * 60 * 1000)
+
+        var recordedApiKey = ""
+        if (targetScript.rpdInfoJson.isNotBlank()) {
+            try {
+                val rObj = org.json.JSONObject(targetScript.rpdInfoJson)
+                recordedApiKey = rObj.optString("uploadApiKey", "")
+            } catch (_: Exception) {}
+        }
+
+        coroutineScope.launch {
+            var isAccessible = false
+            if (!isExpired48h && !targetScript.geminiFileUri.isNullOrBlank()) {
+                if (recordedApiKey.isNotBlank() && recordedApiKey != apiKey) {
+                    isAccessible = false
+                } else {
+                    val fileId = targetScript.geminiFileUri.substringAfterLast("/")
+                    isAccessible = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        try {
+                            geminiApiClient.checkFileState(apiKey, "files/$fileId") == "ACTIVE"
+                        } catch (_: Exception) {
+                            false
+                        }
+                    }
+                }
+            }
+
+            if (isAccessible) {
+                launchGenerationWithUri(targetScript, targetParts, null)
+            } else {
+                pendingRetryScript = targetScript
+                pendingRetryParts = targetParts
+                val mime = targetScript.mimeType ?: "video/*"
+                if (mime.startsWith("audio")) {
+                    retryMediaPickerLauncher.launch("audio/*")
+                } else {
+                    retryMediaPickerLauncher.launch("video/*")
+                }
             }
         }
     }
@@ -957,96 +1058,120 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                 style = MaterialTheme.typography.bodyMedium,
                                 maxLines = 5
                             )
-                            Spacer(modifier = Modifier.height(12.dp))
-                            Button(
-                                onClick = { 
-                                    viewingHistoryScript = script
-                                },
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text("View Full Script (ဖတ်ရှုမည်)")
-                            }
-
                             val timeSinceSaved = System.currentTimeMillis() - script.timestamp
                             val timeRemainingMs = (48L * 60 * 60 * 1000) - timeSinceSaved
-
-                            if (timeRemainingMs > 0 && script.geminiFileUri != null) {
+                            val timeStr = if (timeRemainingMs > 0) {
                                 val remainingHours = java.util.concurrent.TimeUnit.MILLISECONDS.toHours(timeRemainingMs)
                                 val remainingMins = java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(timeRemainingMs) % 60
-                                val timeStr = "${remainingHours}h ${remainingMins}m"
+                                "${remainingHours}h ${remainingMins}m"
+                            } else "Expired"
 
-                                val failedParts = mutableListOf<Int>()
-                                val partsMap = try {
-                                    if (script.scriptPartsJson.isNotBlank()) {
-                                        val obj = org.json.JSONObject(script.scriptPartsJson)
-                                        obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
-                                    } else emptyMap()
-                                } catch (_: Exception) {
-                                    emptyMap()
+                            val failedParts = mutableListOf<Int>()
+                            val partsMap = try {
+                                if (script.scriptPartsJson.isNotBlank()) {
+                                    val obj = org.json.JSONObject(script.scriptPartsJson)
+                                    obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                                } else emptyMap()
+                            } catch (_: Exception) {
+                                emptyMap()
+                            }
+
+                            for (i in 0 until script.partsCount) {
+                                val partContent = partsMap[i]
+                                val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
+                                val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
+                                val isMarkerInText = script.scriptText.contains("[အပိုင်း (${i + 1})") || 
+                                    script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
+                                    script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
+                                    script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
+                                    script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
+                                    script.scriptText.contains("Part ${i + 1}") && (script.scriptText.contains("Error") || script.scriptText.contains("failed"))
+
+                                if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
+                                    failedParts.add(i)
                                 }
+                            }
 
-                                for (i in 0 until script.partsCount) {
-                                    val partContent = partsMap[i]
-                                    val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
-                                    val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
-                                    val isMarkerInText = script.scriptText.contains("[အပိုင်း (${i + 1})") || 
-                                        script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
-                                        script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
-                                        script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
-                                        script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
-                                        script.scriptText.contains("Part ${i + 1}") && (script.scriptText.contains("Error") || script.scriptText.contains("failed"))
-
-                                    if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
-                                        failedParts.add(i)
+                            if (failedParts.isNotEmpty()) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Surface(
+                                    color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier.fillMaxWidth().padding(bottom = 4.dp)
+                                ) {
+                                    Row(
+                                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Icon(
+                                            imageVector = Icons.Filled.Warning,
+                                            contentDescription = null,
+                                            tint = MaterialTheme.colorScheme.error,
+                                            modifier = Modifier.size(16.dp)
+                                        )
+                                        Spacer(modifier = Modifier.width(6.dp))
+                                        Text(
+                                            text = "⚠️ မပြည့်စုံသေးသောအပိုင်း (${failedParts.size}) ပိုင်း ကျန်ရှိနေပါသည်: ${failedParts.map { it + 1 }.joinToString(", ")}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.onErrorContainer
+                                        )
                                     }
                                 }
-                                
-                                Spacer(modifier = Modifier.height(8.dp))
+                            }
+
+                            Spacer(modifier = Modifier.height(12.dp))
+
+                            // Row 1: [View Full Script] [Regenerate All]
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                Button(
+                                    onClick = { viewingHistoryScript = script },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text("View Full Script", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
+                                androidx.compose.material3.OutlinedButton(
+                                    onClick = { scriptToRegenerate = script },
+                                    modifier = Modifier.weight(1f)
+                                ) {
+                                    Text(
+                                        if (timeRemainingMs > 0) "Regenerate All ($timeStr)" else "Regenerate All",
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+
+                            Spacer(modifier = Modifier.height(8.dp))
+
+                            // Row 2: [Retry Special Parts] [Retry Failed Parts (if failed)]
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                androidx.compose.material3.OutlinedButton(
+                                    onClick = { scriptForSpecialParts = script },
+                                    modifier = if (failedParts.isNotEmpty()) Modifier.weight(1f) else Modifier.fillMaxWidth()
+                                ) {
+                                    Text("Retry Special Parts", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                }
                                 if (failedParts.isNotEmpty()) {
-                                    Surface(
-                                        color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f),
-                                        shape = RoundedCornerShape(8.dp),
-                                        modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
-                                    ) {
-                                        Row(
-                                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
-                                            verticalAlignment = Alignment.CenterVertically
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Filled.Warning,
-                                                contentDescription = null,
-                                                tint = MaterialTheme.colorScheme.error,
-                                                modifier = Modifier.size(16.dp)
-                                            )
-                                            Spacer(modifier = Modifier.width(6.dp))
-                                            Text(
-                                                text = "⚠️ မပြည့်စုံသေးသောအပိုင်း (${failedParts.size}) ပိုင်း ကျန်ရှိနေပါသည်: ${failedParts.map { it + 1 }.joinToString(", ")}",
-                                                style = MaterialTheme.typography.bodySmall,
-                                                fontWeight = FontWeight.SemiBold,
-                                                color = MaterialTheme.colorScheme.onErrorContainer
-                                            )
-                                        }
-                                    }
-                                    androidx.compose.material3.OutlinedButton(
-                                        onClick = { scriptToRegenerate = script },
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text("Regenerate All ($timeStr remaining)")
-                                    }
-                                    Spacer(modifier = Modifier.height(4.dp))
                                     Button(
-                                        onClick = { launchGeneration(script, failedParts) },
-                                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error, contentColor = MaterialTheme.colorScheme.onError),
-                                        modifier = Modifier.fillMaxWidth()
+                                        onClick = { triggerScriptAction(script, failedParts) },
+                                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.error,
+                                            contentColor = MaterialTheme.colorScheme.onError
+                                        ),
+                                        modifier = Modifier.weight(1f)
                                     ) {
-                                        Text("Retry Failed Parts ($timeStr remaining)")
-                                    }
-                                } else {
-                                    androidx.compose.material3.OutlinedButton(
-                                        onClick = { scriptToRegenerate = script },
-                                        modifier = Modifier.fillMaxWidth()
-                                    ) {
-                                        Text("Regenerate All ($timeStr remaining)")
+                                        Text(
+                                            "Retry Failed (${failedParts.size})",
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
                                     }
                                 }
                             }
@@ -1396,22 +1521,20 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                         color = MaterialTheme.colorScheme.onErrorContainer
                                     )
                                 }
-                                if (script.geminiFileUri != null) {
-                                    Button(
-                                        onClick = {
-                                            val partsToRun = viewerMissingParts.toList()
-                                            viewingHistoryScript = null
-                                            launchGeneration(script, partsToRun)
-                                        },
-                                        colors = androidx.compose.material3.ButtonDefaults.buttonColors(
-                                            containerColor = MaterialTheme.colorScheme.error,
-                                            contentColor = MaterialTheme.colorScheme.onError
-                                        ),
-                                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
-                                        modifier = Modifier.padding(start = 8.dp)
-                                    ) {
-                                        Text("Retry Failed Parts", style = MaterialTheme.typography.labelSmall)
-                                    }
+                                Button(
+                                    onClick = {
+                                        val partsToRun = viewerMissingParts.toList()
+                                        viewingHistoryScript = null
+                                        triggerScriptAction(script, partsToRun)
+                                    },
+                                    colors = androidx.compose.material3.ButtonDefaults.buttonColors(
+                                        containerColor = MaterialTheme.colorScheme.error,
+                                        contentColor = MaterialTheme.colorScheme.onError
+                                    ),
+                                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                                    modifier = Modifier.padding(start = 8.dp)
+                                ) {
+                                    Text("Retry Failed Parts", style = MaterialTheme.typography.labelSmall)
                                 }
                             }
                         }
@@ -1768,13 +1891,194 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         language = localLanguage
                     )
                     scriptToRegenerate = null
-                    launchGeneration(updatedScript, null)
+                    triggerScriptAction(updatedScript, null)
                 }) {
                     Text("Start Generation")
                 }
             },
             dismissButton = {
                 OutlinedButton(onClick = { scriptToRegenerate = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (scriptForSpecialParts != null) {
+        val targetScript = scriptForSpecialParts!!
+        val totalParts = targetScript.partsCount
+        val selectedPartIndices = remember(targetScript.id) { mutableStateListOf<Int>() }
+
+        val partsMap = remember(targetScript.id) {
+            try {
+                if (targetScript.scriptPartsJson.isNotBlank()) {
+                    val obj = org.json.JSONObject(targetScript.scriptPartsJson)
+                    obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                } else emptyMap()
+            } catch (_: Exception) {
+                emptyMap()
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { scriptForSpecialParts = null },
+            title = {
+                Column {
+                    Text(
+                        text = "Retry Special Parts",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = "${targetScript.fileName} (စုစုပေါင်း $totalParts ပိုင်း)",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = "ပြန်လည်ထုတ်လုပ်လိုသော အပိုင်းနံပါတ်များကို ရွေးချယ်ပါ-",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium
+                    )
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                selectedPartIndices.clear()
+                                for (i in 0 until totalParts) {
+                                    selectedPartIndices.add(i)
+                                }
+                            },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Select All", style = MaterialTheme.typography.labelMedium)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                selectedPartIndices.clear()
+                            },
+                            modifier = Modifier.weight(1f),
+                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                        ) {
+                            Text("Clear All", style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(14.dp))
+
+                    val chunkedParts = (0 until totalParts).chunked(5)
+                    Column(
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        chunkedParts.forEach { rowIndices ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                rowIndices.forEach { partIndex ->
+                                    val isSelected = selectedPartIndices.contains(partIndex)
+                                    val partContent = partsMap[partIndex]
+                                    val isFailedOrMissing = partContent.isNullOrBlank() || 
+                                        partContent.contains("နေရာလွတ်") || 
+                                        partContent.contains("Error")
+
+                                    Box(
+                                        modifier = Modifier
+                                            .weight(1f)
+                                            .aspectRatio(1f)
+                                            .clip(RoundedCornerShape(8.dp))
+                                            .background(
+                                                if (isSelected) MaterialTheme.colorScheme.primary
+                                                else if (isFailedOrMissing) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
+                                                else MaterialTheme.colorScheme.surfaceVariant
+                                            )
+                                            .border(
+                                                width = if (isSelected) 2.dp else 1.dp,
+                                                color = if (isSelected) MaterialTheme.colorScheme.primary
+                                                else if (isFailedOrMissing) MaterialTheme.colorScheme.error.copy(alpha = 0.6f)
+                                                else MaterialTheme.colorScheme.outlineVariant,
+                                                shape = RoundedCornerShape(8.dp)
+                                            )
+                                            .clickable {
+                                                if (isSelected) {
+                                                    selectedPartIndices.remove(partIndex)
+                                                } else {
+                                                    selectedPartIndices.add(partIndex)
+                                                }
+                                            },
+                                        contentAlignment = Alignment.Center
+                                    ) {
+                                        Column(
+                                            horizontalAlignment = Alignment.CenterHorizontally,
+                                            verticalArrangement = Arrangement.Center
+                                        ) {
+                                            Text(
+                                                text = "${partIndex + 1}",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
+                                                color = if (isSelected) MaterialTheme.colorScheme.onPrimary
+                                                else if (isFailedOrMissing) MaterialTheme.colorScheme.error
+                                                else MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                            if (isFailedOrMissing && !isSelected) {
+                                                Text(
+                                                    text = "⚠️",
+                                                    style = MaterialTheme.typography.labelSmall
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                                for (emptySlot in 0 until (5 - rowIndices.size)) {
+                                    Spacer(modifier = Modifier.weight(1f))
+                                }
+                            }
+                        }
+                    }
+
+                    if (selectedPartIndices.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(12.dp))
+                        Text(
+                            text = "ရွေးချယ်ထားသောအပိုင်း (${selectedPartIndices.size} ပိုင်း): ${selectedPartIndices.sorted().map { it + 1 }.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val partsToRun = selectedPartIndices.sorted().toList()
+                        val scriptToRun = targetScript
+                        scriptForSpecialParts = null
+                        triggerScriptAction(scriptToRun, partsToRun)
+                    },
+                    enabled = selectedPartIndices.isNotEmpty()
+                ) {
+                    Text(
+                        if (selectedPartIndices.isEmpty()) "Select at least 1 part" 
+                        else "Regenerate (${selectedPartIndices.size} Parts)"
+                    )
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { scriptForSpecialParts = null }) {
                     Text("Cancel")
                 }
             }

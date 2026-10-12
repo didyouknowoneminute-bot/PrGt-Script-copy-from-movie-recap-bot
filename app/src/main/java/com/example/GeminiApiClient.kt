@@ -709,6 +709,30 @@ class GeminiApiClient(private val context: Context) {
             }
 
             // Pre-Analysis Step: Extract Character Profile & Protagonist Identity (Plot Spoiler Free)
+            // Optimize: Start pre-uploading media for Spare / Parallel Keys in background
+            // while the Primary Key extracts character profiles and awaits user confirmation.
+            val preuploadJob: kotlinx.coroutines.Job? = if (parallelKeyCount > 1) {
+                val candidateSpareKeys = keyMutex.withLock {
+                    activeKeyQueue.filter { it.isSpare }
+                        .filter { entry ->
+                            val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                            !rpdEnabled || used < rpdLimit
+                        }
+                        .take(parallelKeyCount - 1)
+                }
+                if (candidateSpareKeys.isNotEmpty()) {
+                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                        candidateSpareKeys.forEach { entry ->
+                            try {
+                                ensureMediaUploadedForKey(entry.key, entry.label)
+                            } catch (_: Exception) {
+                                // Background pre-upload failure will be retried on demand
+                            }
+                        }
+                    }
+                } else null
+            } else null
+
             var confirmedMainCharacter = characterHint.trim()
             val seriesInfo = GeminiFileKeyCache.parseSeriesInfo(mediaFileName)
             val combinedPriorMap = priorSeriesProfiles
@@ -1902,7 +1926,7 @@ class GeminiApiClient(private val context: Context) {
         }
     }
     
-    private fun checkFileState(apiKey: String, name: String): String {
+    fun checkFileState(apiKey: String, name: String): String {
         val request = Request.Builder()
             .url("https://generativelanguage.googleapis.com/v1beta/$name?key=$apiKey")
             .get()
