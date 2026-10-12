@@ -93,6 +93,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
     // States (Loaded from Last Presets Cache)
     var parts by remember { mutableStateOf(sharedPrefs.getFloat("preset_parts", 20f).coerceIn(5f, 50f)) }
+    var parallelKeys by remember { mutableStateOf(sharedPrefs.getFloat("preset_parallel_keys", 1f).coerceIn(1f, 10f)) }
     
     val scriptLengths = listOf("Short", "Medium", "Long", "TTS match")
     var selectedLength by remember {
@@ -198,6 +199,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var showStopDialog by remember { mutableStateOf(false) }
     var generationJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var saveCurrentProgressAndStop by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var autoSaveCurrentProgress by remember { mutableStateOf<(() -> Unit)?>(null) }
     
     var activeDecisionChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<Boolean>?>(null) }
     var activeNewKeyChannel by remember { mutableStateOf<kotlinx.coroutines.channels.Channel<String>?>(null) }
@@ -218,6 +220,31 @@ fun MainScreen(modifier: Modifier = Modifier) {
     
     val coroutineScope = rememberCoroutineScope()
 
+
+    val lifecycleOwner = androidx.compose.ui.platform.LocalLifecycleOwner.current
+    DisposableEffect(isGenerating) {
+        val window = (context as? android.app.Activity)?.window
+        if (isGenerating) {
+            window?.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            window?.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
+    DisposableEffect(lifecycleOwner, isGenerating) {
+        val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+            if (isGenerating && (event == androidx.lifecycle.Lifecycle.Event.ON_STOP || event == androidx.lifecycle.Lifecycle.Event.ON_PAUSE)) {
+                autoSaveCurrentProgress?.invoke()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
 
     LaunchedEffect(isGenerating) {
         if (isGenerating) {
@@ -357,14 +384,23 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 }
             }
             var previousVersionsArray = org.json.JSONArray(existingScript?.previousVersionsJson ?: "[]")
+            if (existingScript != null && existingScript.scriptText.isNotBlank()) {
+                val prevVersionObj = org.json.JSONObject()
+                prevVersionObj.put("timestamp", System.currentTimeMillis())
+                prevVersionObj.put("scriptText", existingScript.scriptText)
+                previousVersionsArray.put(prevVersionObj)
+            }
+            var autoSavedRecordId: Int? = existingScript?.id
+            val autoSaveMutex = kotlinx.coroutines.sync.Mutex()
 
             val activeFileName = existingScript?.fileName ?: selectedMediaName
             val currentSeriesInfo = GeminiFileKeyCache.parseSeriesInfo(activeFileName)
             val historySeriesProfiles = mutableMapOf<Int, String>()
+            val priorMainCharByPart = mutableMapOf<Int, String>()
             if (currentSeriesInfo.baseTitle.isNotBlank()) {
                 historyScripts.forEach { scriptItem ->
                     val itemSeriesInfo = GeminiFileKeyCache.parseSeriesInfo(scriptItem.fileName)
-                    if (itemSeriesInfo.baseTitle.equals(currentSeriesInfo.baseTitle, ignoreCase = true) &&
+                    if (GeminiFileKeyCache.isSameSeries(itemSeriesInfo.baseTitle, currentSeriesInfo.baseTitle) &&
                         itemSeriesInfo.partNumber != null &&
                         itemSeriesInfo.partNumber != currentSeriesInfo.partNumber
                     ) {
@@ -372,8 +408,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             if (scriptItem.rpdInfoJson.isNotBlank()) {
                                 val rObj = org.json.JSONObject(scriptItem.rpdInfoJson)
                                 val savedCharProf = rObj.optString("characterProfile", "")
-                                if (savedCharProf.isNotBlank()) {
+                                val savedMain = rObj.optString("confirmedMainCharacter", "")
+                                if (savedCharProf.isNotBlank() && !historySeriesProfiles.containsKey(itemSeriesInfo.partNumber)) {
                                     historySeriesProfiles[itemSeriesInfo.partNumber] = savedCharProf
+                                }
+                                if (savedMain.isNotBlank() && !priorMainCharByPart.containsKey(itemSeriesInfo.partNumber)) {
+                                    priorMainCharByPart[itemSeriesInfo.partNumber] = savedMain
                                 }
                             }
                         } catch (_: Exception) {
@@ -396,6 +436,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     }
                 }
             }
+            val priorSeriesMainCharHint = priorMainCharByPart.entries
+                .maxByOrNull { it.key }
+                ?.value
+                ?.trim()
+                ?: ""
             
             if (existingScript != null && retryParts != null && existingScript.scriptPartsJson.isNotBlank()) {
                 try {
@@ -411,6 +456,90 @@ fun MainScreen(modifier: Modifier = Modifier) {
             var finalScript = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
             generatedScript = finalScript
 
+            suspend fun persistProgressToDb(): com.example.db.PrGtScript? {
+                return kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) {
+                    autoSaveMutex.lock()
+                    try {
+                        val snapshotMap = mutableMapOf<Int, String>()
+                        for (partIdx in 0 until savedPartsCount) {
+                            val existingVal = scriptPartsMap[partIdx]
+                            snapshotMap[partIdx] = if (existingVal == null || existingVal.isBlank()) {
+                                "[အပိုင်း ${partIdx + 1} - နေရာလွတ်...]\n"
+                            } else {
+                                existingVal
+                            }
+                        }
+                        val snapshotText = snapshotMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
+                        val hasAnyRealProgress = scriptPartsMap.values.any { it.isNotBlank() && !it.contains("နေရာလွတ်") } ||
+                            localCharacterProfile.isNotBlank() ||
+                            !savedGeminiFileUri.isNullOrBlank()
+                        if (!hasAnyRealProgress || snapshotText.isBlank()) {
+                            return@withContext null
+                        }
+
+                        val partsJson = org.json.JSONObject()
+                        snapshotMap.forEach { (k, v) -> partsJson.put(k.toString(), v) }
+
+                        val rpdJson = org.json.JSONObject().apply {
+                            put("rpdEnabled", rpdEnabled)
+                            put("rpdLimit", 20)
+                            put("usedSpareKey", localUsedSpareKey)
+                            put("mainTotal", localMainApiCalls)
+                            put("mainSuccess", localMainSuccessCalls)
+                            put("mainFailed", localMainFailedCalls)
+                            put("spareTotal", localSpareApiCalls)
+                            put("spareSuccess", localSpareSuccessCalls)
+                            put("spareFailed", localSpareFailedCalls)
+                            put("characterProfile", localCharacterProfile)
+                            put("confirmedMainCharacter", localConfirmedMainChar)
+                        }
+
+                        val scriptEntity = com.example.db.PrGtScript(
+                            fileName = existingScript?.fileName ?: selectedMediaName,
+                            fileSize = "N/A",
+                            durationSec = if (savedDurationMs > 0) (savedDurationMs / 1000).toString() else "N/A",
+                            scriptText = snapshotText,
+                            timestamp = generationStartTime,
+                            language = activeLanguage,
+                            modelId = activeModel,
+                            targetLength = activeLength,
+                            pov = activePOV,
+                            tone = activeTone,
+                            geminiFileUri = savedGeminiFileUri,
+                            mimeType = savedMimeType,
+                            partsCount = savedPartsCount,
+                            scriptPartsJson = partsJson.toString(),
+                            totalApiCalls = localTotalApiCalls,
+                            successApiCalls = localSuccessApiCalls,
+                            failedApiCalls = localFailedApiCalls,
+                            previousVersionsJson = previousVersionsArray.toString(),
+                            rpdInfoJson = rpdJson.toString()
+                        )
+                        val cutoffTime = System.currentTimeMillis() - (168L * 60 * 60 * 1000)
+                        dao.deleteOlderThan(cutoffTime)
+                        val oldId = autoSavedRecordId
+                        if (oldId != null) {
+                            dao.deleteScriptById(oldId)
+                        }
+                        val newId = dao.insertScript(scriptEntity)
+                        autoSavedRecordId = newId.toInt()
+                        currentScriptId = newId.toInt()
+                        dao.keepLatestFifty()
+                        scriptEntity.copy(id = newId.toInt())
+                    } catch (_: Exception) {
+                        null
+                    } finally {
+                        autoSaveMutex.unlock()
+                    }
+                }
+            }
+
+            autoSaveCurrentProgress = {
+                coroutineScope.launch {
+                    persistProgressToDb()
+                }
+            }
+
             saveCurrentProgressAndStop = {
                 generationJob?.cancel()
                 // Ensure all parts up to savedPartsCount exist in scriptPartsMap with a placeholder if missing
@@ -423,67 +552,19 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
                 val currentText = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
                 if (currentText.isNotBlank()) {
-                    val partsJson = org.json.JSONObject()
-                    scriptPartsMap.forEach { (k, v) -> partsJson.put(k.toString(), v) }
-
-                    if (existingScript != null) {
-                        val prevVersionObj = org.json.JSONObject()
-                        prevVersionObj.put("timestamp", System.currentTimeMillis())
-                        prevVersionObj.put("scriptText", existingScript.scriptText)
-                        previousVersionsArray.put(prevVersionObj)
-                    }
-
-                    val rpdJson = org.json.JSONObject().apply {
-                        put("rpdEnabled", rpdEnabled)
-                        put("rpdLimit", 20)
-                        put("usedSpareKey", localUsedSpareKey)
-                        put("mainTotal", localMainApiCalls)
-                        put("mainSuccess", localMainSuccessCalls)
-                        put("mainFailed", localMainFailedCalls)
-                        put("spareTotal", localSpareApiCalls)
-                        put("spareSuccess", localSpareSuccessCalls)
-                        put("spareFailed", localSpareFailedCalls)
-                        put("characterProfile", localCharacterProfile)
-                        put("confirmedMainCharacter", localConfirmedMainChar)
-                    }
-
-                    val scriptEntity = com.example.db.PrGtScript(
-                        fileName = existingScript?.fileName ?: selectedMediaName,
-                        fileSize = "N/A",
-                        durationSec = if (savedDurationMs > 0) (savedDurationMs / 1000).toString() else "N/A",
-                        scriptText = currentText,
-                        timestamp = generationStartTime,
-                        language = activeLanguage,
-                        modelId = activeModel,
-                        targetLength = activeLength,
-                        pov = activePOV,
-                        tone = activeTone,
-                        geminiFileUri = savedGeminiFileUri,
-                        mimeType = savedMimeType,
-                        partsCount = savedPartsCount,
-                        scriptPartsJson = partsJson.toString(),
-                        totalApiCalls = localTotalApiCalls,
-                        successApiCalls = localSuccessApiCalls,
-                        failedApiCalls = localFailedApiCalls,
-                        previousVersionsJson = previousVersionsArray.toString(),
-                        rpdInfoJson = rpdJson.toString()
-                    )
                     coroutineScope.launch {
-                        if (existingScript != null) {
-                            dao.deleteScriptById(existingScript.id)
-                        }
-                        val newId = dao.insertScript(scriptEntity)
-                        currentScriptId = newId.toInt()
+                        val savedEntity = persistProgressToDb()
                         isEditingScript = false
-                        dao.keepLatestFifty()
-                        val savedEntity = scriptEntity.copy(id = newId.toInt())
-                        viewingHistoryScript = savedEntity
+                        if (savedEntity != null) {
+                            viewingHistoryScript = savedEntity
+                        }
                     }
                     generatedScript = currentText
                     generationLogs.add("✅ လက်ရှိပြီးစီးသမျှ အပိုင်းများကို အောင်မြင်စွာ သိမ်းဆည်းထားပြီးပါပြီ။ နောက်မှ ကျန်အပိုင်းများကို ဆက်လက် Retry လုပ်နိုင်ပါသည်။")
                 }
                 isGenerating = false
                 saveCurrentProgressAndStop = null
+                autoSaveCurrentProgress = null
             }
 
             val enabledSpareKeys = spareKeySlots.filter { it.enabled && it.key.isNotBlank() }.map { it.key.trim() }
@@ -508,7 +589,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 specificPartsToGenerate = retryParts,
                 rpm = rpmSetting.toInt(),
                 characterHint = if (activePOV.contains("Main Character", ignoreCase = true)) {
-                    localConfirmedMainChar.ifBlank { characterHint.trim() }
+                    localConfirmedMainChar.ifBlank { characterHint.trim().ifBlank { priorSeriesMainCharHint } }
                 } else "",
                 characterConfirmationChannel = charConfirmChan,
                 mediaFileName = activeFileName,
@@ -516,7 +597,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 existingCharacterProfile = localCharacterProfile,
                 mainKeyEnabled = mainKeyEnabled,
                 spareApiKeysList = enabledSpareKeys,
-                spareKeySlots = spareKeySlots
+                spareKeySlots = spareKeySlots,
+                parallelKeyCount = parallelKeys.toInt()
             ).collect { update ->
                 when (update) {
                     is GenerationUpdate.Log -> generationLogs.add(update.message)
@@ -529,6 +611,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         cachedUploadedDurationMs = update.durationMs
                         cachedUploadedMimeType = update.mimeType
                         cachedUploadedApiKey = apiKey
+                        coroutineScope.launch { persistProgressToDb() }
                     }
                     is GenerationUpdate.InitParts -> {
                         savedPartsCount = update.totalParts
@@ -540,6 +623,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         }
                         finalScript = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
                         generatedScript = finalScript
+                        coroutineScope.launch { persistProgressToDb() }
                     }
                     is GenerationUpdate.ScriptChunk -> {
                         if (update.clearFirst) {
@@ -553,6 +637,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         }
                         finalScript = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
                         generatedScript = finalScript
+                        if (!update.clearFirst && update.text.isNotBlank()) {
+                            coroutineScope.launch { persistProgressToDb() }
+                        }
                     }
                     is GenerationUpdate.Error -> {
                         generationLogs.add("ERROR: ${update.message}")
@@ -588,6 +675,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     is GenerationUpdate.CharacterProfileSaved -> {
                         localCharacterProfile = update.profileText
                         localConfirmedMainChar = update.confirmedMainCharacter
+                        coroutineScope.launch { persistProgressToDb() }
                     }
                     is GenerationUpdate.RequireNewKeyForRpd -> {
                         val missing = scriptPartsMap.filter { entry ->
@@ -622,70 +710,16 @@ fun MainScreen(modifier: Modifier = Modifier) {
             
             // Save to database
             if (finalScript.isNotBlank() && !finalScript.contains("Error generating script") && !finalScript.contains("Error:")) {
-                val partsJson = org.json.JSONObject()
-                scriptPartsMap.forEach { (k, v) -> partsJson.put(k.toString(), v) }
-                
-                if (existingScript != null) {
-                    val prevVersionObj = org.json.JSONObject()
-                    prevVersionObj.put("timestamp", System.currentTimeMillis())
-                    prevVersionObj.put("scriptText", existingScript.scriptText)
-                    previousVersionsArray.put(prevVersionObj)
-                }
-                
-                val rpdJson = org.json.JSONObject().apply {
-                    put("rpdEnabled", rpdEnabled)
-                    put("rpdLimit", 20)
-                    put("usedSpareKey", localUsedSpareKey)
-                    put("mainTotal", localMainApiCalls)
-                    put("mainSuccess", localMainSuccessCalls)
-                    put("mainFailed", localMainFailedCalls)
-                    put("spareTotal", localSpareApiCalls)
-                    put("spareSuccess", localSpareSuccessCalls)
-                    put("spareFailed", localSpareFailedCalls)
-                    put("characterProfile", localCharacterProfile)
-                    put("confirmedMainCharacter", localConfirmedMainChar)
-                }
-
-                val scriptEntity = com.example.db.PrGtScript(
-                    fileName = existingScript?.fileName ?: selectedMediaName,
-                    fileSize = "N/A",
-                    durationSec = if (savedDurationMs > 0) (savedDurationMs / 1000).toString() else "N/A",
-                    scriptText = finalScript,
-                    timestamp = generationStartTime,
-                    language = activeLanguage,
-                    modelId = activeModel,
-                    targetLength = activeLength,
-                    pov = activePOV,
-                    tone = activeTone,
-                    geminiFileUri = savedGeminiFileUri,
-                    mimeType = savedMimeType,
-                    partsCount = savedPartsCount,
-                    scriptPartsJson = partsJson.toString(),
-                    totalApiCalls = localTotalApiCalls,
-                    successApiCalls = localSuccessApiCalls,
-                    failedApiCalls = localFailedApiCalls,
-                    previousVersionsJson = previousVersionsArray.toString(),
-                    rpdInfoJson = rpdJson.toString()
-                )
-                // Delete older than 168 hours (7 days)
-                val cutoffTime = System.currentTimeMillis() - (168L * 60 * 60 * 1000)
-                dao.deleteOlderThan(cutoffTime)
-                if (existingScript != null) {
-                    dao.deleteScriptById(existingScript.id)
-                }
-                val newId = dao.insertScript(scriptEntity)
-                currentScriptId = newId.toInt()
+                val savedEntity = persistProgressToDb()
                 isEditingScript = false
-                dao.keepLatestFifty()
-                // Automatically display the full script dialog on completion unless it terminated due to fatal profile error
-                val savedEntity = scriptEntity.copy(id = newId.toInt())
-                if (!hadFatalProfileError) {
+                if (!hadFatalProfileError && savedEntity != null) {
                     viewingHistoryScript = savedEntity
                 }
             }
             
             isGenerating = false
             saveCurrentProgressAndStop = null
+            autoSaveCurrentProgress = null
         }
     }
 
@@ -1054,11 +1088,37 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         text = "တစ်ပိုင်းလျှင် ခန့်မှန်း $segmentDurationSecs စက္ကန့် (Estimated: $segmentDurationSecs seconds/part)",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
-                        modifier = Modifier.padding(bottom = 16.dp)
+                        modifier = Modifier.padding(bottom = 8.dp)
                     )
                 } else {
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
                 }
+
+                // Parallel Key (1 to 10)
+                SliderSection(
+                    title = "Parallel Key",
+                    value = parallelKeys,
+                    onValueChange = {
+                        parallelKeys = it
+                        sharedPrefs.edit().putFloat("preset_parallel_keys", it).apply()
+                    },
+                    valueRange = 1f..10f
+                )
+                val pCount = parts.toInt()
+                val kCount = parallelKeys.toInt().coerceIn(1, 10)
+                val minPartsPerKey = pCount / kCount
+                val maxPartsPerKey = if (pCount % kCount == 0) minPartsPerKey else minPartsPerKey + 1
+                val partsRangeStr = if (minPartsPerKey == maxPartsPerKey) "$minPartsPerKey ပိုင်းစီ" else "$minPartsPerKey–$maxPartsPerKey ပိုင်းစီ"
+                Text(
+                    text = if (kCount > 1) {
+                        "Key $kCount ခုဖြင့် တစ်ပြိုင်နက် ခွဲဝေထုတ်လုပ်ပါမည် (၁ ခုလျှင် $partsRangeStr)"
+                    } else {
+                        "Key 1 ခုချင်းစီ အစဉ်လိုက် ထုတ်လုပ်ပါမည် (Sequential Mode)"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(bottom = 16.dp)
+                )
 
                 // Script Length
                 DropdownSection(
@@ -1630,6 +1690,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
             mutableStateOf(scriptToRegenerate?.modelId?.ifBlank { selectedModelKey } ?: selectedModelKey) 
         }
         var localParts by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.partsCount.toFloat()) }
+        var localParallelKeys by remember(scriptToRegenerate) { mutableStateOf(parallelKeys) }
         var localLength by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.targetLength) }
         var localPOV by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.pov) }
         var localTone by remember(scriptToRegenerate) { mutableStateOf(scriptToRegenerate!!.tone) }
@@ -1656,6 +1717,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         value = localParts,
                         onValueChange = { localParts = it },
                         valueRange = 5f..50f
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    SliderSection(
+                        title = "Parallel Key",
+                        value = localParallelKeys,
+                        onValueChange = { localParallelKeys = it },
+                        valueRange = 1f..10f
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     DropdownSection(
@@ -1689,6 +1757,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
             },
             confirmButton = {
                 Button(onClick = {
+                    parallelKeys = localParallelKeys
+                    sharedPrefs.edit().putFloat("preset_parallel_keys", localParallelKeys).apply()
                     val updatedScript = scriptToRegenerate!!.copy(
                         modelId = localModelKey,
                         partsCount = localParts.toInt(),

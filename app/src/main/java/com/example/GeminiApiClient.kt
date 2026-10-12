@@ -127,7 +127,8 @@ class GeminiApiClient(private val context: Context) {
         existingCharacterProfile: String = "",
         mainKeyEnabled: Boolean = true,
         spareApiKeysList: List<String> = emptyList(),
-        spareKeySlots: List<SpareKeySlot> = emptyList()
+        spareKeySlots: List<SpareKeySlot> = emptyList(),
+        parallelKeyCount: Int = 1
     ): Flow<GenerationUpdate> = channelFlow {
         send(GenerationUpdate.Progress(0.0f))
 
@@ -444,30 +445,34 @@ class GeminiApiClient(private val context: Context) {
                 }
             }
 
-            // Rate limiter: sliding window + strict minimum interval between ANY two requests
-            val rateLimitMutex = Mutex()
-            var lastRequestTimeMs = 0L
-            val requestTimestamps = mutableListOf<Long>()
+            // Rate limiter: per-key sliding window + strict minimum interval between ANY two requests on the same key
+            class PerKeyRateLimiter {
+                val mutex = Mutex()
+                var lastRequestTimeMs = 0L
+                val requestTimestamps = mutableListOf<Long>()
+            }
+            val keyRateLimiters = java.util.concurrent.ConcurrentHashMap<String, PerKeyRateLimiter>()
             val minDelayBetweenRequestsMs = (60_000L / maxOf(1, rpm))
 
-            suspend fun acquireRateLimitSlot() {
-                rateLimitMutex.withLock {
+            suspend fun acquireRateLimitSlotForKey(targetKey: String) {
+                val limiter = keyRateLimiters.getOrPut(targetKey) { PerKeyRateLimiter() }
+                limiter.mutex.withLock {
                     while (true) {
                         val now = System.currentTimeMillis()
                         // 1. Remove timestamps older than 60 seconds
-                        requestTimestamps.removeAll { now - it >= 60_000L }
+                        limiter.requestTimestamps.removeAll { now - it >= 60_000L }
 
-                        // 2. Strict minimum spacing between any two consecutive requests
-                        val timeSinceLast = now - lastRequestTimeMs
-                        val intervalWait = if (lastRequestTimeMs > 0 && timeSinceLast < minDelayBetweenRequestsMs) {
+                        // 2. Strict minimum spacing between any two consecutive requests on this key
+                        val timeSinceLast = now - limiter.lastRequestTimeMs
+                        val intervalWait = if (limiter.lastRequestTimeMs > 0 && timeSinceLast < minDelayBetweenRequestsMs) {
                             minDelayBetweenRequestsMs - timeSinceLast
                         } else {
                             0L
                         }
 
-                        // 3. Sliding window: wait until oldest request exits the 60-second window
-                        val windowWait = if (requestTimestamps.size >= rpm) {
-                            val oldest = requestTimestamps.firstOrNull() ?: now
+                        // 3. Sliding window: wait until oldest request exits the 60-second window on this key
+                        val windowWait = if (limiter.requestTimestamps.size >= rpm) {
+                            val oldest = limiter.requestTimestamps.firstOrNull() ?: now
                             maxOf(100L, 60_000L - (now - oldest) + 50L)
                         } else {
                             0L
@@ -476,8 +481,8 @@ class GeminiApiClient(private val context: Context) {
                         val waitTime = maxOf(intervalWait, windowWait)
                         if (waitTime <= 0L) {
                             val currentTime = System.currentTimeMillis()
-                            requestTimestamps.add(currentTime)
-                            lastRequestTimeMs = currentTime
+                            limiter.requestTimestamps.add(currentTime)
+                            limiter.lastRequestTimeMs = currentTime
                             return@withLock
                         }
 
@@ -492,10 +497,17 @@ class GeminiApiClient(private val context: Context) {
             var activeApiKey = initialPrimaryKey
             var activeGeminiFileUri = finalGeminiFileUri
             var activeKeyLabel = initialPrimaryEntry.label
-            val uploadedFileUriByKey = mutableMapOf<String, String>(initialPrimaryKey to finalGeminiFileUri)
+            val uploadedFileUriByKey = java.util.concurrent.ConcurrentHashMap<String, String>().apply {
+                put(initialPrimaryKey, finalGeminiFileUri)
+            }
+            val uploadMutexByKey = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
             val usedCountByKey = mutableMapOf<String, Int>()
             activeKeyQueue.forEach { entry ->
                 usedCountByKey[entry.key] = if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+            }
+
+            suspend fun acquireRateLimitSlot() {
+                acquireRateLimitSlotForKey(activeApiKey)
             }
 
             var mainTotalCalls = if (mainKeyEnabled && apiKey.isNotBlank()) (usedCountByKey[apiKey.trim()] ?: 0) else 0
@@ -519,49 +531,52 @@ class GeminiApiClient(private val context: Context) {
             var rpdExhaustedAndStoppedByUser = false
 
             suspend fun ensureMediaUploadedForKey(targetKey: String, targetLabel: String): String {
-                val existingUploaded = uploadedFileUriByKey[targetKey]
-                if (!existingUploaded.isNullOrBlank()) {
-                    return existingUploaded
-                }
-                if (mediaUri != null) {
-                    val cachedForTarget = GeminiFileKeyCache.getCachedFile(context, mediaUri, targetKey)
-                    if (cachedForTarget != null) {
-                        send(GenerationUpdate.Log("✅ $targetLabel အတွက် သိမ်းဆည်းထားသော Media ဖိုင်အား ပြန်လည်အသုံးပြုပါမည်။"))
-                        uploadedFileUriByKey[targetKey] = cachedForTarget.first
-                        return cachedForTarget.first
-                    } else {
-                        send(GenerationUpdate.Log("📤 $targetLabel ဖြင့် Media ဖိုင်အား ဆာဗာသို့ ပြန်လည် Upload တင်နေပါသည်..."))
-                        val uploadResult = uploadFile(targetKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
-                        val targetFileUriInfo = when (uploadResult) {
-                            is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
-                            is UploadResult.Failure -> {
-                                send(GenerationUpdate.Error("$targetLabel ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
-                                throw Exception("$targetLabel upload failed: ${uploadResult.errorDetail}")
-                            }
-                        }
-
-                        if (mediaMimeType?.startsWith("video") == true) {
-                            send(GenerationUpdate.Log("[$targetLabel] Waiting for Gemini server to process video..."))
-                            var isActive = false
-                            while (!isActive) {
-                                val state = checkFileState(targetKey, targetFileUriInfo.second)
-                                if (state == "ACTIVE") {
-                                    isActive = true
-                                } else if (state == "FAILED") {
-                                    send(GenerationUpdate.Error("Gemini server failed to process video with $targetLabel."))
-                                    throw Exception("Gemini server failed to process video with $targetLabel")
-                                } else {
-                                    delay(3000)
+                val perKeyMutex = uploadMutexByKey.getOrPut(targetKey) { Mutex() }
+                return perKeyMutex.withLock {
+                    val existingUploaded = uploadedFileUriByKey[targetKey]
+                    if (!existingUploaded.isNullOrBlank()) {
+                        return@withLock existingUploaded
+                    }
+                    if (mediaUri != null) {
+                        val cachedForTarget = GeminiFileKeyCache.getCachedFile(context, mediaUri, targetKey)
+                        if (cachedForTarget != null) {
+                            send(GenerationUpdate.Log("✅ $targetLabel အတွက် သိမ်းဆည်းထားသော Media ဖိုင်အား ပြန်လည်အသုံးပြုပါမည်။"))
+                            uploadedFileUriByKey[targetKey] = cachedForTarget.first
+                            return@withLock cachedForTarget.first
+                        } else {
+                            send(GenerationUpdate.Log("📤 $targetLabel ဖြင့် Media ဖိုင်အား ဆာဗာသို့ Upload တင်နေပါသည်..."))
+                            val uploadResult = uploadFile(targetKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
+                            val targetFileUriInfo = when (uploadResult) {
+                                is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
+                                is UploadResult.Failure -> {
+                                    send(GenerationUpdate.Error("$targetLabel ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
+                                    throw Exception("$targetLabel upload failed: ${uploadResult.errorDetail}")
                                 }
                             }
+
+                            if (mediaMimeType?.startsWith("video") == true) {
+                                send(GenerationUpdate.Log("[$targetLabel] Waiting for Gemini server to process video..."))
+                                var isActive = false
+                                while (!isActive) {
+                                    val state = checkFileState(targetKey, targetFileUriInfo.second)
+                                    if (state == "ACTIVE") {
+                                        isActive = true
+                                    } else if (state == "FAILED") {
+                                        send(GenerationUpdate.Error("Gemini server failed to process video with $targetLabel."))
+                                        throw Exception("Gemini server failed to process video with $targetLabel")
+                                    } else {
+                                        delay(3000)
+                                    }
+                                }
+                            }
+                            GeminiFileKeyCache.saveCachedFile(context, mediaUri, targetKey, targetFileUriInfo.first, targetFileUriInfo.second)
+                            uploadedFileUriByKey[targetKey] = targetFileUriInfo.first
+                            send(GenerationUpdate.Log("✅ $targetLabel ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
+                            return@withLock targetFileUriInfo.first
                         }
-                        GeminiFileKeyCache.saveCachedFile(context, mediaUri, targetKey, targetFileUriInfo.first, targetFileUriInfo.second)
-                        uploadedFileUriByKey[targetKey] = targetFileUriInfo.first
-                        send(GenerationUpdate.Log("✅ $targetLabel ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
-                        return targetFileUriInfo.first
                     }
+                    activeGeminiFileUri
                 }
-                return activeGeminiFileUri
             }
 
             suspend fun getOrSwitchKeyAndFile(): ReservedKeySlot {
@@ -570,33 +585,41 @@ class GeminiApiClient(private val context: Context) {
                     while (reservedSlot == null) {
                         if (rpdEnabled) {
                             var curUsed = usedCountByKey[activeApiKey] ?: RpdTracker.getStatus(context, activeApiKey, rpdLimit).usedCount
-                            while (curUsed >= rpdLimit && currentKeyIndex + 1 < activeKeyQueue.size) {
-                                val exhaustedLabel = activeKeyLabel
-                                currentKeyIndex++
-                                val nextEntry = activeKeyQueue[currentKeyIndex]
-                                val nextUsed = usedCountByKey[nextEntry.key] ?: RpdTracker.getStatus(context, nextEntry.key, rpdLimit).usedCount
-                                usedCountByKey[nextEntry.key] = nextUsed
-                                send(GenerationUpdate.Log("⚠️ $exhaustedLabel RPD limit ($rpdLimit/$rpdLimit) ပြည့်သွားပါပြီ။"))
-                                if (nextUsed >= rpdLimit) {
-                                    send(GenerationUpdate.Log("⏭️ ${nextEntry.label} သည်လည်း RPD ($nextUsed/$rpdLimit) ပြည့်နေသဖြင့် နောက်ထပ် Key သို့ ဆက်လက်စစ်ဆေးပါမည်..."))
+                            usedCountByKey[activeApiKey] = curUsed
+                            if (curUsed >= rpdLimit) {
+                                val availableIdx = activeKeyQueue.indexOfFirst { entry ->
+                                    val u = usedCountByKey[entry.key] ?: RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount
+                                    usedCountByKey[entry.key] = u
+                                    u < rpdLimit
+                                }
+                                if (availableIdx >= 0) {
+                                    val exhaustedLabel = activeKeyLabel
+                                    currentKeyIndex = availableIdx
+                                    val nextEntry = activeKeyQueue[availableIdx]
+                                    val nextUsed = usedCountByKey[nextEntry.key] ?: 0
+                                    send(GenerationUpdate.Log("⚠️ $exhaustedLabel RPD limit ($rpdLimit/$rpdLimit) ပြည့်သွားပါပြီ။"))
+                                    send(GenerationUpdate.Log("🔄 ${nextEntry.label} သို့ အလိုအလျောက် ပြောင်းလဲအသုံးပြုနေပါသည်..."))
+                                    activeGeminiFileUri = ensureMediaUploadedForKey(nextEntry.key, nextEntry.label)
                                     activeApiKey = nextEntry.key
                                     activeKeyLabel = nextEntry.label
                                     hasSwitchedToSpare = nextEntry.isSpare
                                     curUsed = nextUsed
-                                    continue
+                                    send(GenerationUpdate.Log("🚀 ကျန်ရှိသော Script အပိုင်းများကို ${nextEntry.label} ဖြင့် ဆက်လက်ထုတ်လုပ်ပါမည်။"))
+                                } else {
+                                    currentKeyIndex = activeKeyQueue.lastIndex
                                 }
-                                send(GenerationUpdate.Log("🔄 ${nextEntry.label} သို့ အလိုအလျောက် ပြောင်းလဲအသုံးပြုနေပါသည်..."))
-                                activeGeminiFileUri = ensureMediaUploadedForKey(nextEntry.key, nextEntry.label)
-                                activeApiKey = nextEntry.key
-                                activeKeyLabel = nextEntry.label
-                                hasSwitchedToSpare = nextEntry.isSpare
-                                curUsed = nextUsed
-                                send(GenerationUpdate.Log("🚀 ကျန်ရှိသော Script အပိုင်းများကို ${nextEntry.label} ဖြင့် ဆက်လက်ထုတ်လုပ်ပါမည်။"))
+                            } else {
+                                activeGeminiFileUri = uploadedFileUriByKey[activeApiKey] ?: ensureMediaUploadedForKey(activeApiKey, activeKeyLabel)
                             }
                         }
 
                         val currentKeyUsed = usedCountByKey[activeApiKey] ?: 0
-                        val isExhausted = rpdEnabled && currentKeyUsed >= rpdLimit && (currentKeyIndex + 1 >= activeKeyQueue.size)
+                        val allKeysExhausted = rpdEnabled && activeKeyQueue.all { entry ->
+                            val u = usedCountByKey[entry.key] ?: RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount
+                            usedCountByKey[entry.key] = u
+                            u >= rpdLimit
+                        }
+                        val isExhausted = rpdEnabled && currentKeyUsed >= rpdLimit && allKeysExhausted
 
                         if (isExhausted && newKeyChannel != null) {
                             if (inFlightHttpRequests.get() > 0) {
@@ -692,8 +715,165 @@ class GeminiApiClient(private val context: Context) {
                 .filterKeys { k -> seriesInfo.partNumber == null || k != seriesInfo.partNumber }
                 .toSortedMap()
 
-            val priorContextKey = if (combinedPriorMap.isNotEmpty()) {
-                combinedPriorMap.entries.joinToString("|") { "${it.key}:${it.value.hashCode()}" }
+            fun extractCharacterCoreKey(desc: String): String {
+                val trimmed = desc.trim().removePrefix("-").removePrefix("*").trim()
+                val beforeBracket = trimmed
+                    .substringBefore("(")
+                    .substringBefore("（")
+                    .substringBefore("[")
+                    .substringBefore("【")
+                    .substringBefore("/")
+                    .substringBefore(" - ")
+                    .substringBefore(" — ")
+                    .substringBefore(" – ")
+                    .substringBefore(":")
+                    .substringBefore("：")
+                    .trim()
+                val candidate = if (beforeBracket.length >= 2) beforeBracket else trimmed
+                return candidate.lowercase().replace(Regex("""\s+"""), " ").trim()
+            }
+
+            fun parseProfileToDetectedCharacters(profileText: String): List<DetectedCharacter> {
+                val result = mutableListOf<DetectedCharacter>()
+                profileText.lines().forEach { line ->
+                    val trimmed = line.trim().removePrefix("-").removePrefix("*").trim()
+                    if (trimmed.contains("CHARACTER_ITEM:", ignoreCase = true) || trimmed.contains("|")) {
+                        val content = trimmed.substringAfter("CHARACTER_ITEM:", trimmed).trim()
+                        val segments = content.split("|").map { it.trim() }
+                        if (segments.size >= 4) {
+                            val roleTag = segments[0].uppercase()
+                            val isMain = roleTag.contains("MAIN")
+                            val desc = segments[1]
+                            val relationship = segments[2]
+                            val pronoun = segments[3].ifBlank { "ကျွန်တော်" }
+                            if (desc.isNotBlank()) {
+                                result.add(DetectedCharacter(desc, relationship, pronoun, isMain))
+                            }
+                        } else if (segments.size >= 2) {
+                            val roleTag = segments[0].uppercase()
+                            val isMain = roleTag.contains("MAIN")
+                            val desc = segments[1]
+                            val pronoun = if (segments.size >= 3 && segments[2].isNotBlank()) segments[2] else "ကျွန်တော်"
+                            if (desc.isNotBlank()) {
+                                result.add(DetectedCharacter(desc, "", pronoun, isMain))
+                            }
+                        }
+                    }
+                }
+                return result
+            }
+
+            fun formatDetectedCharactersToProfile(chars: List<DetectedCharacter>): String {
+                return chars.joinToString("\n") { ch ->
+                    val role = if (ch.isRecommendedMain) "MAIN" else "SUPPORT"
+                    val rel = ch.relationshipStatus.ifBlank { "ဇာတ်ကောင်" }
+                    val pron = ch.pronoun.ifBlank { "ကျွန်တော်" }
+                    "CHARACTER_ITEM: $role | ${ch.nameAndAppearance} | $rel | $pron"
+                }
+            }
+
+            fun buildDeduplicatedPriorProfile(priorMap: Map<Int, String>, maxChars: Int = 25): String {
+                if (priorMap.isEmpty()) return ""
+                val charMap = linkedMapOf<String, DetectedCharacter>()
+                val lastSeenPartMap = mutableMapOf<String, Int>()
+                val seenCountMap = mutableMapOf<String, Int>()
+                priorMap.forEach { (partNum, pText) ->
+                    val parsed = parseProfileToDetectedCharacters(pText)
+                    parsed.forEach { item ->
+                        val coreKey = extractCharacterCoreKey(item.nameAndAppearance)
+                        if (coreKey.isNotBlank()) {
+                            val existing = charMap[coreKey]
+                            if (existing == null) {
+                                charMap[coreKey] = item
+                                lastSeenPartMap[coreKey] = partNum
+                                seenCountMap[coreKey] = 1
+                            } else {
+                                val mergedRel = item.relationshipStatus.ifBlank { existing.relationshipStatus }
+                                val mergedPronoun = item.pronoun.ifBlank { existing.pronoun }
+                                val mergedMain = item.isRecommendedMain || existing.isRecommendedMain
+                                charMap[coreKey] = DetectedCharacter(
+                                    nameAndAppearance = item.nameAndAppearance.ifBlank { existing.nameAndAppearance },
+                                    relationshipStatus = mergedRel,
+                                    pronoun = mergedPronoun,
+                                    isRecommendedMain = mergedMain
+                                )
+                                lastSeenPartMap[coreKey] = partNum
+                                seenCountMap[coreKey] = (seenCountMap[coreKey] ?: 1) + 1
+                            }
+                        }
+                    }
+                }
+                if (charMap.isEmpty()) {
+                    return priorMap.values.last().trim()
+                }
+                val sortedKeys = charMap.keys.sortedWith(
+                    compareByDescending<String> { charMap[it]?.isRecommendedMain == true }
+                        .thenByDescending { lastSeenPartMap[it] ?: 0 }
+                        .thenByDescending { seenCountMap[it] ?: 0 }
+                ).take(maxChars)
+
+                var mainAssigned = false
+                val finalChars = sortedKeys.mapNotNull { key ->
+                    val ch = charMap[key] ?: return@mapNotNull null
+                    val isMain = if (ch.isRecommendedMain && !mainAssigned) {
+                        mainAssigned = true
+                        true
+                    } else false
+                    ch.copy(isRecommendedMain = isMain)
+                }
+                return formatDetectedCharactersToProfile(finalChars)
+            }
+
+            fun mergeCurrentWithPriorProfile(currentText: String, deduplicatedPriorText: String, maxChars: Int = 25): String {
+                if (deduplicatedPriorText.isBlank()) return currentText.trim()
+                val currentChars = parseProfileToDetectedCharacters(currentText)
+                val priorChars = parseProfileToDetectedCharacters(deduplicatedPriorText)
+                if (currentChars.isEmpty()) return currentText.trim().ifBlank { deduplicatedPriorText.trim() }
+                if (priorChars.isEmpty()) return currentText.trim()
+
+                val mergedByCoreKey = linkedMapOf<String, DetectedCharacter>()
+                // 1. Keep current part's characters at the top with their latest Relationship Status; fill missing relationship/pronoun from prior if blank
+                val priorLookup = priorChars.associateBy { extractCharacterCoreKey(it.nameAndAppearance) }
+                currentChars.forEach { cur ->
+                    val key = extractCharacterCoreKey(cur.nameAndAppearance)
+                    if (key.isNotBlank() && !mergedByCoreKey.containsKey(key)) {
+                        val priorMatch = priorLookup[key]
+                        val finalRel = cur.relationshipStatus.ifBlank { priorMatch?.relationshipStatus ?: "" }
+                        val finalPron = cur.pronoun.ifBlank { priorMatch?.pronoun ?: "ကျွန်တော်" }
+                        val finalMain = cur.isRecommendedMain || (currentChars.none { it.isRecommendedMain } && priorMatch?.isRecommendedMain == true)
+                        mergedByCoreKey[key] = cur.copy(
+                            relationshipStatus = finalRel,
+                            pronoun = finalPron,
+                            isRecommendedMain = finalMain
+                        )
+                    }
+                }
+                // 2. Append prior recurring/important characters that the AI omitted in this part
+                priorChars.forEach { prior ->
+                    if (mergedByCoreKey.size < maxChars) {
+                        val key = extractCharacterCoreKey(prior.nameAndAppearance)
+                        if (key.isNotBlank() && !mergedByCoreKey.containsKey(key)) {
+                            val hasMainAlready = mergedByCoreKey.values.any { it.isRecommendedMain }
+                            mergedByCoreKey[key] = prior.copy(isRecommendedMain = if (hasMainAlready) false else prior.isRecommendedMain)
+                        }
+                    }
+                }
+                // Ensure MAIN character is at the top and only one MAIN is marked
+                val ordered = mergedByCoreKey.values.sortedByDescending { it.isRecommendedMain }
+                var mainSeen = false
+                val normalized = ordered.map { ch ->
+                    val isMain = if (ch.isRecommendedMain && !mainSeen) {
+                        mainSeen = true
+                        true
+                    } else false
+                    ch.copy(isRecommendedMain = isMain)
+                }
+                return formatDetectedCharactersToProfile(normalized)
+            }
+
+            val deduplicatedPriorProfile = buildDeduplicatedPriorProfile(combinedPriorMap)
+            val priorContextKey = if (deduplicatedPriorProfile.isNotBlank()) {
+                "prior_${deduplicatedPriorProfile.hashCode()}"
             } else ""
 
             var extractedCharacterProfile = existingCharacterProfile.trim().ifBlank {
@@ -708,9 +888,12 @@ class GeminiApiClient(private val context: Context) {
             }
 
             if (extractedCharacterProfile.isNotBlank()) {
+                if (deduplicatedPriorProfile.isNotBlank()) {
+                    extractedCharacterProfile = mergeCurrentWithPriorProfile(extractedCharacterProfile, deduplicatedPriorProfile)
+                }
                 send(GenerationUpdate.Log("✅ Cached Character Profile & Relationship Status အား ပြန်လည်အသုံးပြုပါမည်။"))
             } else {
-                val hasPriorProfiles = combinedPriorMap.isNotEmpty()
+                val hasPriorProfiles = combinedPriorMap.isNotEmpty() && deduplicatedPriorProfile.isNotBlank()
                 if (hasPriorProfiles) {
                     val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
                     send(GenerationUpdate.Log("🔗 အရှေ့အပိုင်းများ ($priorPartNames) မှ Character List နှင့် Relationship Status များကို ဆွဲယူပြီး ယခုအပိုင်းနှင့် ပေါင်းစည်းစစ်ဆေးနေပါသည်..."))
@@ -724,18 +907,16 @@ class GeminiApiClient(private val context: Context) {
                     "ဗီဒီယို/အသံဖိုင် တစ်ခုလုံးတွင် အဓိကအကျဆုံး ပင်မဇာတ်ဆောင် (Main Protagonist) တစ်ဦးတည်းကို အတိအကျ ရွေးချယ်သတ်မှတ်ပေးပါ။"
                 }
                 val priorSeriesInstruction = if (hasPriorProfiles) {
+                    val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
                     buildString {
-                        appendLine("အရေးကြီးသော အရှေ့အပိုင်းများ၏ ဇာတ်ကောင်နှင့် ဆက်ဆံရေး မှတ်တမ်း (Previous Parts Character & Relationship Reference):")
-                        combinedPriorMap.forEach { (partNum, pText) ->
-                            appendLine("--- [Part $partNum မှတ်တမ်း] ---")
-                            appendLine(pText.trim())
-                        }
+                        appendLine("အရေးကြီးသော အရှေ့အပိုင်းများ ($priorPartNames) ၏ ပေါင်းစည်းထားသော ဇာတ်ကောင်နှင့် ဆက်ဆံရေး မှတ်တမ်း (Previous Parts Unified Character & Relationship Reference):")
+                        appendLine(deduplicatedPriorProfile)
                         appendLine()
                         appendLine("ပေါင်းစည်းရန် စည်းကမ်းချက် (Smart Merge & Deduplication Rule):")
-                        appendLine("1. အထက်ပါ အရှေ့အပိုင်းများမှ ဇာတ်ကောင်များနှင့် ယခု Video Part တွင် ပါဝင်သော ဇာတ်ကောင်များကို ပေါင်းစပ်၍ စုစုပေါင်း Unified Character List တစ်ခုတည်းအဖြစ် ထုတ်ပေးပါ။")
-                        appendLine("2. ထပ်နေသော ဇာတ်ကောင်များ (Duplicate Characters) ကို လုံးဝ နှစ်ကြောင်းမရေးဘဲ တစ်ကြောင်းတည်းအဖြစ် ပေါင်းစည်း (Merge) ပေးပါ။")
+                        appendLine("1. အထက်ပါ အရှေ့အပိုင်းများမှ ဇာတ်ကောင်အားလုံးကို လုံးဝ မချန်လှပ်ဘဲ အခြေခံယူ၍ ယခု Video Part တွင် ပါဝင်သော ဇာတ်ကောင်များနှင့် ပေါင်းစပ်ကာ Unified Character List တစ်ခုတည်းအဖြစ် ထုတ်ပေးပါ။")
+                        appendLine("2. ထပ်နေသော ဇာတ်ကောင်များ (Duplicate Characters) ကို လုံးဝ နှစ်ကြောင်းမရေးဘဲ အဓိကနာမည် (Core Name) တူပါက တစ်ကြောင်းတည်းအဖြစ် ပေါင်းစည်း (Merge) ပေးပါ။")
                         appendLine("3. ဇာတ်ကောင်များ၏ အမည်၊ နာမ်စား နှင့် ပင်မဇာတ်ဆောင် (MAIN) သတ်မှတ်ချက်ကို အရှေ့အပိုင်းများနှင့် တသမတ်တည်း (Consistent) ဖြစ်အောင် ထိန်းသိမ်းပါ။")
-                        appendLine("4. အကယ်၍ ယခုအပိုင်းတွင် ဇာတ်ကောင်အချင်းချင်း Relationship Status ပြောင်းလဲ/တိုးတက်သွားပါက နောက်ဆုံးအခြေအနေ (Updated Relationship Status) ကို ရေးပေးပြီး၊ ဇာတ်ကောင်အသစ်များ ပါလာပါက အသစ်ထပ်ပေါင်းထည့်ပေးပါ။")
+                        appendLine("4. အကယ်၍ ယခုအပိုင်းတွင် ဇာတ်ကောင်အချင်းချင်း Relationship Status သို့မဟုတ် ဝတ်စုံ ပြောင်းလဲ/တိုးတက်သွားပါက နောက်ဆုံးအခြေအနေ (Updated Relationship Status) ကို အပ်ဒိတ်လုပ်ပေးပြီး၊ ဇာတ်ကောင်အသစ်များ ပါလာပါက အသစ်ထပ်ပေါင်းထည့်ပေးပါ။")
                     }
                 } else ""
 
@@ -836,7 +1017,8 @@ class GeminiApiClient(private val context: Context) {
                                 }
                                 val textOut = sb.toString().trim()
                                 if (textOut.isNotBlank()) {
-                                    extractedCharacterProfile = textOut
+                                    val mergedTextOut = mergeCurrentWithPriorProfile(textOut, deduplicatedPriorProfile)
+                                    extractedCharacterProfile = mergedTextOut
                                     recordCallOutcome(preSlot.isSpare, true)
                                     GeminiFileKeyCache.saveCachedCharacterProfile(
                                         context = context,
@@ -844,27 +1026,28 @@ class GeminiApiClient(private val context: Context) {
                                         geminiFileUri = finalGeminiFileUri,
                                         characterHint = priorContextKey,
                                         language = language,
-                                        profileText = textOut,
+                                        profileText = mergedTextOut,
                                         fileName = mediaFileName
                                     )
                                     send(GenerationUpdate.Log("✅ Character Profile & Relationship Status ရရှိပြီးစီးပါပြီ [${preSlot.keyLabel}]။"))
                                 } else {
                                     recordCallOutcome(preSlot.isSpare, false)
-                                    lastProfileErrorDetail = "Empty Response (AI မှ Character စာရင်း ပြန်မပို့ပါ)"
-                                    send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးမှု (Attempt $profileAttempt/$maxProfileAttempts) အလွတ်ဖြစ်နေပါသည်။"))
+                                    lastProfileErrorDetail = "Empty Response [${preSlot.keyLabel}]"
+                                    send(GenerationUpdate.Log("⚠️ Character Profile (${profileAttempt}/$maxProfileAttempts) [${preSlot.keyLabel}] Failed: Empty Response"))
                                 }
                             } else {
                                 recordCallOutcome(preSlot.isSpare, false)
                                 val errBody = resp.body?.string() ?: ""
                                 val errMsg = extractApiErrorMessage(resp.code, resp.message, errBody)
-                                lastProfileErrorDetail = "HTTP ${resp.code} - $errMsg"
-                                send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးမှု (Attempt $profileAttempt/$maxProfileAttempts) မအောင်မြင်ပါ ($lastProfileErrorDetail)။"))
+                                lastProfileErrorDetail = "HTTP ${resp.code} ($errMsg) [${preSlot.keyLabel}]"
+                                send(GenerationUpdate.Log("⚠️ Character Profile (${profileAttempt}/$maxProfileAttempts) [${preSlot.keyLabel}] Failed: HTTP ${resp.code} ($errMsg)"))
                             }
                         }
                     } catch (e: Exception) {
                         recordCallOutcome(preSlot.isSpare, false)
-                        lastProfileErrorDetail = "Network Error (${e.javaClass.simpleName}: ${e.message ?: "Connection failed"})"
-                        send(GenerationUpdate.Log("⚠️ Character Profile စစ်ဆေးစဉ် (Attempt $profileAttempt/$maxProfileAttempts) $lastProfileErrorDetail ဖြစ်ပေါ်ခဲ့ပါသည်။"))
+                        val shortNetErr = (e.message ?: "Connection failed").lineSequence().firstOrNull()?.take(50) ?: "Connection failed"
+                        lastProfileErrorDetail = "Network Error (${e.javaClass.simpleName}: $shortNetErr) [${preSlot.keyLabel}]"
+                        send(GenerationUpdate.Log("⚠️ Character Profile (${profileAttempt}/$maxProfileAttempts) [${preSlot.keyLabel}] Failed: ${e.javaClass.simpleName} ($shortNetErr)"))
                     } finally {
                         workingCount.decrementAndGet()
                         inFlightHttpRequests.decrementAndGet()
@@ -873,11 +1056,11 @@ class GeminiApiClient(private val context: Context) {
 
                 if (extractedCharacterProfile.isBlank()) {
                     if (hasPriorProfiles) {
-                        // Fallback to prior series parts' character list & relationship status
-                        val fallbackPriorText = combinedPriorMap.values.last().trim()
+                        // Fallback to deduplicated prior series parts' character list & relationship status
+                        val fallbackPriorText = deduplicatedPriorProfile.ifBlank { combinedPriorMap.values.last().trim() }
                         extractedCharacterProfile = fallbackPriorText
                         val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
-                        send(GenerationUpdate.Log("ℹ️ Character Profile အသစ်ရယူမှု မအောင်မြင်သဖြင့် အရှေ့အပိုင်း ($priorPartNames) မှ Character List နှင့် Relationship Status အား တိုက်ရိုက် ယူသုံးပါမည်။"))
+                        send(GenerationUpdate.Log("ℹ️ Character Profile အသစ်ရယူမှု မအောင်မြင်သဖြင့် အရှေ့အပိုင်း ($priorPartNames) မှ ပေါင်းစည်းထားသော Character List နှင့် Relationship Status အား တိုက်ရိုက် ယူသုံးပါမည်။"))
                     } else {
                         // No prior series profiles available and all 5 attempts failed: end processing, show 15s auto-close dialog, and leave failed record in History
                         val fatalMsg = "Character List နှင့် Relationship Status ရယူမှု ($maxProfileAttempts) ကြိမ်တိုင်တိုင် မအောင်မြင်ပါ။\n\nError Code: $lastProfileErrorDetail\n\nProcessing ကို ရပ်နားလိုက်ပါပြီ။ ခေတ္တစောင့်ဆိုင်းပြီးမှ History ထဲမှနေ၍ ပြန်လည်ကြိုးစားပေးပါ။"
@@ -946,7 +1129,14 @@ class GeminiApiClient(private val context: Context) {
                 }
 
                 if (parsedCharacters.isNotEmpty() && characterConfirmationChannel != null) {
-                    val recIdx = parsedCharacters.indexOfFirst { it.isRecommendedMain }.let { if (it >= 0) it else 0 }
+                    val hintCoreKey = extractCharacterCoreKey(characterHint)
+                    val recIdx = when {
+                        hintCoreKey.isNotBlank() -> {
+                            val byHint = parsedCharacters.indexOfFirst { extractCharacterCoreKey(it.nameAndAppearance) == hintCoreKey }
+                            if (byHint >= 0) byHint else parsedCharacters.indexOfFirst { it.isRecommendedMain }.let { if (it >= 0) it else 0 }
+                        }
+                        else -> parsedCharacters.indexOfFirst { it.isRecommendedMain }.let { if (it >= 0) it else 0 }
+                    }
                     send(GenerationUpdate.Log("⏳ User ထံမှ Character စာရင်း အတည်ပြုချက် (10s Auto-Continue) စောင့်ဆိုင်းနေပါသည်..."))
                     send(GenerationUpdate.RequireCharacterConfirmation(
                         characters = parsedCharacters,
@@ -1051,8 +1241,257 @@ class GeminiApiClient(private val context: Context) {
                 }
 
                 try {
+                    val requestedParallelKeys = parallelKeyCount.coerceIn(1, 10)
+                    val eligibleInitialKeys = keyMutex.withLock {
+                        activeKeyQueue.filter { entry ->
+                            val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                            usedCountByKey[entry.key] = used
+                            !rpdEnabled || used < rpdLimit
+                        }
+                    }
+                    val targetParallelCount = minOf(requestedParallelKeys, eligibleInitialKeys.size.coerceAtLeast(1), partsToProcess.size.coerceAtLeast(1))
+                    val initialParallelEntries = eligibleInitialKeys.take(targetParallelCount)
+                    val claimedKeySet = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+                    initialParallelEntries.forEach { claimedKeySet.add(it.key) }
+
+                    // Parallel Video Upload for selected Parallel Keys right after Character Profile & Relationship Status confirmation
+                    if (initialParallelEntries.size > 1) {
+                        send(GenerationUpdate.Log("⚡ Parallel Key Mode: Key (${initialParallelEntries.size}) ခု [${initialParallelEntries.joinToString(", ") { it.label }}] ဖြင့် Video Upload နှင့် Script ထုတ်လုပ်မှုကို တစ်ပြိုင်နက် လုပ်ဆောင်ပါမည်..."))
+                        coroutineScope {
+                            initialParallelEntries.map { entry ->
+                                async {
+                                    val uri = ensureMediaUploadedForKey(entry.key, entry.label)
+                                    if (entry.isSpare) {
+                                        keyMutex.withLock { hasSwitchedToSpare = true }
+                                    }
+                                    uri
+                                }
+                            }.awaitAll()
+                        }
+                        send(GenerationUpdate.Log("✅ Parallel Keys (${initialParallelEntries.size} ခု) အားလုံးအတွက် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
+                    } else if (initialParallelEntries.size == 1) {
+                        val singleEntry = initialParallelEntries.first()
+                        ensureMediaUploadedForKey(singleEntry.key, singleEntry.label)
+                        if (singleEntry.isSpare) {
+                            keyMutex.withLock { hasSwitchedToSpare = true }
+                        }
+                    }
+
+                    suspend fun tryReserveSlotForSpecificKey(entry: ActiveKeyEntry): ReservedKeySlot? {
+                        return keyMutex.withLock {
+                            val curUsed = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                            usedCountByKey[entry.key] = curUsed
+                            if (rpdEnabled && curUsed >= rpdLimit) {
+                                return@withLock null
+                            }
+                            val updatedKeyCount = curUsed + 1
+                            usedCountByKey[entry.key] = updatedKeyCount
+                            if (rpdEnabled) {
+                                RpdTracker.recordCall(context, entry.key)
+                            }
+                            if (!entry.isSpare) {
+                                mainTotalCalls = updatedKeyCount
+                            } else {
+                                hasSwitchedToSpare = true
+                                spareTotalCalls++
+                            }
+                            val totalUsed = mainTotalCalls + spareTotalCalls
+                            val fileUri = uploadedFileUriByKey[entry.key] ?: activeGeminiFileUri
+                            ReservedKeySlot(
+                                apiKey = entry.key,
+                                fileUri = fileUri,
+                                isSpare = entry.isSpare,
+                                keyLabel = entry.label,
+                                slotNumber = updatedKeyCount,
+                                totalRpdUsed = totalUsed
+                            )
+                        }
+                    }
+
+                    suspend fun claimNextStandbyKey(): ActiveKeyEntry? {
+                        val candidate = keyMutex.withLock {
+                            activeKeyQueue.firstOrNull { entry ->
+                                if (claimedKeySet.contains(entry.key)) return@firstOrNull false
+                                val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                                usedCountByKey[entry.key] = used
+                                if (rpdEnabled && used >= rpdLimit) {
+                                    claimedKeySet.add(entry.key)
+                                    false
+                                } else {
+                                    claimedKeySet.add(entry.key)
+                                    true
+                                }
+                            }
+                        }
+                        if (candidate != null) {
+                            send(GenerationUpdate.Log("🔄 Next Standby Key [${candidate.label}] သို့ အလိုအလျောက် ပြောင်းလဲချိတ်ဆက်နေပါသည်..."))
+                            ensureMediaUploadedForKey(candidate.key, candidate.label)
+                            if (candidate.isSpare) {
+                                keyMutex.withLock { hasSwitchedToSpare = true }
+                            }
+                        }
+                        return candidate
+                    }
+
+                    suspend fun executeSegmentPart(i: Int, initialKeyAndFile: ReservedKeySlot, preferredEntry: ActiveKeyEntry?) {
+                        val startMs = i * segmentDurationMs
+                        val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
+                        val startStr = formatTime(startMs)
+                        val endStr = formatTime(endMs)
+
+                        try {
+                            val timingConstraint = if (isVideo) {
+                                """
+                                Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
+                                (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
+                                သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ဖြစ်ပျက်ခဲ့ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
+                                """.trimIndent()
+                            } else {
+                                """
+                                Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
+                                (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
+                                သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ပါဝင်ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
+                                """.trimIndent()
+                            }
+
+                            val systemInstruction = """
+                                သင်သည် '$tone' လေသံနှင့် '$pov' ရှုထောင့်ကို အထူးကျွမ်းကျင်သော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
+                                
+                                ညွှန်ကြားချက်များ:
+                                1. Input Media Analysis:
+                                $modalityInstruction
+                                2. Narrator POV: $povDetail
+                                3. Character Profile & Continuity:
+                                $characterContinuityRules
+                                4. Script Tone: $toneDetail
+                                5. Length Constraint: $lengthInstruction
+                                6. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
+                                7. Timing & Context: $timingConstraint
+                                8. Language Constraints: $languageConstraint
+                            """.trimIndent()
+
+                            val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို '$tone' လေသံ ($toneDetail) နှင့် '$pov' ရှုထောင့်အတိုင်း အတိအကျ လိုက်နာ၍ PrGt's Script ရေးသားပေးပါ။"
+
+                             var success = false
+                            var attempts = 0
+                            val maxAttempts = 3
+                            var lastUsedKeyLabel = initialKeyAndFile.keyLabel
+
+                            while (!success && attempts < maxAttempts) {
+                                attempts++
+                                val activeSlot = if (attempts == 1) {
+                                    initialKeyAndFile
+                                } else {
+                                    send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
+                                    val retryKeyAndFile = preferredEntry?.let { tryReserveSlotForSpecificKey(it) } ?: getOrSwitchKeyAndFile()
+                                    acquireRateLimitSlotForKey(retryKeyAndFile.apiKey)
+                                    retryKeyAndFile
+                                }
+                                val callApiKey = activeSlot.apiKey
+                                val callFileUri = activeSlot.fileUri
+                                val isSpareCall = activeSlot.isSpare
+                                lastUsedKeyLabel = activeSlot.keyLabel
+                                val keyLabel = " [${activeSlot.keyLabel}]"
+
+                                send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""}$keyLabel to AI..."))
+
+                                val requestBody = createSegmentRequestBody(
+                                    systemInstruction = systemInstruction,
+                                    prompt = prompt,
+                                    mediaMimeType = mediaMimeType,
+                                    fileUri = callFileUri,
+                                    isVideo = isVideo,
+                                    startMs = startMs,
+                                    endMs = endMs
+                                )
+                                val request = Request.Builder()
+                                    .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$callApiKey")
+                                    .post(requestBody)
+                                    .build()
+
+                                logReservedRequestSent(activeSlot)
+                                workingCount.incrementAndGet()
+                                inFlightHttpRequests.incrementAndGet()
+
+                                try {
+                                    client.newCall(request).execute().use { response ->
+                                        if (!response.isSuccessful) {
+                                            recordCallOutcome(isSpareCall, false)
+                                            val errorBody = response.body?.string() ?: ""
+                                            val errorDetail = extractApiErrorMessage(response.code, response.message, errorBody)
+                                            send(GenerationUpdate.Log("❌ Part ${i + 1} ($attempts/$maxAttempts)$keyLabel Failed: HTTP ${response.code} ($errorDetail)"))
+                                            if (attempts == maxAttempts) {
+                                                send(GenerationUpdate.ScriptChunk(i, "❌ [Part ${i + 1} Failed$keyLabel: HTTP ${response.code} ($errorDetail)]\n", isError = true))
+                                            }
+                                            return@use
+                                        }
+
+                                        val responseString = response.body?.string() ?: ""
+
+                                        try {
+                                            val jsonArray = JSONArray(responseString)
+                                            val partTextBuilder = StringBuilder()
+                                            for (j in 0 until jsonArray.length()) {
+                                                val chunk = jsonArray.getJSONObject(j)
+                                                val candidates = chunk.optJSONArray("candidates")
+                                                if (candidates != null && candidates.length() > 0) {
+                                                    val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
+                                                    if (contentParts != null && contentParts.length() > 0) {
+                                                        val text = contentParts.getJSONObject(0).optString("text", "")
+                                                        partTextBuilder.append(text)
+                                                    }
+                                                }
+                                            }
+                                            val resultText = partTextBuilder.toString()
+                                            if (resultText.isNotBlank()) {
+                                                send(GenerationUpdate.ScriptChunk(i, resultText))
+                                                success = true
+                                                recordCallOutcome(isSpareCall, true)
+                                                val keyTag = "[${activeSlot.keyLabel}]"
+                                                send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed successfully with $keyTag."))
+                                            } else {
+                                                throw Exception("Empty response")
+                                            }
+                                        } catch (e: Exception) {
+                                            recordCallOutcome(isSpareCall, false)
+                                            val shortParseErr = (e.message ?: "Parse error").lineSequence().firstOrNull()?.take(50) ?: "Parse error"
+                                            send(GenerationUpdate.Log("❌ Part ${i + 1} ($attempts/$maxAttempts)$keyLabel Failed: $shortParseErr"))
+                                            if (attempts == maxAttempts) {
+                                                send(GenerationUpdate.ScriptChunk(i, "❌ [Part ${i + 1} Failed$keyLabel: $shortParseErr]\n", isError = true))
+                                            }
+                                            return@use
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    recordCallOutcome(isSpareCall, false)
+                                    val shortNetErr = (e.message ?: "Connection failed").lineSequence().firstOrNull()?.take(50) ?: "Connection failed"
+                                    send(GenerationUpdate.Log("❌ Part ${i + 1} ($attempts/$maxAttempts)$keyLabel Failed: ${e.javaClass.simpleName} ($shortNetErr)"))
+                                    if (attempts == maxAttempts) {
+                                        send(GenerationUpdate.ScriptChunk(i, "❌ [Part ${i + 1} Failed$keyLabel: ${e.javaClass.simpleName} ($shortNetErr)]\n", isError = true))
+                                    }
+                                } finally {
+                                    workingCount.decrementAndGet()
+                                    inFlightHttpRequests.decrementAndGet()
+                                }
+                            }
+
+                            if (success) {
+                                val currentSuccess = successfulCount.incrementAndGet()
+                                val currentProgress = 0.15f + (0.85f * (currentSuccess.toFloat() / maxOf(1, totalToProcess)))
+                                send(GenerationUpdate.Progress(currentProgress))
+                            } else {
+                                failedCount.incrementAndGet()
+                                failedParts.add(i)
+                                send(GenerationUpdate.Log("❌ Part ${i + 1} [$lastUsedKeyLabel] failed after $maxAttempts attempts."))
+                                send(GenerationUpdate.ScriptChunk(i, "[အပိုင်း (${i + 1}) [$lastUsedKeyLabel] ၃ ကြိမ် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။]\n", isError = true))
+                            }
+                        } finally {
+                            // workingCount is managed per in-flight HTTP request
+                        }
+                    }
+
                     coroutineScope {
-                        // Queue all parts upfront so the user sees them queued before sequential rate-limited dispatch
+                        // Queue all parts upfront so the user sees them queued before rate-limited dispatch
                         partsToProcess.forEach { i ->
                             val startMs = i * segmentDurationMs
                             val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
@@ -1062,202 +1501,101 @@ class GeminiApiClient(private val context: Context) {
                             send(GenerationUpdate.Log("[$actualModelName] Queued Part ${i + 1}/$parts ($startStr - $endStr)..."))
                         }
 
-                        partsToProcess.forEachIndexed { index, i ->
-                            val startMs = i * segmentDurationMs
-                            val endMs = if (i == parts - 1) durationMs else (i + 1) * segmentDurationMs
-                            val startStr = formatTime(startMs)
-                            val endStr = formatTime(endMs)
+                        val overflowPendingQueue = java.util.concurrent.ConcurrentLinkedQueue<Int>()
 
-                            // Acquire key and rate-limit slot sequentially BEFORE launching so Part 1, Part 2, Part 3... always send in strict order
-                            val initialKeyAndFile = getOrSwitchKeyAndFile()
-                            acquireRateLimitSlot()
-
-                            launch {
-                                try {
-
-                        val timingConstraint = if (isVideo) {
-                            """
-                            Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
-                            (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
-                            သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ဖြစ်ပျက်ခဲ့ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
-                            """.trimIndent()
+                        if (initialParallelEntries.isEmpty()) {
+                            overflowPendingQueue.addAll(partsToProcess)
                         } else {
-                            """
-                            Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
-                            (အရေးကြီးသတိပေးချက်: ဤသတ်မှတ်ထားသော အချိန်အပိုင်းအခြားမတိုင်မီ (သို့) ပြီးနောက်တွင် ဖြစ်ပျက်ခဲ့သော အကြောင်းအရာများကို လုံးဝ (လုံးဝ) ထည့်သွင်းခြင်းမပြုရပါ။ 
-                            သင်ရေးသားလိုက်သော အကြောင်းအရာများသည် $startStr နှင့် $endStr ကြားတွင် အမှန်တကယ်ပါဝင်ခြင်း ရှိမရှိ သေချာစွာ စစ်ဆေးပြီးမှသာ ရေးသားပါ။)
-                            """.trimIndent()
-                        }
-                        
-                        val systemInstruction = """
-                            သင်သည် '$tone' လေသံနှင့် '$pov' ရှုထောင့်ကို အထူးကျွမ်းကျင်သော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
-                            
-                            ညွှန်ကြားချက်များ:
-                            1. Input Media Analysis:
-                            $modalityInstruction
-                            2. Narrator POV: $povDetail
-                            3. Character Profile & Continuity:
-                            $characterContinuityRules
-                            4. Script Tone: $toneDetail
-                            5. Length Constraint: $lengthInstruction
-                            6. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
-                            7. Timing & Context: $timingConstraint
-                            8. Language Constraints: $languageConstraint
-                        """.trimIndent()
-
-                        val prompt = "အထက်ပါ ညွှန်ကြားချက်များအတိုင်း $timingConstraint ကို '$tone' လေသံ ($toneDetail) နှင့် '$pov' ရှုထောင့်အတိုင်း အတိအကျ လိုက်နာ၍ PrGt's Script ရေးသားပေးပါ။"
-
-                        val jsonBody = JSONObject().apply {
-                            put("system_instruction", JSONObject().apply {
-                                put("parts", JSONArray().apply {
-                                    put(JSONObject().apply { put("text", systemInstruction) })
-                                })
-                            })
-                            put("contents", JSONArray().apply {
-                                put(JSONObject().apply {
-                                    put("role", "user")
-                                    put("parts", JSONArray().apply {
-                                        put(JSONObject().apply {
-                                            put("file_data", JSONObject().apply {
-                                                put("mime_type", mediaMimeType ?: "video/mp4")
-                                                put("file_uri", finalGeminiFileUri)
-                                            })
-                                            if (isVideo) {
-                                                val startSec = startMs / 1000
-                                                val endSec = (endMs / 1000).coerceAtLeast(startSec + 1)
-                                                put("video_metadata", JSONObject().apply {
-                                                    put("start_offset", JSONObject().apply {
-                                                        put("seconds", startSec)
-                                                    })
-                                                    put("end_offset", JSONObject().apply {
-                                                        put("seconds", endSec)
-                                                    })
-                                                })
-                                            }
-                                        })
-                                        put(JSONObject().apply {
-                                            put("text", prompt)
-                                        })
-                                    })
-                                })
-                            })
-                        }
-
-                        var success = false
-                        var attempts = 0
-                        val maxAttempts = 3
-                        
-                        while (!success && attempts < maxAttempts) {
-                            attempts++
-                            val activeSlot = if (attempts == 1) {
-                                initialKeyAndFile
-                            } else {
-                                send(GenerationUpdate.Log("Retrying Segment ${i + 1}/$parts (Attempt $attempts/$maxAttempts)..."))
-                                val retryKeyAndFile = getOrSwitchKeyAndFile()
-                                acquireRateLimitSlot()
-                                retryKeyAndFile
+                            val kCount = initialParallelEntries.size
+                            val totalN = partsToProcess.size
+                            val basePerKey = totalN / kCount
+                            val remPerKey = totalN % kCount
+                            val workerAssignments = mutableListOf<Pair<ActiveKeyEntry, List<Int>>>()
+                            var cursor = 0
+                            for (w in 0 until kCount) {
+                                val countForWorker = basePerKey + (if (w < remPerKey) 1 else 0)
+                                val slice = partsToProcess.subList(cursor, cursor + countForWorker)
+                                cursor += countForWorker
+                                workerAssignments.add(initialParallelEntries[w] to slice)
+                                if (kCount > 1 && slice.isNotEmpty()) {
+                                    send(GenerationUpdate.Log("📋 [${initialParallelEntries[w].label}] တာဝန်ယူမည့် အပိုင်းများ: Part ${slice.first() + 1} to Part ${slice.last() + 1} (${slice.size} ပိုင်း)"))
+                                }
                             }
-                            val callApiKey = activeSlot.apiKey
-                            val callFileUri = activeSlot.fileUri
-                            val isSpareCall = activeSlot.isSpare
-                            val keyLabel = " [${activeSlot.keyLabel}]"
-                            
-                            send(GenerationUpdate.Log("🚀 Sending Part ${i + 1}/$parts ($startStr - $endStr)${if (attempts > 1) " [Retry $attempts]" else ""}$keyLabel to AI..."))
-                            
-                            val requestBody = createSegmentRequestBody(
-                                systemInstruction = systemInstruction,
-                                prompt = prompt,
-                                mediaMimeType = mediaMimeType,
-                                fileUri = callFileUri,
-                                isVideo = isVideo,
-                                startMs = startMs,
-                                endMs = endMs
-                            )
-                            val request = Request.Builder()
-                                .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModelName:streamGenerateContent?key=$callApiKey")
-                                .post(requestBody)
-                                .build()
-                            
-                            logReservedRequestSent(activeSlot)
-                            workingCount.incrementAndGet()
-                            inFlightHttpRequests.incrementAndGet()
-                            
-                            try {
-                                client.newCall(request).execute().use { response ->
-                                    if (!response.isSuccessful) {
-                                        recordCallOutcome(isSpareCall, false)
-                                        val errorBody = response.body?.string() ?: ""
-                                        val errorDetail = extractApiErrorMessage(response.code, response.message, errorBody)
-                                        send(GenerationUpdate.Log("❌ Part ${i + 1} (Attempt $attempts/$maxAttempts) Failed: HTTP ${response.code} - $errorDetail"))
-                                        if (attempts == maxAttempts) {
-                                            send(GenerationUpdate.ScriptChunk(i, "API Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody\n\n", isError = true))
-                                        }
-                                        return@use
-                                    }
-                                    
-                                    val responseString = response.body?.string() ?: ""
-                                    
-                                    try {
-                                        val jsonArray = JSONArray(responseString)
-                                        val partTextBuilder = StringBuilder()
-                                        for (j in 0 until jsonArray.length()) {
-                                            val chunk = jsonArray.getJSONObject(j)
-                                            val candidates = chunk.optJSONArray("candidates")
-                                            if (candidates != null && candidates.length() > 0) {
-                                                val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
-                                                if (contentParts != null && contentParts.length() > 0) {
-                                                    val text = contentParts.getJSONObject(0).optString("text", "")
-                                                    partTextBuilder.append(text)
+
+                            // Run all assigned key workers in parallel
+                            coroutineScope {
+                                workerAssignments.forEach { (initialEntry, assignedSlice) ->
+                                    launch {
+                                        var currentWorkerEntry: ActiveKeyEntry? = initialEntry
+                                        // Phase A: Process this key's contiguous assigned parts
+                                        for (idx in assignedSlice.indices) {
+                                            val partIdx = assignedSlice[idx]
+                                            val activeEntry = currentWorkerEntry
+                                            val slot = activeEntry?.let { tryReserveSlotForSpecificKey(it) }
+                                            if (slot != null) {
+                                                acquireRateLimitSlotForKey(slot.apiKey)
+                                                launch {
+                                                    executeSegmentPart(partIdx, slot, activeEntry)
                                                 }
+                                            } else {
+                                                // Current key reached its RPD limit before finishing its assigned parts!
+                                                val unfinishedParts = assignedSlice.subList(idx, assignedSlice.size)
+                                                overflowPendingQueue.addAll(unfinishedParts)
+                                                send(
+                                                    GenerationUpdate.Log(
+                                                        "⚠️ ${activeEntry?.label ?: "Key"} သည် RPD Limit ($rpdLimit/$rpdLimit) ပြည့်သွားသဖြင့် ကျန်ရှိသော အပိုင်း (${unfinishedParts.map { it + 1 }.joinToString(", ")}) ကို Next Key များဆီသို့ Pending အနေဖြင့် လွှဲပြောင်းတန်းဆီလိုက်ပါပြီ။"
+                                                    )
+                                                )
+                                                currentWorkerEntry = claimNextStandbyKey()
+                                                break
                                             }
                                         }
-                                        val resultText = partTextBuilder.toString()
-                                        if (resultText.isNotBlank()) {
-                                            send(GenerationUpdate.ScriptChunk(i, resultText))
-                                            success = true
-                                            recordCallOutcome(isSpareCall, true)
-                                            val keyTag = "[${activeSlot.keyLabel}]"
-                                            send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts ($startStr - $endStr) completed successfully with $keyTag."))
-                                        } else {
-                                            throw Exception("Empty response candidate text")
+
+                                        // Phase B: Help drain overflowPendingQueue using remaining RPD on this key or standby keys
+                                        while (currentWorkerEntry != null) {
+                                            val pendingPart = overflowPendingQueue.poll() ?: break
+                                            var slot = tryReserveSlotForSpecificKey(currentWorkerEntry!!)
+                                            while (slot == null) {
+                                                val exhaustedLabel = currentWorkerEntry!!.label
+                                                send(GenerationUpdate.Log("⚠️ $exhaustedLabel သည် RPD Limit ($rpdLimit/$rpdLimit) ပြည့်သွားပါပြီ။"))
+                                                currentWorkerEntry = claimNextStandbyKey()
+                                                if (currentWorkerEntry == null) break
+                                                slot = tryReserveSlotForSpecificKey(currentWorkerEntry!!)
+                                            }
+                                            if (slot != null && currentWorkerEntry != null) {
+                                                val assignedEntry = currentWorkerEntry!!
+                                                send(GenerationUpdate.Log("🔄 [Pending Queue] Part ${pendingPart + 1}/$parts ကို ${assignedEntry.label} ဖြင့် ဆက်လက်ထုတ်လုပ်နေပါသည်..."))
+                                                acquireRateLimitSlotForKey(slot.apiKey)
+                                                launch {
+                                                    executeSegmentPart(pendingPart, slot, assignedEntry)
+                                                }
+                                            } else {
+                                                overflowPendingQueue.add(pendingPart)
+                                                break
+                                            }
                                         }
-                                    } catch (e: Exception) {
-                                        recordCallOutcome(isSpareCall, false)
-                                        send(GenerationUpdate.Log("❌ Part ${i + 1} (Attempt $attempts/$maxAttempts) Parsing Error: ${e.message ?: "Unknown parse error"}"))
-                                        if (attempts == maxAttempts) {
-                                            send(GenerationUpdate.ScriptChunk(i, "Error parsing output for Part ${i + 1}: ${e.message}\nRaw Output: $responseString", isError = true))
-                                        }
-                                        return@use
                                     }
                                 }
-                            } catch (e: Exception) {
-                                recordCallOutcome(isSpareCall, false)
-                                send(GenerationUpdate.Log("❌ Part ${i + 1} (Attempt $attempts/$maxAttempts) Network Error: ${e.javaClass.simpleName} - ${e.message ?: "Connection failed"}"))
-                                if (attempts == maxAttempts) {
-                                    send(GenerationUpdate.ScriptChunk(i, "Network Error in Part ${i + 1}: ${e.message}\n\n", isError = true))
-                                }
-                            } finally {
-                                workingCount.decrementAndGet()
-                                inFlightHttpRequests.decrementAndGet()
                             }
                         }
-                        
-                        if (success) {
-                            val currentSuccess = successfulCount.incrementAndGet()
-                            val currentProgress = 0.15f + (0.85f * (currentSuccess.toFloat() / maxOf(1, totalToProcess)))
-                            send(GenerationUpdate.Progress(currentProgress))
-                        } else {
-                            failedCount.incrementAndGet()
-                            failedParts.add(i)
-                            send(GenerationUpdate.Log("❌ Part ${i + 1} failed after $maxAttempts attempts."))
-                            send(GenerationUpdate.ScriptChunk(i, "\n[အပိုင်း (${i + 1}) အား ၃ ကြိမ်တိုင်တိုင် ကြိုးစားသော်လည်း မအောင်မြင်ပါ။]\n", isError = true))
+
+                        // Phase C: If any overflow pending parts remain (e.g. if a worker finished early before another worker overflowed, or all keys hit RPD limit)
+                        try {
+                            while (overflowPendingQueue.isNotEmpty() && !rpdExhaustedAndStoppedByUser) {
+                                val pendingPart = overflowPendingQueue.poll() ?: break
+                                val fallbackSlot = getOrSwitchKeyAndFile()
+                                send(GenerationUpdate.Log("🔄 [Pending Queue] Part ${pendingPart + 1}/$parts ကို ${fallbackSlot.keyLabel} ဖြင့် ဆက်လက်ထုတ်လုပ်နေပါသည်..."))
+                                acquireRateLimitSlotForKey(fallbackSlot.apiKey)
+                                launch {
+                                    executeSegmentPart(pendingPart, fallbackSlot, null)
+                                }
+                            }
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            if (!rpdExhaustedAndStoppedByUser && ce.message != "RPD_EXHAUSTED_STOP") {
+                                throw ce
+                            }
                         }
-                    } finally {
-                        // workingCount is managed per in-flight HTTP request
                     }
-                }
-            }
-        }
         
         // Pass 2+: Automatically retry failed parts as long as RPD/Keys are available
         remainingFailedParts = failedParts.toList()
@@ -1377,9 +1715,9 @@ class GeminiApiClient(private val context: Context) {
                                             recordCallOutcome(isSpareCall, false)
                                             val errorBody = response.body?.string() ?: ""
                                             val errorDetail = extractApiErrorMessage(response.code, response.message, errorBody)
-                                            send(GenerationUpdate.Log("❌ Retry Part ${i + 1} (Round #$autoRetryRound, Attempt $attempts/$maxAttempts) Failed: HTTP ${response.code} - $errorDetail"))
+                                            send(GenerationUpdate.Log("❌ Retry Part ${i + 1} (R#$autoRetryRound, $attempts/$maxAttempts)$keyLabel Failed: HTTP ${response.code} ($errorDetail)"))
                                             if (attempts == maxAttempts) {
-                                                send(GenerationUpdate.ScriptChunk(i, "\n[Final Retry Error in Part ${i + 1}: ${response.code} ${response.message}\n$errorBody]\n", isError = true))
+                                                send(GenerationUpdate.ScriptChunk(i, "\n❌ [Part ${i + 1} Retry Failed$keyLabel: HTTP ${response.code} ($errorDetail)]\n", isError = true))
                                             }
                                             return@use
                                         }
@@ -1408,22 +1746,24 @@ class GeminiApiClient(private val context: Context) {
                                                 val keyTag = "[${activeSlot.keyLabel}]"
                                                 send(GenerationUpdate.Log("✅ Part ${i + 1}/$parts [$startStr - $endStr] recovered successfully with $keyTag."))
                                             } else {
-                                                throw Exception("Empty response candidate text")
+                                                throw Exception("Empty response")
                                             }
                                         } catch (e: Exception) {
                                             recordCallOutcome(isSpareCall, false)
-                                            send(GenerationUpdate.Log("❌ Retry Part ${i + 1} (Round #$autoRetryRound, Attempt $attempts/$maxAttempts) Parsing Error: ${e.message ?: "Unknown parse error"}"))
+                                            val shortParseErr = (e.message ?: "Parse error").lineSequence().firstOrNull()?.take(50) ?: "Parse error"
+                                            send(GenerationUpdate.Log("❌ Retry Part ${i + 1} (R#$autoRetryRound, $attempts/$maxAttempts)$keyLabel Failed: $shortParseErr"))
                                             if (attempts == maxAttempts) {
-                                                send(GenerationUpdate.ScriptChunk(i, "\n[Error parsing final output for Part ${i + 1}: ${e.message}]\n", isError = true))
+                                                send(GenerationUpdate.ScriptChunk(i, "\n❌ [Part ${i + 1} Retry Failed$keyLabel: $shortParseErr]\n", isError = true))
                                             }
                                             return@use
                                         }
                                     }
                                 } catch (e: Exception) {
                                     recordCallOutcome(isSpareCall, false)
-                                    send(GenerationUpdate.Log("❌ Retry Part ${i + 1} (Round #$autoRetryRound, Attempt $attempts/$maxAttempts) Network Error: ${e.javaClass.simpleName} - ${e.message ?: "Connection failed"}"))
+                                    val shortNetErr = (e.message ?: "Connection failed").lineSequence().firstOrNull()?.take(50) ?: "Connection failed"
+                                    send(GenerationUpdate.Log("❌ Retry Part ${i + 1} (R#$autoRetryRound, $attempts/$maxAttempts)$keyLabel Failed: ${e.javaClass.simpleName} ($shortNetErr)"))
                                     if (attempts == maxAttempts) {
-                                        send(GenerationUpdate.ScriptChunk(i, "\n[Network Error in Final Retry Part ${i + 1}: ${e.message}]\n", isError = true))
+                                        send(GenerationUpdate.ScriptChunk(i, "\n❌ [Part ${i + 1} Retry Failed$keyLabel: ${e.javaClass.simpleName} ($shortNetErr)]\n", isError = true))
                                     }
                                 } finally {
                                     workingCount.decrementAndGet()
@@ -1524,21 +1864,42 @@ class GeminiApiClient(private val context: Context) {
     }
 
     private fun extractApiErrorMessage(code: Int, message: String, errorBody: String?): String {
-        if (errorBody.isNullOrBlank()) return "$code $message"
-        try {
-            val json = JSONObject(errorBody)
-            val errObj = json.optJSONObject("error")
-            if (errObj != null) {
-                val status = errObj.optString("status")
-                val msg = errObj.optString("message")
-                val detail = if (status.isNotBlank()) "$status: $msg" else msg
-                if (detail.isNotBlank()) return detail
+        var status = ""
+        var msg = ""
+        if (!errorBody.isNullOrBlank()) {
+            try {
+                val json = JSONObject(errorBody)
+                val errObj = json.optJSONObject("error")
+                if (errObj != null) {
+                    status = errObj.optString("status").trim()
+                    msg = errObj.optString("message").trim()
+                }
+            } catch (_: Exception) {
+                // Not a JSON object
             }
-        } catch (_: Exception) {
-            // Not a JSON object or parsing failed
         }
-        val clean = errorBody.replace("\n", " ").trim()
-        return if (clean.length > 150) clean.take(150) + "..." else clean
+        return when {
+            code == 429 || status.equals("RESOURCE_EXHAUSTED", ignoreCase = true) -> "Quota/Rate Limit Exceeded"
+            code == 503 || status.equals("UNAVAILABLE", ignoreCase = true) -> "Model Overloaded"
+            code == 500 || status.equals("INTERNAL", ignoreCase = true) -> "Internal Server Error"
+            code == 504 || status.equals("DEADLINE_EXCEEDED", ignoreCase = true) -> "Gateway Timeout"
+            code == 400 || status.equals("INVALID_ARGUMENT", ignoreCase = true) -> {
+                val shortMsg = msg.lineSequence().firstOrNull()?.take(45) ?: "Invalid Argument"
+                "Invalid Request: $shortMsg"
+            }
+            code == 403 || status.equals("PERMISSION_DENIED", ignoreCase = true) -> "Permission Denied / Invalid Key"
+            code == 404 || status.equals("NOT_FOUND", ignoreCase = true) -> "File or Model Not Found"
+            msg.isNotBlank() -> {
+                val cleanMsg = msg.replace("\n", " ").trim()
+                if (cleanMsg.length > 55) cleanMsg.take(55) + "..." else cleanMsg
+            }
+            status.isNotBlank() -> status
+            !errorBody.isNullOrBlank() -> {
+                val clean = errorBody.replace("\n", " ").trim()
+                if (clean.length > 55) clean.take(55) + "..." else clean
+            }
+            else -> message.ifBlank { "Error" }
+        }
     }
     
     private fun checkFileState(apiKey: String, name: String): String {
