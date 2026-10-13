@@ -361,6 +361,12 @@ class GeminiApiClient(private val context: Context) {
                         - အပြစ်ကင်းစင်ပြီး ချစ်စရာကောင်းသော၊ နွေးထွေးနူးညံ့သည့် လေသံဖြင့် ရေးသားရန်။
                         - အထူးသဖြင့် ကလေးငယ် ဇာတ်ကောင်များ (သား/သမီး) သို့မဟုတ် ချစ်စရာ ဇာတ်ကောင်များ ပါဝင်ပါက ကလေးတို့၏ အပြစ်ကင်းစင်ပုံ၊ ချစ်စဖွယ် အမူအရာလေးများနှင့် ချစ်စနိုး အသုံးအနှုန်းလေးများ (ဥပမာ - 'လေး' အသုံးအနှုန်းများ၊ နူးညံ့ချိုသာသော ကလေးသဘာဝ စကားလုံးများ) ကို ပေါ်လွင်အောင် နားထောင်သူ အသည်းယားပြီး ချစ်ခင်သွားစေမည့် ချစ်စရာ လူပြောစကားပုံစံဖြင့် ရေးသားရန်။
                         """.trimIndent()
+                    tone.contains("Action", ignoreCase = true) || tone.contains("High-Energy", ignoreCase = true) ->
+                        """
+                        Action & High-Energy (အက်ရှင် / အရှိန်ပြင်းသွက်လက်သော လေသံ):
+                        - အက်ရှင်ဇာတ်ဝင်ခန်းများ၊ တိုက်ခိုက်ခန်းများ၊ သဲထိတ်ရင်ဖို လိုက်လံဖမ်းဆီးခန်းများနှင့် အပြောင်းအလဲမြန်သော အဖြစ်အပျက်များကို အရှိန်အဟုန်ပြင်းပြင်း၊ သွက်သွက်လက်လက်နှင့် စိတ်လှုပ်ရှားတက်ကြွစေမည့် စကားလုံးများဖြင့် ရေးသားရန်။
+                        - ဝါကျများကို တိုတိုပြတ်ပြတ်နှင့် စည်းချက်မှန်မှန် (Punchy & Fast-paced) သုံးစွဲပြီး နားဆင်သူ၏ ရင်ခုန်သံကို မြန်ဆန်လာစေမည့် ပြင်းထန်သွက်လက်သော လူပြောစကားလေသံဖြင့် ရေးသားရန်။
+                        """.trimIndent()
                     else -> "$tone (ရွေးချယ်ထားသော '$tone' လေသံအတိုင်း နားထောင်သူ စိတ်ဝင်စားအောင် ရေးသားပါ)"
                 }
             } else {
@@ -384,6 +390,12 @@ class GeminiApiClient(private val context: Context) {
                         """
                         Cute & Adorable (Sweet, Innocent & Heartwarming Tone):
                         - Narrate in a warm, gentle, innocent, and endearing spoken style. Especially when child characters or cute moments are involved, use affectionate, soft, and charming expressions that highlight their innocence and make the listener adore them.
+                        """.trimIndent()
+                    tone.contains("Action", ignoreCase = true) || tone.contains("High-Energy", ignoreCase = true) ->
+                        """
+                        Action & High-Energy (Fast-Paced, Dynamic & Adrenaline-Fueled Tone):
+                        - Narrate with high intensity, relentless pace, and gripping energy that matches action sequences, chase scenes, fight choreography, and fast-moving plot twists.
+                        - Use short, punchy, dynamic sentences with strong verbs and high-stakes spoken phrasing to keep the listener's adrenaline pumping throughout the voiceover.
                         """.trimIndent()
                     else -> "$tone (Narrate strictly in an engaging '$tone' spoken voiceover tone)"
                 }

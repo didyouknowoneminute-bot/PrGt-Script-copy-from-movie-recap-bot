@@ -110,7 +110,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
     var characterHint by remember { mutableStateOf(sharedPrefs.getString("preset_character_hint", "") ?: "") }
     
-    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful", "Cute & Adorable")
+    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful", "Cute & Adorable", "Action & High-Energy")
     var selectedTone by remember {
         val saved = sharedPrefs.getString("preset_tone", scriptTones[0]) ?: scriptTones[0]
         mutableStateOf(if (scriptTones.contains(saved)) saved else scriptTones[0])
@@ -1379,6 +1379,25 @@ fun MainScreen(modifier: Modifier = Modifier) {
         val charCount = viewerText.length
         val formattedDate = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date(script.timestamp))
 
+        val partsMap = remember(script.id, script.scriptPartsJson) {
+            try {
+                if (script.scriptPartsJson.isNotBlank()) {
+                    val obj = org.json.JSONObject(script.scriptPartsJson)
+                    obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                } else emptyMap()
+            } catch (_: Exception) {
+                emptyMap()
+            }
+        }
+        val totalParts = remember(script.partsCount, partsMap.size) {
+            if (script.partsCount > 0) script.partsCount else if (partsMap.isNotEmpty()) partsMap.size else 1
+        }
+        val midPart = remember(totalParts) {
+            if (totalParts <= 1) 1 else (totalParts + 1) / 2
+        }
+        val part1RangeStr = if (totalParts > 1) "Part 1-$midPart" else "Part 1"
+        val part2RangeStr = if (totalParts > 1) "Part ${midPart + 1}-$totalParts" else "Part 1"
+
         AlertDialog(
             onDismissRequest = { viewingHistoryScript = null },
             properties = androidx.compose.ui.window.DialogProperties(
@@ -1579,38 +1598,96 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 }
             },
             confirmButton = {
-                Row(
+                Column(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        IconButton(onClick = {
-                            clipboardManager.setText(AnnotatedString(viewerText))
-                        }) {
-                            Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
-                        }
-                        if (isEditingInViewer) {
-                            IconButton(onClick = {
-                                isEditingInViewer = false
-                                coroutineScope.launch {
-                                    dao.updateScriptText(script.id, viewerText)
-                                }
-                            }) {
-                                Icon(Icons.Filled.Save, contentDescription = "Save", tint = MaterialTheme.colorScheme.primary)
+                    if (totalParts > 1) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    val textToCopy = if (viewerText == script.scriptText && partsMap.isNotEmpty()) {
+                                        val selected = (0 until midPart).mapNotNull { partsMap[it] }.filter { it.isNotBlank() }
+                                        if (selected.isNotEmpty()) selected.joinToString("\n\n") { it.trim() }
+                                        else viewerText.split("\n\n").let { paras -> paras.take((paras.size + 1) / 2).joinToString("\n\n") }
+                                    } else {
+                                        val paras = viewerText.split("\n\n").filter { it.isNotBlank() }
+                                        if (paras.size > 1) paras.take((paras.size + 1) / 2).joinToString("\n\n")
+                                        else viewerText.take(viewerText.length / 2)
+                                    }
+                                    clipboardManager.setText(AnnotatedString(textToCopy))
+                                    android.widget.Toast.makeText(context, "Copy 1 ($part1RangeStr) ကူးယူပြီးပါပြီ", android.widget.Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                            ) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Copy 1 ($part1RangeStr)", style = MaterialTheme.typography.labelMedium, maxLines = 1)
                             }
-                        } else {
-                            IconButton(onClick = {
-                                isEditingInViewer = true
-                            }) {
-                                Icon(Icons.Filled.Edit, contentDescription = "Edit")
+
+                            OutlinedButton(
+                                onClick = {
+                                    val textToCopy = if (viewerText == script.scriptText && partsMap.isNotEmpty()) {
+                                        val selected = (midPart until totalParts).mapNotNull { partsMap[it] }.filter { it.isNotBlank() }
+                                        if (selected.isNotEmpty()) selected.joinToString("\n\n") { it.trim() }
+                                        else viewerText.split("\n\n").let { paras -> paras.drop((paras.size + 1) / 2).joinToString("\n\n") }
+                                    } else {
+                                        val paras = viewerText.split("\n\n").filter { it.isNotBlank() }
+                                        if (paras.size > 1) paras.drop((paras.size + 1) / 2).joinToString("\n\n")
+                                        else viewerText.drop(viewerText.length / 2)
+                                    }
+                                    clipboardManager.setText(AnnotatedString(textToCopy))
+                                    android.widget.Toast.makeText(context, "Copy 2 ($part2RangeStr) ကူးယူပြီးပါပြီ", android.widget.Toast.LENGTH_SHORT).show()
+                                },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp, vertical = 6.dp)
+                            ) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Copy 2 ($part2RangeStr)", style = MaterialTheme.typography.labelMedium, maxLines = 1)
                             }
                         }
                     }
 
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = { viewingHistoryScript = null }) {
-                            Text("ပိတ်မည်")
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            IconButton(onClick = {
+                                clipboardManager.setText(AnnotatedString(viewerText))
+                                android.widget.Toast.makeText(context, "ဇာတ်ညွှန်းတစ်ခုလုံး (Full Script) Copy ကူးပြီးပါပြီ", android.widget.Toast.LENGTH_SHORT).show()
+                            }) {
+                                Icon(Icons.Filled.ContentCopy, contentDescription = "Copy")
+                            }
+                            if (isEditingInViewer) {
+                                IconButton(onClick = {
+                                    isEditingInViewer = false
+                                    coroutineScope.launch {
+                                        dao.updateScriptText(script.id, viewerText)
+                                    }
+                                }) {
+                                    Icon(Icons.Filled.Save, contentDescription = "Save", tint = MaterialTheme.colorScheme.primary)
+                                }
+                            } else {
+                                IconButton(onClick = {
+                                    isEditingInViewer = true
+                                }) {
+                                    Icon(Icons.Filled.Edit, contentDescription = "Edit")
+                                }
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(onClick = { viewingHistoryScript = null }) {
+                                Text("ပိတ်မည်")
+                            }
                         }
                     }
                 }
