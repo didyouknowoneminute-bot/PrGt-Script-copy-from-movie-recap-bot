@@ -556,31 +556,58 @@ class GeminiApiClient(private val context: Context) {
                             uploadedFileUriByKey[targetKey] = cachedForTarget.first
                             return@withLock cachedForTarget.first
                         } else {
-                            send(GenerationUpdate.Log("📤 $targetLabel ဖြင့် Media ဖိုင်အား ဆာဗာသို့ Upload တင်နေပါသည်..."))
-                            val uploadResult = uploadFile(targetKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
-                            val targetFileUriInfo = when (uploadResult) {
-                                is UploadResult.Success -> Pair(uploadResult.uri, uploadResult.name)
-                                is UploadResult.Failure -> {
-                                    send(GenerationUpdate.Error("$targetLabel ဖြင့် Upload တင်ခြင်း မအောင်မြင်ပါ:\n${uploadResult.errorDetail}"))
-                                    throw Exception("$targetLabel upload failed: ${uploadResult.errorDetail}")
+                            val maxUploadAttempts = 3
+                            var lastUploadError = ""
+                            var targetFileUriInfo: Pair<String, String>? = null
+
+                            for (attempt in 1..maxUploadAttempts) {
+                                val attemptSuffix = if (attempt > 1) " (ကြိုးစားမှု $attempt/$maxUploadAttempts)" else ""
+                                send(GenerationUpdate.Log("📤 $targetLabel ဖြင့် Media ဖိုင်အား ဆာဗာသို့ Upload တင်နေပါသည်$attemptSuffix..."))
+                                val uploadResult = uploadFile(targetKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
+                                when (uploadResult) {
+                                    is UploadResult.Success -> {
+                                        val candidateUriInfo = Pair(uploadResult.uri, uploadResult.name)
+                                        if (mediaMimeType?.startsWith("video") == true) {
+                                            send(GenerationUpdate.Log("[$targetLabel] Waiting for Gemini server to process video..."))
+                                            var isActive = false
+                                            var processFailed = false
+                                            while (!isActive && !processFailed) {
+                                                val state = checkFileState(targetKey, candidateUriInfo.second)
+                                                if (state == "ACTIVE") {
+                                                    isActive = true
+                                                } else if (state == "FAILED") {
+                                                    processFailed = true
+                                                    lastUploadError = "Gemini server failed to process video with $targetLabel"
+                                                } else {
+                                                    delay(3000)
+                                                }
+                                            }
+                                            if (isActive) {
+                                                targetFileUriInfo = candidateUriInfo
+                                                break
+                                            }
+                                        } else {
+                                            targetFileUriInfo = candidateUriInfo
+                                            break
+                                        }
+                                    }
+                                    is UploadResult.Failure -> {
+                                        lastUploadError = uploadResult.errorDetail
+                                    }
+                                }
+
+                                if (attempt < maxUploadAttempts) {
+                                    val delaySec = attempt * 3
+                                    send(GenerationUpdate.Log("⚠️ $targetLabel ဖြင့် Media Upload မအောင်မြင်ပါ ($lastUploadError)။ $delaySec စက္ကန့်အကြာတွင် ပြန်လည်ကြိုးစားပါမည်..."))
+                                    delay(delaySec * 1000L)
                                 }
                             }
 
-                            if (mediaMimeType?.startsWith("video") == true) {
-                                send(GenerationUpdate.Log("[$targetLabel] Waiting for Gemini server to process video..."))
-                                var isActive = false
-                                while (!isActive) {
-                                    val state = checkFileState(targetKey, targetFileUriInfo.second)
-                                    if (state == "ACTIVE") {
-                                        isActive = true
-                                    } else if (state == "FAILED") {
-                                        send(GenerationUpdate.Error("Gemini server failed to process video with $targetLabel."))
-                                        throw Exception("Gemini server failed to process video with $targetLabel")
-                                    } else {
-                                        delay(3000)
-                                    }
-                                }
+                            if (targetFileUriInfo == null) {
+                                send(GenerationUpdate.Error("$targetLabel ဖြင့် Media Upload $maxUploadAttempts ကြိမ် ပြန်လည်ကြိုးစားသော်လည်း မအောင်မြင်ပါ:\n$lastUploadError"))
+                                throw Exception("$targetLabel upload failed after $maxUploadAttempts attempts: $lastUploadError")
                             }
+
                             GeminiFileKeyCache.saveCachedFile(context, mediaUri, targetKey, targetFileUriInfo.first, targetFileUriInfo.second)
                             uploadedFileUriByKey[targetKey] = targetFileUriInfo.first
                             send(GenerationUpdate.Log("✅ $targetLabel ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
@@ -735,10 +762,12 @@ class GeminiApiClient(private val context: Context) {
                 if (candidateSpareKeys.isNotEmpty()) {
                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
                         candidateSpareKeys.forEach { entry ->
-                            try {
-                                ensureMediaUploadedForKey(entry.key, entry.label)
-                            } catch (_: Exception) {
-                                // Background pre-upload failure will be retried on demand
+                            launch {
+                                try {
+                                    ensureMediaUploadedForKey(entry.key, entry.label)
+                                } catch (_: Exception) {
+                                    // Background pre-upload failure will be retried on demand
+                                }
                             }
                         }
                     }
@@ -1290,27 +1319,8 @@ class GeminiApiClient(private val context: Context) {
                     val claimedKeySet = java.util.Collections.synchronizedSet(mutableSetOf<String>())
                     initialParallelEntries.forEach { claimedKeySet.add(it.key) }
 
-                    // Parallel Video Upload for selected Parallel Keys right after Character Profile & Relationship Status confirmation
                     if (initialParallelEntries.size > 1) {
-                        send(GenerationUpdate.Log("⚡ Parallel Key Mode: Key (${initialParallelEntries.size}) ခု [${initialParallelEntries.joinToString(", ") { it.label }}] ဖြင့် Video Upload နှင့် Script ထုတ်လုပ်မှုကို တစ်ပြိုင်နက် လုပ်ဆောင်ပါမည်..."))
-                        coroutineScope {
-                            initialParallelEntries.map { entry ->
-                                async {
-                                    val uri = ensureMediaUploadedForKey(entry.key, entry.label)
-                                    if (entry.isSpare) {
-                                        keyMutex.withLock { hasSwitchedToSpare = true }
-                                    }
-                                    uri
-                                }
-                            }.awaitAll()
-                        }
-                        send(GenerationUpdate.Log("✅ Parallel Keys (${initialParallelEntries.size} ခု) အားလုံးအတွက် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
-                    } else if (initialParallelEntries.size == 1) {
-                        val singleEntry = initialParallelEntries.first()
-                        ensureMediaUploadedForKey(singleEntry.key, singleEntry.label)
-                        if (singleEntry.isSpare) {
-                            keyMutex.withLock { hasSwitchedToSpare = true }
-                        }
+                        send(GenerationUpdate.Log("⚡ Parallel Key Mode: Key (${initialParallelEntries.size}) ခု [${initialParallelEntries.joinToString(", ") { it.label }}] ဖြင့် စတင်ပါမည် (Ready ဖြစ်သော Key မှ ချက်ချင်း စတင်ထုတ်လုပ်ပါမည်)..."))
                     }
 
                     suspend fun tryReserveSlotForSpecificKey(entry: ActiveKeyEntry): ReservedKeySlot? {
@@ -1563,27 +1573,55 @@ class GeminiApiClient(private val context: Context) {
                                 workerAssignments.forEach { (initialEntry, assignedSlice) ->
                                     launch {
                                         var currentWorkerEntry: ActiveKeyEntry? = initialEntry
-                                        // Phase A: Process this key's contiguous assigned parts
-                                        for (idx in assignedSlice.indices) {
-                                            val partIdx = assignedSlice[idx]
-                                            val activeEntry = currentWorkerEntry
-                                            val slot = activeEntry?.let { tryReserveSlotForSpecificKey(it) }
-                                            if (slot != null) {
-                                                acquireRateLimitSlotForKey(slot.apiKey)
-                                                launch {
-                                                    executeSegmentPart(partIdx, slot, activeEntry)
+                                        var readyToRunAssignedSlice = true
+                                        if (currentWorkerEntry != null) {
+                                            val entryKey = currentWorkerEntry.key
+                                            val entryLabel = currentWorkerEntry.label
+                                            val existingUri = uploadedFileUriByKey[entryKey]
+                                            if (existingUri.isNullOrBlank()) {
+                                                send(GenerationUpdate.Log("⏳ [$entryLabel] Media Upload ပြီးစီးရန် စောင့်ဆိုင်းနေပါသည်..."))
+                                                try {
+                                                    ensureMediaUploadedForKey(entryKey, entryLabel)
+                                                    if (currentWorkerEntry.isSpare) {
+                                                        keyMutex.withLock { hasSwitchedToSpare = true }
+                                                    }
+                                                    send(GenerationUpdate.Log("✅ [$entryLabel] Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။ သတ်မှတ်ထားသော အပိုင်းများကို စတင်ထုတ်လုပ်ပါမည်။"))
+                                                } catch (e: Exception) {
+                                                    send(GenerationUpdate.Log("❌ [$entryLabel] Media Upload မအောင်မြင်ပါ (${e.message})။ ဤ Key ၏ အပိုင်းများကို အခြား Key သို့ လွှဲပြောင်းပါမည်..."))
+                                                    overflowPendingQueue.addAll(assignedSlice)
+                                                    currentWorkerEntry = claimNextStandbyKey()
+                                                    readyToRunAssignedSlice = false
                                                 }
                                             } else {
-                                                // Current key reached its RPD limit before finishing its assigned parts!
-                                                val unfinishedParts = assignedSlice.subList(idx, assignedSlice.size)
-                                                overflowPendingQueue.addAll(unfinishedParts)
-                                                send(
-                                                    GenerationUpdate.Log(
-                                                        "⚠️ ${activeEntry?.label ?: "Key"} သည် RPD Limit ($rpdLimit/$rpdLimit) ပြည့်သွားသဖြင့် ကျန်ရှိသော အပိုင်း (${unfinishedParts.map { it + 1 }.joinToString(", ")}) ကို Next Key များဆီသို့ Pending အနေဖြင့် လွှဲပြောင်းတန်းဆီလိုက်ပါပြီ။"
+                                                if (currentWorkerEntry.isSpare) {
+                                                    keyMutex.withLock { hasSwitchedToSpare = true }
+                                                }
+                                            }
+                                        }
+
+                                        // Phase A: Process this key's contiguous assigned parts
+                                        if (readyToRunAssignedSlice) {
+                                            for (idx in assignedSlice.indices) {
+                                                val partIdx = assignedSlice[idx]
+                                                val activeEntry = currentWorkerEntry
+                                                val slot = activeEntry?.let { tryReserveSlotForSpecificKey(it) }
+                                                if (slot != null) {
+                                                    acquireRateLimitSlotForKey(slot.apiKey)
+                                                    launch {
+                                                        executeSegmentPart(partIdx, slot, activeEntry)
+                                                    }
+                                                } else {
+                                                    // Current key reached its RPD limit before finishing its assigned parts!
+                                                    val unfinishedParts = assignedSlice.subList(idx, assignedSlice.size)
+                                                    overflowPendingQueue.addAll(unfinishedParts)
+                                                    send(
+                                                        GenerationUpdate.Log(
+                                                            "⚠️ ${activeEntry?.label ?: "Key"} သည် RPD Limit ($rpdLimit/$rpdLimit) ပြည့်သွားသဖြင့် ကျန်ရှိသော အပိုင်း (${unfinishedParts.map { it + 1 }.joinToString(", ")}) ကို Next Key များဆီသို့ Pending အနေဖြင့် လွှဲပြောင်းတန်းဆီလိုက်ပါပြီ။"
+                                                        )
                                                     )
-                                                )
-                                                currentWorkerEntry = claimNextStandbyKey()
-                                                break
+                                                    currentWorkerEntry = claimNextStandbyKey()
+                                                    break
+                                                }
                                             }
                                         }
 
