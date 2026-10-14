@@ -214,6 +214,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val customCharacterNamesMap = remember { androidx.compose.runtime.mutableStateMapOf<Int, String>() }
     var showRetryDialog by remember { mutableStateOf<List<Int>?>(null) }
     var showRpdKeyDialog by remember { mutableStateOf(false) }
+    var activeRunningModel by remember { mutableStateOf("") }
     var editMainKeyInput by remember { mutableStateOf("") }
     var editSpareKeyInput by remember { mutableStateOf("") }
     var currentMissingParts by remember { mutableStateOf<List<Int>>(emptyList()) }
@@ -283,6 +284,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var scriptToDelete by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var scriptToRegenerate by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var scriptForSpecialParts by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
+    var scriptToConfigureRetry by remember { mutableStateOf<Pair<com.example.db.PrGtScript, List<Int>>?>(null) }
     var pendingRetryScript by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var pendingRetryParts by remember { mutableStateOf<List<Int>?>(null) }
     var viewingHistoryScript by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
@@ -359,7 +361,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
         generationJob = coroutineScope.launch {
             val scriptPartsMap = mutableMapOf<Int, String>()
             
-            val activeModel = existingScript?.modelId ?: selectedModelKey
+            val activeModel = existingScript?.modelId?.ifBlank { selectedModelKey } ?: selectedModelKey
+            activeRunningModel = activeModel
             val activeParts = existingScript?.partsCount?.toFloat() ?: parts
             val activeLength = existingScript?.targetLength ?: selectedLength
             val activePOV = existingScript?.pov ?: selectedPOV
@@ -530,7 +533,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             scriptText = snapshotText,
                             timestamp = generationStartTime,
                             language = activeLanguage,
-                            modelId = activeModel,
+                            modelId = activeRunningModel.ifBlank { activeModel },
                             targetLength = activeLength,
                             pov = activePOV,
                             tone = activeTone,
@@ -1160,7 +1163,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                 }
                                 if (failedParts.isNotEmpty()) {
                                     Button(
-                                        onClick = { triggerScriptAction(script, failedParts) },
+                                        onClick = { scriptToConfigureRetry = Pair(script, failedParts) },
                                         colors = androidx.compose.material3.ButtonDefaults.buttonColors(
                                             containerColor = MaterialTheme.colorScheme.error,
                                             contentColor = MaterialTheme.colorScheme.onError
@@ -1544,7 +1547,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                     onClick = {
                                         val partsToRun = viewerMissingParts.toList()
                                         viewingHistoryScript = null
-                                        triggerScriptAction(script, partsToRun)
+                                        scriptToConfigureRetry = Pair(script, partsToRun)
                                     },
                                     colors = androidx.compose.material3.ButtonDefaults.buttonColors(
                                         containerColor = MaterialTheme.colorScheme.error,
@@ -2144,18 +2147,124 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         val partsToRun = selectedPartIndices.sorted().toList()
                         val scriptToRun = targetScript
                         scriptForSpecialParts = null
-                        triggerScriptAction(scriptToRun, partsToRun)
+                        scriptToConfigureRetry = Pair(scriptToRun, partsToRun)
                     },
                     enabled = selectedPartIndices.isNotEmpty()
                 ) {
                     Text(
                         if (selectedPartIndices.isEmpty()) "Select at least 1 part" 
-                        else "Regenerate (${selectedPartIndices.size} Parts)"
+                        else "Continue (${selectedPartIndices.size} Parts)"
                     )
                 }
             },
             dismissButton = {
                 OutlinedButton(onClick = { scriptForSpecialParts = null }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (scriptToConfigureRetry != null) {
+        val targetScript = scriptToConfigureRetry!!.first
+        val partsToRun = scriptToConfigureRetry!!.second
+        var localModelKey by remember(scriptToConfigureRetry) { 
+            mutableStateOf(targetScript.modelId.ifBlank { selectedModelKey }) 
+        }
+        val maxAllowedParallel = maxOf(1f, minOf(10f, partsToRun.size.toFloat()))
+        var localParallelKeys by remember(scriptToConfigureRetry) { 
+            mutableStateOf(minOf(parallelKeys, maxAllowedParallel)) 
+        }
+        var localLength by remember(scriptToConfigureRetry) { mutableStateOf(targetScript.targetLength) }
+        var localPOV by remember(scriptToConfigureRetry) { mutableStateOf(targetScript.pov) }
+        var localTone by remember(scriptToConfigureRetry) { mutableStateOf(targetScript.tone) }
+        var localLanguage by remember(scriptToConfigureRetry) { mutableStateOf(targetScript.language) }
+
+        AlertDialog(
+            onDismissRequest = { scriptToConfigureRetry = null },
+            title = { Text("Retry Settings ပြင်ဆင်ရန် (${partsToRun.size} ပိုင်း)") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .verticalScroll(rememberScrollState())
+                        .padding(8.dp)
+                ) {
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "ထုတ်လုပ်မည့် အပိုင်းများ: Part ${partsToRun.map { it + 1 }.joinToString(", ")}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(10.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(14.dp))
+                    DropdownSection(
+                        title = "Gemini Model",
+                        options = modelOptions.map { it.second },
+                        selectedOption = modelKeyToDisplay(localModelKey),
+                        onOptionSelected = { localModelKey = modelDisplayToKey(it) }
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    SliderSection(
+                        title = "Parallel Key (အများဆုံး ${maxAllowedParallel.toInt()} ခု)",
+                        value = localParallelKeys.coerceIn(1f, maxAllowedParallel),
+                        onValueChange = { localParallelKeys = it.coerceIn(1f, maxAllowedParallel) },
+                        valueRange = 1f..maxAllowedParallel
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    DropdownSection(
+                        title = "Script Length",
+                        options = scriptLengths,
+                        selectedOption = localLength,
+                        onOptionSelected = { localLength = it }
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    DropdownSection(
+                        title = "Narrator POV",
+                        options = narratorPOVs,
+                        selectedOption = localPOV,
+                        onOptionSelected = { localPOV = it }
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    DropdownSection(
+                        title = "Script Tone",
+                        options = scriptTones,
+                        selectedOption = localTone,
+                        onOptionSelected = { localTone = it }
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    DropdownSection(
+                        title = "Output Language",
+                        options = outputLanguages,
+                        selectedOption = localLanguage,
+                        onOptionSelected = { localLanguage = it }
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    parallelKeys = localParallelKeys
+                    sharedPrefs.edit().putFloat("preset_parallel_keys", localParallelKeys).apply()
+                    val updatedScript = targetScript.copy(
+                        modelId = localModelKey,
+                        targetLength = localLength,
+                        pov = localPOV,
+                        tone = localTone,
+                        language = localLanguage
+                    )
+                    scriptToConfigureRetry = null
+                    triggerScriptAction(updatedScript, partsToRun)
+                }) {
+                    Text("Start Retry (${partsToRun.size} Parts)")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { scriptToConfigureRetry = null }) {
                     Text("Cancel")
                 }
             }
@@ -2508,19 +2617,25 @@ fun MainScreen(modifier: Modifier = Modifier) {
             }
         }
 
-        val mainKeyStatus = remember(editMainKeyInput, rpdEnabled, selectedModelKey) { RpdTracker.getStatus(context, editMainKeyInput, model = selectedModelKey) }
-        val spareKeyStatus = remember(editSpareKeyInput, rpdEnabled, selectedModelKey) { RpdTracker.getStatus(context, editSpareKeyInput, model = selectedModelKey) }
+        var dialogSelectedModelKey by remember(showRpdKeyDialog) {
+            mutableStateOf(activeRunningModel.ifBlank { selectedModelKey })
+        }
+        val currentDialogModel = dialogSelectedModelKey
+        val mainKeyStatus = remember(editMainKeyInput, rpdEnabled, currentDialogModel) { RpdTracker.getStatus(context, editMainKeyInput, model = currentDialogModel) }
+        val spareKeyStatus = remember(editSpareKeyInput, rpdEnabled, currentDialogModel) { RpdTracker.getStatus(context, editSpareKeyInput, model = currentDialogModel) }
 
-        val canProceed = remember(editMainKeyInput, editSpareKeyInput, apiKey, spareApiKey) {
+        val isModelChanged = dialogSelectedModelKey != (activeRunningModel.ifBlank { selectedModelKey })
+        val hasQuotaOnCurrentKeys = !mainKeyStatus.isLimitReached || (editSpareKeyInput.isNotBlank() && !spareKeyStatus.isLimitReached)
+        val canProceed = remember(editMainKeyInput, editSpareKeyInput, apiKey, spareApiKey, isModelChanged, hasQuotaOnCurrentKeys) {
             val mainChangedAndValid = editMainKeyInput.trim().isNotBlank() && editMainKeyInput.trim() != apiKey.trim()
             val spareChangedAndValid = editSpareKeyInput.trim().isNotBlank() && editSpareKeyInput.trim() != spareApiKey.trim()
-            mainChangedAndValid || spareChangedAndValid
+            mainChangedAndValid || spareChangedAndValid || (isModelChanged && hasQuotaOnCurrentKeys)
         }
 
         AlertDialog(
             onDismissRequest = { /* Prevent dismiss */ },
             title = { 
-                Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ ($selectedModelKey)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
+                Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ ($currentDialogModel)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
             },
             text = {
                 Column(
@@ -2530,8 +2645,16 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD - $selectedModelKey) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် Settings ထဲက Main API Key (သို့မဟုတ်) Spare API Key အသစ် လဲလှယ်ထည့်သွင်းပေးပါ (အချိန်ကုန်ဆုံးပါက $rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို အလိုအလျောက် Auto-Save လုပ်ပေးပါမည်)။",
+                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD - $currentDialogModel) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် အခြား Gemini Model တစ်ခုသို့ ပြောင်းလဲအသုံးပြုနိုင်သလို (သို့မဟုတ်) Main API Key / Spare API Key အသစ် လဲလှယ်ထည့်သွင်းပေးနိုင်ပါသည် ($rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို Auto-Save လုပ်ပေးပါမည်)။",
                         style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    // Model Selection Section
+                    DropdownSection(
+                        title = "Gemini Model ပြောင်းလဲရန်",
+                        options = modelOptions.map { it.second },
+                        selectedOption = modelKeyToDisplay(dialogSelectedModelKey),
+                        onOptionSelected = { dialogSelectedModelKey = modelDisplayToKey(it) }
                     )
 
                     // Main Key Section
@@ -2640,12 +2763,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         val trimmedSpare = editSpareKeyInput.trim()
                         
                         // Save both updated keys directly to settings / preferences
-                        apiKey = trimmedMain
-                        mainKeyEnabled = true
-                        sharedPrefs.edit()
-                            .putString("gemini_api_key", trimmedMain)
-                            .putBoolean("gemini_main_key_enabled", true)
-                            .apply()
+                        if (trimmedMain.isNotBlank()) {
+                            apiKey = trimmedMain
+                            mainKeyEnabled = true
+                            sharedPrefs.edit()
+                                .putString("gemini_api_key", trimmedMain)
+                                .putBoolean("gemini_main_key_enabled", true)
+                                .apply()
+                        }
                         
                         if (trimmedSpare.isNotBlank()) {
                             val updatedSlots = spareKeySlots.toMutableList()
@@ -2656,18 +2781,32 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             }
                             saveSpareKeySlots(updatedSlots)
                         }
+
+                        val isModelSwitched = dialogSelectedModelKey != (activeRunningModel.ifBlank { selectedModelKey })
+                        if (isModelSwitched) {
+                            selectedModelKey = dialogSelectedModelKey
+                            activeRunningModel = dialogSelectedModelKey
+                            sharedPrefs.edit().putString("gemini_model", dialogSelectedModelKey).apply()
+                        }
                         
                         // Decide which key to feed into active generation channel
                         val nextKeyToUse = when {
                             trimmedSpare.isNotBlank() && trimmedSpare != spareApiKey.trim() -> trimmedSpare
                             trimmedMain.isNotBlank() && trimmedMain != apiKey.trim() -> trimmedMain
                             trimmedSpare.isNotBlank() && !spareKeyStatus.isLimitReached -> trimmedSpare
+                            !mainKeyStatus.isLimitReached -> trimmedMain
                             else -> trimmedMain
                         }
 
-                        if (nextKeyToUse.isNotBlank()) {
+                        val messageToSend = if (isModelSwitched) {
+                            "MODEL:$dialogSelectedModelKey:$nextKeyToUse"
+                        } else {
+                            nextKeyToUse
+                        }
+
+                        if (nextKeyToUse.isNotBlank() || isModelSwitched) {
                             coroutineScope.launch {
-                                activeNewKeyChannel?.send(nextKeyToUse)
+                                activeNewKeyChannel?.send(messageToSend)
                             }
                             showRpdKeyDialog = false
                         }

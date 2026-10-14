@@ -178,7 +178,7 @@ class GeminiApiClient(private val context: Context) {
         val initialPrimaryKey = initialPrimaryEntry.key
 
         try {
-            val actualModelName = getModelName(modelName)
+            var actualModelName = getModelName(modelName)
             var finalGeminiFileUri: String
             var durationMs = 30000L // Default fallback
             
@@ -315,12 +315,16 @@ class GeminiApiClient(private val context: Context) {
                 send(GenerationUpdate.Progress(0.01f))
 
                 // User setting: Start uploading spare keys (parallel keys) 15 seconds after Primary Key starts uploading
-                val candidateSpareKeys = activeKeyQueue.filter { it.isSpare }
-                    .filter { entry ->
-                        val used = if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
-                        !rpdEnabled || used < rpdLimit
-                    }
-                    .take(if (parallelKeyCount > 1) parallelKeyCount - 1 else 1)
+                val pendingPartsCount = specificPartsToGenerate?.size ?: partsCount.toInt().coerceAtLeast(1)
+                val targetParallelCount = minOf(parallelKeyCount, pendingPartsCount)
+                val candidateSpareKeys = if (targetParallelCount > 1) {
+                    activeKeyQueue.filter { it.key != initialPrimaryKey && it.isSpare }
+                        .filter { entry ->
+                            val used = if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
+                            !rpdEnabled || used < rpdLimit
+                        }
+                        .take(targetParallelCount - 1)
+                } else emptyList()
 
                 if (candidateSpareKeys.isNotEmpty()) {
                     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
@@ -697,20 +701,73 @@ class GeminiApiClient(private val context: Context) {
                             send(GenerationUpdate.RequireNewKeyForRpd(emptyList(), rpdLimit))
                             val userSuppliedKey = newKeyChannel.receive().trim()
                             if (userSuppliedKey.isNotBlank()) {
-                                val newStatus = RpdTracker.getStatus(context, userSuppliedKey, rpdLimit, actualModelName)
-                                usedCountByKey[userSuppliedKey] = newStatus.usedCount
-                                if (newStatus.usedCount >= rpdLimit) {
-                                    send(GenerationUpdate.Log("⚠️ ထည့်သွင်းလိုက်သော API Key အသစ်သည်လည်း ယနေ့အတွက် RPD Limit ($actualModelName: ${newStatus.usedCount}/$rpdLimit) ပြည့်နေပြီးသား ဖြစ်နေပါသည်။ နောက်ထပ် Key အသစ် ထပ်မံတောင်းခံပါမည်..."))
-                                    continue
+                                val (incomingModel, keyToUse) = if (userSuppliedKey.startsWith("MODEL:")) {
+                                    val parts = userSuppliedKey.removePrefix("MODEL:").split(":", limit = 2)
+                                    val m = parts.getOrNull(0)?.trim() ?: ""
+                                    val k = parts.getOrNull(1)?.trim() ?: ""
+                                    m to k
+                                } else {
+                                    "" to userSuppliedKey
                                 }
-                                val newEntryLabel = "Spare Key #${activeKeyQueue.count { it.isSpare } + 1}"
-                                send(GenerationUpdate.Log("🔑 API Key အသစ် ($newEntryLabel) ရရှိပါပြီ။ Media ဖိုင်အား စစ်ဆေး/Upload တင်နေပါသည်..."))
-                                activeGeminiFileUri = ensureMediaUploadedForKey(userSuppliedKey, newEntryLabel)
-                                activeKeyQueue.add(ActiveKeyEntry(newEntryLabel, userSuppliedKey, isSpare = true))
-                                currentKeyIndex = activeKeyQueue.lastIndex
-                                activeApiKey = userSuppliedKey
-                                activeKeyLabel = newEntryLabel
-                                hasSwitchedToSpare = true
+
+                                if (incomingModel.isNotBlank()) {
+                                    val newResolvedModel = getModelName(incomingModel)
+                                    if (newResolvedModel != actualModelName) {
+                                        actualModelName = newResolvedModel
+                                        send(GenerationUpdate.Log("🔄 Model အား $actualModelName သို့ ပြောင်းလဲအသုံးပြုပါမည်။"))
+                                        usedCountByKey.clear()
+                                    }
+                                }
+
+                                val targetKey = keyToUse.ifBlank { activeApiKey }
+                                val existingQueueEntry = activeKeyQueue.firstOrNull { it.key == targetKey }
+                                if (existingQueueEntry != null) {
+                                    val newStatus = RpdTracker.getStatus(context, targetKey, rpdLimit, actualModelName)
+                                    usedCountByKey[targetKey] = newStatus.usedCount
+                                    if (newStatus.usedCount >= rpdLimit) {
+                                        send(GenerationUpdate.Log("⚠️ $actualModelName အတွက် ${existingQueueEntry.label} သည် RPD Limit (${newStatus.usedCount}/$rpdLimit) ပြည့်နေပါသည်။ နောက်ထပ် Key/Model အသစ် လိုအပ်ပါသည်..."))
+                                        continue
+                                    }
+                                    activeApiKey = targetKey
+                                    activeKeyLabel = existingQueueEntry.label
+                                    hasSwitchedToSpare = existingQueueEntry.isSpare
+                                    currentKeyIndex = activeKeyQueue.indexOf(existingQueueEntry)
+                                    activeGeminiFileUri = uploadedFileUriByKey[targetKey] ?: ensureMediaUploadedForKey(targetKey, activeKeyLabel)
+                                    send(GenerationUpdate.Log("🔑 ${existingQueueEntry.label} ဖြင့် $actualModelName တွင် ဆက်လက်လုပ်ဆောင်ပါမည် (RPD: ${newStatus.usedCount}/$rpdLimit)။"))
+                                } else if (targetKey.isNotBlank()) {
+                                    val newStatus = RpdTracker.getStatus(context, targetKey, rpdLimit, actualModelName)
+                                    usedCountByKey[targetKey] = newStatus.usedCount
+                                    if (newStatus.usedCount >= rpdLimit) {
+                                        send(GenerationUpdate.Log("⚠️ ထည့်သွင်းလိုက်သော API Key အသစ်သည်လည်း ယနေ့အတွက် RPD Limit ($actualModelName: ${newStatus.usedCount}/$rpdLimit) ပြည့်နေပြီးသား ဖြစ်နေပါသည်။ နောက်ထပ် Key အသစ် ထပ်မံတောင်းခံပါမည်..."))
+                                        continue
+                                    }
+                                    val newEntryLabel = "Spare Key #${activeKeyQueue.count { it.isSpare } + 1}"
+                                    send(GenerationUpdate.Log("🔑 API Key အသစ် ($newEntryLabel) ရရှိပါပြီ။ Media ဖိုင်အား စစ်ဆေး/Upload တင်နေပါသည်..."))
+                                    activeGeminiFileUri = ensureMediaUploadedForKey(targetKey, newEntryLabel)
+                                    activeKeyQueue.add(ActiveKeyEntry(newEntryLabel, targetKey, isSpare = true))
+                                    currentKeyIndex = activeKeyQueue.lastIndex
+                                    activeApiKey = targetKey
+                                    activeKeyLabel = newEntryLabel
+                                    hasSwitchedToSpare = true
+                                } else {
+                                    val availableQueueEntry = activeKeyQueue.firstOrNull { entry ->
+                                        val st = RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName)
+                                        st.usedCount < rpdLimit
+                                    }
+                                    if (availableQueueEntry != null) {
+                                        val st = RpdTracker.getStatus(context, availableQueueEntry.key, rpdLimit, actualModelName)
+                                        usedCountByKey[availableQueueEntry.key] = st.usedCount
+                                        activeApiKey = availableQueueEntry.key
+                                        activeKeyLabel = availableQueueEntry.label
+                                        hasSwitchedToSpare = availableQueueEntry.isSpare
+                                        currentKeyIndex = activeKeyQueue.indexOf(availableQueueEntry)
+                                        activeGeminiFileUri = uploadedFileUriByKey[availableQueueEntry.key] ?: ensureMediaUploadedForKey(availableQueueEntry.key, activeKeyLabel)
+                                        send(GenerationUpdate.Log("🔑 ${availableQueueEntry.label} ဖြင့် $actualModelName တွင် ဆက်လက်လုပ်ဆောင်ပါမည် (RPD: ${st.usedCount}/$rpdLimit)။"))
+                                    } else {
+                                        send(GenerationUpdate.Log("⚠️ $actualModelName အတွက် Keys အားလုံး RPD ပြည့်နေပါသည်။ Key အသစ် လိုအပ်ပါသည်..."))
+                                        continue
+                                    }
+                                }
                             } else {
                                 rpdExhaustedAndStoppedByUser = true
                                 throw kotlinx.coroutines.CancellationException("RPD_EXHAUSTED_STOP")
