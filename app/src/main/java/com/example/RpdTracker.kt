@@ -13,13 +13,31 @@ data class RpdStatus(
     val isLimitReached: Boolean,
     val resetTimeDescription: String,
     val hoursUntilReset: Long,
-    val minutesUntilReset: Long
+    val minutesUntilReset: Long,
+    val modelName: String = ""
 )
 
 object RpdTracker {
     private const val PREFS_NAME = "rpd_tracker_cache"
     private const val PACIFIC_TIMEZONE_ID = "America/Los_Angeles"
     const val DEFAULT_RPD_LIMIT = 20
+
+    /**
+     * Map any UI display string or raw model ID to a canonical model ID without modifying model IDs.
+     */
+    fun normalizeModel(model: String): String {
+        val trimmed = model.trim().lowercase(Locale.US)
+        return when {
+            trimmed.contains("3.7") -> "gemini-3.7-flash"
+            trimmed.contains("3.6") -> "gemini-3.6-flash"
+            trimmed.contains("3.5-flash-lite") || (trimmed.contains("3.5") && trimmed.contains("lite")) -> "gemini-3.5-flash-lite"
+            trimmed.contains("3.5") -> "gemini-3.5-flash"
+            trimmed.contains("3.1") -> "gemini-3.1-flash-lite"
+            trimmed.startsWith("gemini-") -> trimmed
+            trimmed.isBlank() -> "default"
+            else -> trimmed
+        }
+    }
 
     /**
      * Get the current date in US Pacific Time (YYYY-MM-DD).
@@ -49,11 +67,24 @@ object RpdTracker {
         }
     }
 
+    private fun getStorageKey(keyHash: String, normModel: String): String {
+        return if (normModel == "default" || normModel.isBlank()) {
+            keyHash
+        } else {
+            "${keyHash}_${normModel}"
+        }
+    }
+
     /**
-     * Get the current RPD usage and status for an API key.
+     * Get the current RPD usage and status for an API key and model.
      * Automatically resets to 0 if the US Pacific date has changed!
      */
-    fun getStatus(context: Context, apiKey: String, limit: Int = DEFAULT_RPD_LIMIT): RpdStatus {
+    fun getStatus(
+        context: Context,
+        apiKey: String,
+        limit: Int = DEFAULT_RPD_LIMIT,
+        model: String = ""
+    ): RpdStatus {
         val trimmed = apiKey.trim()
         val tz = TimeZone.getTimeZone(PACIFIC_TIMEZONE_ID)
         val nowCal = Calendar.getInstance(tz)
@@ -80,6 +111,8 @@ object RpdTracker {
             "မွန်းလွဲ ၂:၃၀ PM (MMT) / ၃:၀၀ PM (ICT) [PST]"
         }
 
+        val normModel = normalizeModel(model)
+
         if (trimmed.isEmpty()) {
             return RpdStatus(
                 usedCount = 0,
@@ -88,7 +121,8 @@ object RpdTracker {
                 isLimitReached = false,
                 resetTimeDescription = resetDescription,
                 hoursUntilReset = hoursUntilReset,
-                minutesUntilReset = minutesUntilReset
+                minutesUntilReset = minutesUntilReset,
+                modelName = normModel
             )
         }
 
@@ -96,11 +130,17 @@ object RpdTracker {
         val keyHash = hashKey(trimmed)
         val todayDate = getPacificDateKey()
 
-        val savedDate = prefs.getString("date_$keyHash", null)
+        val subKey = getStorageKey(keyHash, normModel)
+        val savedDate = prefs.getString("date_$subKey", null)
         val used = if (savedDate == todayDate) {
-            prefs.getInt("count_$keyHash", 0)
+            prefs.getInt("count_$subKey", 0)
         } else {
-            0 // Automatically reset when Pacific date changes!
+            // Fallback for legacy key storage if model was default or first transition
+            if (normModel == "default" && prefs.getString("date_$keyHash", null) == todayDate) {
+                prefs.getInt("count_$keyHash", 0)
+            } else {
+                0 // Automatically reset when Pacific date changes!
+            }
         }
 
         val remaining = (limit - used).coerceAtLeast(0)
@@ -113,31 +153,34 @@ object RpdTracker {
             isLimitReached = isReached,
             resetTimeDescription = resetDescription,
             hoursUntilReset = hoursUntilReset,
-            minutesUntilReset = minutesUntilReset
+            minutesUntilReset = minutesUntilReset,
+            modelName = normModel
         )
     }
 
     /**
-     * Record an API call for a key. Increments usage count for today's Pacific Date.
+     * Record an API call for a key and model. Increments usage count for today's Pacific Date.
      */
     @Synchronized
-    fun recordCall(context: Context, apiKey: String): Int {
+    fun recordCall(context: Context, apiKey: String, model: String = ""): Int {
         val trimmed = apiKey.trim()
         if (trimmed.isEmpty()) return 0
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val keyHash = hashKey(trimmed)
+        val normModel = normalizeModel(model)
         val todayDate = getPacificDateKey()
 
-        val savedDate = prefs.getString("date_$keyHash", null)
+        val subKey = getStorageKey(keyHash, normModel)
+        val savedDate = prefs.getString("date_$subKey", null)
         val currentCount = if (savedDate == todayDate) {
-            prefs.getInt("count_$keyHash", 0)
+            prefs.getInt("count_$subKey", 0)
         } else {
             0
         }
         val newCount = currentCount + 1
         prefs.edit()
-            .putString("date_$keyHash", todayDate)
-            .putInt("count_$keyHash", newCount)
+            .putString("date_$subKey", todayDate)
+            .putInt("count_$subKey", newCount)
             .commit()
         return newCount
     }

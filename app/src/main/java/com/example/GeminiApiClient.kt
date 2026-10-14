@@ -184,6 +184,85 @@ class GeminiApiClient(private val context: Context) {
             
             send(GenerationUpdate.Log("AI Engine: $actualModelName"))
 
+            val uploadedFileUriByKey = java.util.concurrent.ConcurrentHashMap<String, String>()
+            val uploadMutexByKey = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+
+            suspend fun ensureMediaUploadedForKey(targetKey: String, targetLabel: String): String {
+                val perKeyMutex = uploadMutexByKey.getOrPut(targetKey) { Mutex() }
+                return perKeyMutex.withLock {
+                    val existingUploaded = uploadedFileUriByKey[targetKey]
+                    if (!existingUploaded.isNullOrBlank()) {
+                        return@withLock existingUploaded
+                    }
+                    if (mediaUri != null) {
+                        val cachedForTarget = GeminiFileKeyCache.getCachedFile(context, mediaUri, targetKey)
+                        if (cachedForTarget != null) {
+                            send(GenerationUpdate.Log("✅ $targetLabel အတွက် သိမ်းဆည်းထားသော Media ဖိုင်အား ပြန်လည်အသုံးပြုပါမည်။"))
+                            uploadedFileUriByKey[targetKey] = cachedForTarget.first
+                            return@withLock cachedForTarget.first
+                        } else {
+                            val maxUploadAttempts = 3
+                            var lastUploadError = ""
+                            var targetFileUriInfo: Pair<String, String>? = null
+
+                            for (attempt in 1..maxUploadAttempts) {
+                                val attemptSuffix = if (attempt > 1) " (ကြိုးစားမှု $attempt/$maxUploadAttempts)" else ""
+                                send(GenerationUpdate.Log("📤 $targetLabel ဖြင့် Media ဖိုင်အား ဆာဗာသို့ Upload တင်နေပါသည်$attemptSuffix..."))
+                                val uploadResult = uploadFile(targetKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
+                                when (uploadResult) {
+                                    is UploadResult.Success -> {
+                                        val candidateUriInfo = Pair(uploadResult.uri, uploadResult.name)
+                                        if (mediaMimeType?.startsWith("video") == true) {
+                                            send(GenerationUpdate.Log("[$targetLabel] Waiting for Gemini server to process video..."))
+                                            var isActive = false
+                                            var processFailed = false
+                                            while (!isActive && !processFailed) {
+                                                val state = checkFileState(targetKey, candidateUriInfo.second)
+                                                if (state == "ACTIVE") {
+                                                    isActive = true
+                                                } else if (state == "FAILED") {
+                                                    processFailed = true
+                                                    lastUploadError = "Gemini server failed to process video with $targetLabel"
+                                                } else {
+                                                    delay(3000)
+                                                }
+                                            }
+                                            if (isActive) {
+                                                targetFileUriInfo = candidateUriInfo
+                                                break
+                                            }
+                                        } else {
+                                            targetFileUriInfo = candidateUriInfo
+                                            break
+                                        }
+                                    }
+                                    is UploadResult.Failure -> {
+                                        lastUploadError = uploadResult.errorDetail
+                                    }
+                                }
+
+                                if (attempt < maxUploadAttempts) {
+                                    val delaySec = attempt * 3
+                                    send(GenerationUpdate.Log("⚠️ $targetLabel ဖြင့် Media Upload မအောင်မြင်ပါ ($lastUploadError)။ $delaySec စက္ကန့်အကြာတွင် ပြန်လည်ကြိုးစားပါမည်..."))
+                                    delay(delaySec * 1000L)
+                                }
+                            }
+
+                            if (targetFileUriInfo == null) {
+                                send(GenerationUpdate.Error("$targetLabel ဖြင့် Media Upload $maxUploadAttempts ကြိမ် ပြန်လည်ကြိုးစားသော်လည်း မအောင်မြင်ပါ:\n$lastUploadError"))
+                                throw Exception("$targetLabel upload failed after $maxUploadAttempts attempts: $lastUploadError")
+                            }
+
+                            GeminiFileKeyCache.saveCachedFile(context, mediaUri, targetKey, targetFileUriInfo.first, targetFileUriInfo.second)
+                            uploadedFileUriByKey[targetKey] = targetFileUriInfo.first
+                            send(GenerationUpdate.Log("✅ $targetLabel ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
+                            return@withLock targetFileUriInfo.first
+                        }
+                    }
+                    uploadedFileUriByKey[initialPrimaryKey] ?: ""
+                }
+            }
+
             // Verify if existingGeminiFileUri is actually valid and accessible with current initialPrimaryKey
             var isExistingUriAccessible = false
             if (existingGeminiFileUri != null && existingDurationMs != null) {
@@ -234,6 +313,30 @@ class GeminiApiClient(private val context: Context) {
                 }
                 send(GenerationUpdate.Log("[0%] Preparing media upload to Gemini (${initialPrimaryEntry.label})..."))
                 send(GenerationUpdate.Progress(0.01f))
+
+                // User setting: Start uploading spare keys (parallel keys) 15 seconds after Primary Key starts uploading
+                val candidateSpareKeys = activeKeyQueue.filter { it.isSpare }
+                    .filter { entry ->
+                        val used = if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
+                        !rpdEnabled || used < rpdLimit
+                    }
+                    .take(if (parallelKeyCount > 1) parallelKeyCount - 1 else 1)
+
+                if (candidateSpareKeys.isNotEmpty()) {
+                    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+                        delay(15_000L) // Exactly 15 seconds after Primary Key upload started
+                        send(GenerationUpdate.Log("⏱️ Primary Key upload စတင်ပြီး 15s ပြည့်သဖြင့် Spare/Parallel Key (${candidateSpareKeys.size}) ခု [${candidateSpareKeys.joinToString(", ") { it.label }}] အား နောက်ကွယ်မှ စတင် Upload တင်နေပါသည်..."))
+                        candidateSpareKeys.forEach { entry ->
+                            launch {
+                                try {
+                                    ensureMediaUploadedForKey(entry.key, entry.label)
+                                } catch (_: Exception) {
+                                    // Background pre-upload failure will be retried on demand
+                                }
+                            }
+                        }
+                    }
+                }
                 
                 var lastLogPercent = -1
                 val uploadResult = uploadFile(initialPrimaryKey, mediaUri!!, mediaMimeType ?: "video/mp4") { ratio, uploadedBytes, totalBytes ->
@@ -449,11 +552,11 @@ class GeminiApiClient(private val context: Context) {
 
             send(GenerationUpdate.Log("Starting generation with $rpm RPM (Pipelined Parallel mode)..."))
             if (rpdEnabled) {
-                val firstStatus = RpdTracker.getStatus(context, initialPrimaryKey, rpdLimit)
+                val firstStatus = RpdTracker.getStatus(context, initialPrimaryKey, rpdLimit, actualModelName)
                 send(GenerationUpdate.Log("ℹ️ Daily Quota Reset: ${firstStatus.resetTimeDescription} (${firstStatus.hoursUntilReset}h ${firstStatus.minutesUntilReset}m until midnight PST/PDT)."))
                 activeKeyQueue.forEach { entry ->
-                    val st = RpdTracker.getStatus(context, entry.key, rpdLimit)
-                    send(GenerationUpdate.Log("ℹ️ RPD Cache [${entry.label}]: ${st.usedCount}/$rpdLimit requests used today (${st.remainingCount} available)."))
+                    val st = RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName)
+                    send(GenerationUpdate.Log("ℹ️ RPD Cache [${entry.label}] ($actualModelName): ${st.usedCount}/$rpdLimit requests used today (${st.remainingCount} available)."))
                 }
             }
 
@@ -509,13 +612,10 @@ class GeminiApiClient(private val context: Context) {
             var activeApiKey = initialPrimaryKey
             var activeGeminiFileUri = finalGeminiFileUri
             var activeKeyLabel = initialPrimaryEntry.label
-            val uploadedFileUriByKey = java.util.concurrent.ConcurrentHashMap<String, String>().apply {
-                put(initialPrimaryKey, finalGeminiFileUri)
-            }
-            val uploadMutexByKey = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
+            uploadedFileUriByKey[initialPrimaryKey] = finalGeminiFileUri
             val usedCountByKey = mutableMapOf<String, Int>()
             activeKeyQueue.forEach { entry ->
-                usedCountByKey[entry.key] = if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                usedCountByKey[entry.key] = if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
             }
 
             suspend fun acquireRateLimitSlot() {
@@ -542,92 +642,16 @@ class GeminiApiClient(private val context: Context) {
 
             var rpdExhaustedAndStoppedByUser = false
 
-            suspend fun ensureMediaUploadedForKey(targetKey: String, targetLabel: String): String {
-                val perKeyMutex = uploadMutexByKey.getOrPut(targetKey) { Mutex() }
-                return perKeyMutex.withLock {
-                    val existingUploaded = uploadedFileUriByKey[targetKey]
-                    if (!existingUploaded.isNullOrBlank()) {
-                        return@withLock existingUploaded
-                    }
-                    if (mediaUri != null) {
-                        val cachedForTarget = GeminiFileKeyCache.getCachedFile(context, mediaUri, targetKey)
-                        if (cachedForTarget != null) {
-                            send(GenerationUpdate.Log("✅ $targetLabel အတွက် သိမ်းဆည်းထားသော Media ဖိုင်အား ပြန်လည်အသုံးပြုပါမည်။"))
-                            uploadedFileUriByKey[targetKey] = cachedForTarget.first
-                            return@withLock cachedForTarget.first
-                        } else {
-                            val maxUploadAttempts = 3
-                            var lastUploadError = ""
-                            var targetFileUriInfo: Pair<String, String>? = null
-
-                            for (attempt in 1..maxUploadAttempts) {
-                                val attemptSuffix = if (attempt > 1) " (ကြိုးစားမှု $attempt/$maxUploadAttempts)" else ""
-                                send(GenerationUpdate.Log("📤 $targetLabel ဖြင့် Media ဖိုင်အား ဆာဗာသို့ Upload တင်နေပါသည်$attemptSuffix..."))
-                                val uploadResult = uploadFile(targetKey, mediaUri, mediaMimeType ?: "video/mp4") { _, _, _ -> }
-                                when (uploadResult) {
-                                    is UploadResult.Success -> {
-                                        val candidateUriInfo = Pair(uploadResult.uri, uploadResult.name)
-                                        if (mediaMimeType?.startsWith("video") == true) {
-                                            send(GenerationUpdate.Log("[$targetLabel] Waiting for Gemini server to process video..."))
-                                            var isActive = false
-                                            var processFailed = false
-                                            while (!isActive && !processFailed) {
-                                                val state = checkFileState(targetKey, candidateUriInfo.second)
-                                                if (state == "ACTIVE") {
-                                                    isActive = true
-                                                } else if (state == "FAILED") {
-                                                    processFailed = true
-                                                    lastUploadError = "Gemini server failed to process video with $targetLabel"
-                                                } else {
-                                                    delay(3000)
-                                                }
-                                            }
-                                            if (isActive) {
-                                                targetFileUriInfo = candidateUriInfo
-                                                break
-                                            }
-                                        } else {
-                                            targetFileUriInfo = candidateUriInfo
-                                            break
-                                        }
-                                    }
-                                    is UploadResult.Failure -> {
-                                        lastUploadError = uploadResult.errorDetail
-                                    }
-                                }
-
-                                if (attempt < maxUploadAttempts) {
-                                    val delaySec = attempt * 3
-                                    send(GenerationUpdate.Log("⚠️ $targetLabel ဖြင့် Media Upload မအောင်မြင်ပါ ($lastUploadError)။ $delaySec စက္ကန့်အကြာတွင် ပြန်လည်ကြိုးစားပါမည်..."))
-                                    delay(delaySec * 1000L)
-                                }
-                            }
-
-                            if (targetFileUriInfo == null) {
-                                send(GenerationUpdate.Error("$targetLabel ဖြင့် Media Upload $maxUploadAttempts ကြိမ် ပြန်လည်ကြိုးစားသော်လည်း မအောင်မြင်ပါ:\n$lastUploadError"))
-                                throw Exception("$targetLabel upload failed after $maxUploadAttempts attempts: $lastUploadError")
-                            }
-
-                            GeminiFileKeyCache.saveCachedFile(context, mediaUri, targetKey, targetFileUriInfo.first, targetFileUriInfo.second)
-                            uploadedFileUriByKey[targetKey] = targetFileUriInfo.first
-                            send(GenerationUpdate.Log("✅ $targetLabel ဖြင့် Media ဖိုင် အဆင်သင့်ဖြစ်ပါပြီ။"))
-                            return@withLock targetFileUriInfo.first
-                        }
-                    }
-                    activeGeminiFileUri
-                }
-            }
-
             suspend fun getOrSwitchKeyAndFile(): ReservedKeySlot {
                 return keyMutex.withLock {
                     var reservedSlot: ReservedKeySlot? = null
                     while (reservedSlot == null) {
                         if (rpdEnabled) {
-                            var curUsed = usedCountByKey[activeApiKey] ?: RpdTracker.getStatus(context, activeApiKey, rpdLimit).usedCount
+                            var curUsed = usedCountByKey[activeApiKey] ?: RpdTracker.getStatus(context, activeApiKey, rpdLimit, actualModelName).usedCount
                             usedCountByKey[activeApiKey] = curUsed
                             if (curUsed >= rpdLimit) {
                                 val availableIdx = activeKeyQueue.indexOfFirst { entry ->
-                                    val u = usedCountByKey[entry.key] ?: RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount
+                                    val u = usedCountByKey[entry.key] ?: RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount
                                     usedCountByKey[entry.key] = u
                                     u < rpdLimit
                                 }
@@ -636,7 +660,7 @@ class GeminiApiClient(private val context: Context) {
                                     currentKeyIndex = availableIdx
                                     val nextEntry = activeKeyQueue[availableIdx]
                                     val nextUsed = usedCountByKey[nextEntry.key] ?: 0
-                                    send(GenerationUpdate.Log("⚠️ $exhaustedLabel RPD limit ($rpdLimit/$rpdLimit) ပြည့်သွားပါပြီ။"))
+                                    send(GenerationUpdate.Log("⚠️ $exhaustedLabel RPD limit ($actualModelName: $rpdLimit/$rpdLimit) ပြည့်သွားပါပြီ။"))
                                     send(GenerationUpdate.Log("🔄 ${nextEntry.label} သို့ အလိုအလျောက် ပြောင်းလဲအသုံးပြုနေပါသည်..."))
                                     activeGeminiFileUri = ensureMediaUploadedForKey(nextEntry.key, nextEntry.label)
                                     activeApiKey = nextEntry.key
@@ -654,7 +678,7 @@ class GeminiApiClient(private val context: Context) {
 
                         val currentKeyUsed = usedCountByKey[activeApiKey] ?: 0
                         val allKeysExhausted = rpdEnabled && activeKeyQueue.all { entry ->
-                            val u = usedCountByKey[entry.key] ?: RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount
+                            val u = usedCountByKey[entry.key] ?: RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount
                             usedCountByKey[entry.key] = u
                             u >= rpdLimit
                         }
@@ -669,14 +693,14 @@ class GeminiApiClient(private val context: Context) {
                                 send(GenerationUpdate.Log("✅ လက်ရှိ Processing requests အားလုံး response ရရှိပြီးစီးပါပြီ။"))
                             }
 
-                            send(GenerationUpdate.Log("⚠️ ဖွင့်ထားသော API Keys အားလုံး၏ RPD Limit ($rpdLimit/$rpdLimit ကြိမ်) ပြည့်သွားပါပြီ။ API Key အသစ် တောင်းခံနေပါသည်..."))
+                            send(GenerationUpdate.Log("⚠️ ဖွင့်ထားသော API Keys အားလုံး၏ RPD Limit ($actualModelName: $rpdLimit/$rpdLimit ကြိမ်) ပြည့်သွားပါပြီ။ API Key အသစ် တောင်းခံနေပါသည်..."))
                             send(GenerationUpdate.RequireNewKeyForRpd(emptyList(), rpdLimit))
                             val userSuppliedKey = newKeyChannel.receive().trim()
                             if (userSuppliedKey.isNotBlank()) {
-                                val newStatus = RpdTracker.getStatus(context, userSuppliedKey, rpdLimit)
+                                val newStatus = RpdTracker.getStatus(context, userSuppliedKey, rpdLimit, actualModelName)
                                 usedCountByKey[userSuppliedKey] = newStatus.usedCount
                                 if (newStatus.usedCount >= rpdLimit) {
-                                    send(GenerationUpdate.Log("⚠️ ထည့်သွင်းလိုက်သော API Key အသစ်သည်လည်း ယနေ့အတွက် RPD Limit (${newStatus.usedCount}/$rpdLimit) ပြည့်နေပြီးသား ဖြစ်နေပါသည်။ နောက်ထပ် Key အသစ် ထပ်မံတောင်းခံပါမည်..."))
+                                    send(GenerationUpdate.Log("⚠️ ထည့်သွင်းလိုက်သော API Key အသစ်သည်လည်း ယနေ့အတွက် RPD Limit ($actualModelName: ${newStatus.usedCount}/$rpdLimit) ပြည့်နေပြီးသား ဖြစ်နေပါသည်။ နောက်ထပ် Key အသစ် ထပ်မံတောင်းခံပါမည်..."))
                                     continue
                                 }
                                 val newEntryLabel = "Spare Key #${activeKeyQueue.count { it.isSpare } + 1}"
@@ -696,7 +720,7 @@ class GeminiApiClient(private val context: Context) {
                         val updatedKeyCount = (usedCountByKey[activeApiKey] ?: 0) + 1
                         usedCountByKey[activeApiKey] = updatedKeyCount
                         if (rpdEnabled) {
-                            RpdTracker.recordCall(context, activeApiKey)
+                            RpdTracker.recordCall(context, activeApiKey, actualModelName)
                         }
 
                         if (!hasSwitchedToSpare) {
@@ -754,7 +778,7 @@ class GeminiApiClient(private val context: Context) {
                 val candidateSpareKeys = keyMutex.withLock {
                     activeKeyQueue.filter { it.isSpare }
                         .filter { entry ->
-                            val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                            val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
                             !rpdEnabled || used < rpdLimit
                         }
                         .take(parallelKeyCount - 1)
@@ -1309,7 +1333,7 @@ class GeminiApiClient(private val context: Context) {
                     val requestedParallelKeys = parallelKeyCount.coerceIn(1, 10)
                     val eligibleInitialKeys = keyMutex.withLock {
                         activeKeyQueue.filter { entry ->
-                            val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                            val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
                             usedCountByKey[entry.key] = used
                             !rpdEnabled || used < rpdLimit
                         }
@@ -1325,7 +1349,7 @@ class GeminiApiClient(private val context: Context) {
 
                     suspend fun tryReserveSlotForSpecificKey(entry: ActiveKeyEntry): ReservedKeySlot? {
                         return keyMutex.withLock {
-                            val curUsed = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                            val curUsed = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
                             usedCountByKey[entry.key] = curUsed
                             if (rpdEnabled && curUsed >= rpdLimit) {
                                 return@withLock null
@@ -1333,7 +1357,7 @@ class GeminiApiClient(private val context: Context) {
                             val updatedKeyCount = curUsed + 1
                             usedCountByKey[entry.key] = updatedKeyCount
                             if (rpdEnabled) {
-                                RpdTracker.recordCall(context, entry.key)
+                                RpdTracker.recordCall(context, entry.key, actualModelName)
                             }
                             if (!entry.isSpare) {
                                 mainTotalCalls = updatedKeyCount
@@ -1358,7 +1382,7 @@ class GeminiApiClient(private val context: Context) {
                         val candidate = keyMutex.withLock {
                             activeKeyQueue.firstOrNull { entry ->
                                 if (claimedKeySet.contains(entry.key)) return@firstOrNull false
-                                val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit).usedCount else 0
+                                val used = usedCountByKey[entry.key] ?: if (rpdEnabled) RpdTracker.getStatus(context, entry.key, rpdLimit, actualModelName).usedCount else 0
                                 usedCountByKey[entry.key] = used
                                 if (rpdEnabled && used >= rpdLimit) {
                                     claimedKeySet.add(entry.key)

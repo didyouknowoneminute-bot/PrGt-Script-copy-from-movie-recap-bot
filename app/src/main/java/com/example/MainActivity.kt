@@ -2508,8 +2508,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
             }
         }
 
-        val mainKeyStatus = remember(editMainKeyInput, rpdEnabled) { RpdTracker.getStatus(context, editMainKeyInput) }
-        val spareKeyStatus = remember(editSpareKeyInput, rpdEnabled) { RpdTracker.getStatus(context, editSpareKeyInput) }
+        val mainKeyStatus = remember(editMainKeyInput, rpdEnabled, selectedModelKey) { RpdTracker.getStatus(context, editMainKeyInput, model = selectedModelKey) }
+        val spareKeyStatus = remember(editSpareKeyInput, rpdEnabled, selectedModelKey) { RpdTracker.getStatus(context, editSpareKeyInput, model = selectedModelKey) }
 
         val canProceed = remember(editMainKeyInput, editSpareKeyInput, apiKey, spareApiKey) {
             val mainChangedAndValid = editMainKeyInput.trim().isNotBlank() && editMainKeyInput.trim() != apiKey.trim()
@@ -2520,7 +2520,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
         AlertDialog(
             onDismissRequest = { /* Prevent dismiss */ },
             title = { 
-                Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
+                Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ ($selectedModelKey)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
             },
             text = {
                 Column(
@@ -2530,7 +2530,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် Settings ထဲက Main API Key (သို့မဟုတ်) Spare API Key အသစ် လဲလှယ်ထည့်သွင်းပေးပါ (အချိန်ကုန်ဆုံးပါက $rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို အလိုအလျောက် Auto-Save လုပ်ပေးပါမည်)။",
+                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD - $selectedModelKey) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် Settings ထဲက Main API Key (သို့မဟုတ်) Spare API Key အသစ် လဲလှယ်ထည့်သွင်းပေးပါ (အချိန်ကုန်ဆုံးပါက $rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို အလိုအလျောက် Auto-Save လုပ်ပေးပါမည်)။",
                         style = MaterialTheme.typography.bodyMedium
                     )
 
@@ -2962,7 +2962,7 @@ fun SettingsDialog(
         onDismissRequest = onDismiss,
         title = {
             val context = LocalContext.current
-            val headerResetStatus = remember(rpdEnabled) { RpdTracker.getStatus(context, apiKey) }
+            val headerResetStatus = remember(rpdEnabled, selectedModel) { RpdTracker.getStatus(context, apiKey, model = selectedModel) }
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -3012,7 +3012,7 @@ fun SettingsDialog(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 val context = LocalContext.current
-                val mainKeyStatus = remember(apiKey, rpdEnabled) { RpdTracker.getStatus(context, apiKey) }
+                val mainKeyStatus = remember(apiKey, rpdEnabled, selectedModel) { RpdTracker.getStatus(context, apiKey, model = selectedModel) }
                 val allKeysEnabled = mainKeyEnabled && spareKeySlots.all { it.enabled }
 
                 // Master Switch: All API Keys ON/OFF
@@ -3115,7 +3115,7 @@ fun SettingsDialog(
                                         )
                                         Spacer(modifier = Modifier.width(6.dp))
                                         Text(
-                                            text = "RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ပြည့်သွားပါပြီ",
+                                            text = "RPD (${mainKeyStatus.modelName}): ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ပြည့်သွားပါပြီ",
                                             style = MaterialTheme.typography.bodySmall,
                                             fontWeight = FontWeight.Bold,
                                             color = MaterialTheme.colorScheme.onErrorContainer
@@ -3129,7 +3129,7 @@ fun SettingsDialog(
                                     modifier = Modifier.fillMaxWidth()
                                 ) {
                                     Text(
-                                        text = "RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
+                                        text = "RPD (${mainKeyStatus.modelName}): ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
                                         style = MaterialTheme.typography.bodySmall,
                                         fontWeight = FontWeight.SemiBold,
                                         color = MaterialTheme.colorScheme.primary,
@@ -3154,7 +3154,7 @@ fun SettingsDialog(
 
                 // Dynamic Spare API Key Slots (up to 19 Spare Keys => Total 20 Keys max)
                 spareKeySlots.forEachIndexed { index, slot ->
-                    val slotKeyStatus = remember(slot.key, rpdEnabled) { RpdTracker.getStatus(context, slot.key) }
+                    val slotKeyStatus = remember(slot.key, rpdEnabled, selectedModel) { RpdTracker.getStatus(context, slot.key, model = selectedModel) }
                     val keyDisplayNum = index + 2 // Key #2 .. Key #20
                     val spareNum = index + 1     // Spare #1 .. Spare #19
 
@@ -3241,7 +3241,7 @@ fun SettingsDialog(
                                             )
                                             Spacer(modifier = Modifier.width(6.dp))
                                             Text(
-                                                text = "RPD: ${slotKeyStatus.usedCount}/${slotKeyStatus.maxLimit} ပြည့်သွားပါပြီ",
+                                                text = "RPD (${slotKeyStatus.modelName}): ${slotKeyStatus.usedCount}/${slotKeyStatus.maxLimit} ပြည့်သွားပါပြီ",
                                                 style = MaterialTheme.typography.bodySmall,
                                                 fontWeight = FontWeight.Bold,
                                                 color = MaterialTheme.colorScheme.onErrorContainer
@@ -3255,7 +3255,7 @@ fun SettingsDialog(
                                         modifier = Modifier.fillMaxWidth()
                                     ) {
                                         Text(
-                                            text = "RPD: ${slotKeyStatus.usedCount}/${slotKeyStatus.maxLimit} ကြိမ် (Available: ${slotKeyStatus.remainingCount} ကြိမ်)",
+                                            text = "RPD (${slotKeyStatus.modelName}): ${slotKeyStatus.usedCount}/${slotKeyStatus.maxLimit} ကြိမ် (Available: ${slotKeyStatus.remainingCount} ကြိမ်)",
                                             style = MaterialTheme.typography.bodySmall,
                                             fontWeight = FontWeight.SemiBold,
                                             color = MaterialTheme.colorScheme.secondary,
