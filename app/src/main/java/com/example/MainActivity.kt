@@ -124,11 +124,12 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
     // Settings State
     val modelOptions = listOf(
-        "gemini-3.7-flash" to "Gemini 3.7 Flash (Hybrid Reasoning/နောက်ဆုံးထွက်)",
-        "gemini-3.6-flash" to "Gemini 3.6 Flash (Agentic)",
-        "gemini-3.5-flash" to "Gemini 3.5 Flash (မြန်ဆန်/Stable)",
-        "gemini-3.5-flash-lite" to "Gemini 3.5 Flash-Lite (Low-latency)",
-        "gemini-3.1-flash-lite" to "Gemini 3.1 Flash-Lite (အမြန်ဆုံး/ချွေတာရေး)"
+        "gemini-3.8-flash" to "Gemini 3.8 Flash (Latest Preview)",
+        "gemini-3.7-flash" to "Gemini 3.7 Flash (Hybrid Reasoning)",
+        "gemini-3.6-flash" to "Gemini 3.6 Flash (Default)",
+        "gemini-3-flash" to "Gemini 3 Flash (Fast & Efficient)",
+        "gemini-3.5-flash-lite" to "Gemini 3.5 Flash-Lite (RPD 150)",
+        "gemini-3.1-flash-lite" to "Gemini 3.1 Flash-Lite (RPD 150)"
     )
     val modelKeys = modelOptions.map { it.first }
     val modelDisplayMap = modelOptions.toMap()
@@ -186,8 +187,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
     var rpdEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("gemini_rpd_enabled", true)) }
     var selectedModelKey by remember { 
-        val saved = sharedPrefs.getString("gemini_model", "gemini-3.5-flash") ?: "gemini-3.5-flash"
-        mutableStateOf(if (modelKeys.contains(saved)) saved else "gemini-3.5-flash")
+        val saved = sharedPrefs.getString("gemini_model", "gemini-3.6-flash") ?: "gemini-3.6-flash"
+        mutableStateOf(if (modelKeys.contains(saved)) saved else "gemini-3.6-flash")
     }
     var rpmSetting by remember { mutableFloatStateOf(sharedPrefs.getFloat("gemini_rpm", 20f)) }
 
@@ -513,7 +514,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
                         val rpdJson = org.json.JSONObject().apply {
                             put("rpdEnabled", rpdEnabled)
-                            put("rpdLimit", 20)
+                            put("rpdLimit", RpdTracker.getLimitForModel(activeModel))
                             put("usedSpareKey", localUsedSpareKey)
                             put("mainTotal", localMainApiCalls)
                             put("mainSuccess", localMainSuccessCalls)
@@ -605,7 +606,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 apiKey = apiKey,
                 spareApiKey = enabledSpareKeys.firstOrNull() ?: "",
                 rpdEnabled = rpdEnabled,
-                rpdLimit = 20,
+                rpdLimit = RpdTracker.getLimitForModel(activeModel),
                 modelName = activeModel,
                 partsCount = activeParts,
                 length = activeLength,
@@ -1011,7 +1012,52 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         )
                     }
                 }
-                items(historyScripts) { script ->
+                items(historyScripts, key = { it.id }) { script ->
+                    val previewText = remember(script.scriptText) {
+                        if (script.scriptText.length > 500) script.scriptText.take(500) + "..." else script.scriptText
+                    }
+
+                    val timeRemainingMs = remember(script.timestamp) {
+                        val timeSinceSaved = System.currentTimeMillis() - script.timestamp
+                        (48L * 60 * 60 * 1000) - timeSinceSaved
+                    }
+                    val timeStr = remember(timeRemainingMs) {
+                        if (timeRemainingMs > 0) {
+                            val remainingHours = java.util.concurrent.TimeUnit.MILLISECONDS.toHours(timeRemainingMs)
+                            val remainingMins = java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(timeRemainingMs) % 60
+                            "${remainingHours}h ${remainingMins}m"
+                        } else "Expired"
+                    }
+
+                    val failedParts = remember(script.id, script.partsCount, script.scriptPartsJson, script.scriptText) {
+                        val list = mutableListOf<Int>()
+                        val partsMap = try {
+                            if (script.scriptPartsJson.isNotBlank()) {
+                                val obj = org.json.JSONObject(script.scriptPartsJson)
+                                obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                            } else emptyMap()
+                        } catch (_: Exception) {
+                            emptyMap()
+                        }
+
+                        for (i in 0 until script.partsCount) {
+                            val partContent = partsMap[i]
+                            val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
+                            val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
+                            val isMarkerInText = script.scriptText.contains("[အပိုင်း (${i + 1})") || 
+                                script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
+                                script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
+                                script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
+                                script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
+                                script.scriptText.contains("Part ${i + 1}") && (script.scriptText.contains("Error") || script.scriptText.contains("failed"))
+
+                            if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
+                                list.add(i)
+                            }
+                        }
+                        list
+                    }
+
                     Surface(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
@@ -1057,43 +1103,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             )
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
-                                text = script.scriptText,
+                                text = previewText,
                                 style = MaterialTheme.typography.bodyMedium,
                                 maxLines = 5
                             )
-                            val timeSinceSaved = System.currentTimeMillis() - script.timestamp
-                            val timeRemainingMs = (48L * 60 * 60 * 1000) - timeSinceSaved
-                            val timeStr = if (timeRemainingMs > 0) {
-                                val remainingHours = java.util.concurrent.TimeUnit.MILLISECONDS.toHours(timeRemainingMs)
-                                val remainingMins = java.util.concurrent.TimeUnit.MILLISECONDS.toMinutes(timeRemainingMs) % 60
-                                "${remainingHours}h ${remainingMins}m"
-                            } else "Expired"
-
-                            val failedParts = mutableListOf<Int>()
-                            val partsMap = try {
-                                if (script.scriptPartsJson.isNotBlank()) {
-                                    val obj = org.json.JSONObject(script.scriptPartsJson)
-                                    obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
-                                } else emptyMap()
-                            } catch (_: Exception) {
-                                emptyMap()
-                            }
-
-                            for (i in 0 until script.partsCount) {
-                                val partContent = partsMap[i]
-                                val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
-                                val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
-                                val isMarkerInText = script.scriptText.contains("[အပိုင်း (${i + 1})") || 
-                                    script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
-                                    script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
-                                    script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
-                                    script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
-                                    script.scriptText.contains("Part ${i + 1}") && (script.scriptText.contains("Error") || script.scriptText.contains("failed"))
-
-                                if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
-                                    failedParts.add(i)
-                                }
-                            }
 
                             if (failedParts.isNotEmpty()) {
                                 Spacer(modifier = Modifier.height(10.dp))
@@ -2210,12 +2223,29 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         onOptionSelected = { localModelKey = modelDisplayToKey(it) }
                     )
                     Spacer(modifier = Modifier.height(16.dp))
-                    SliderSection(
-                        title = "Parallel Key (အများဆုံး ${maxAllowedParallel.toInt()} ခု)",
-                        value = localParallelKeys.coerceIn(1f, maxAllowedParallel),
-                        onValueChange = { localParallelKeys = it.coerceIn(1f, maxAllowedParallel) },
-                        valueRange = 1f..maxAllowedParallel
-                    )
+                    if (maxAllowedParallel > 1f) {
+                        SliderSection(
+                            title = "Parallel Key (အများဆုံး ${maxAllowedParallel.toInt()} ခု)",
+                            value = localParallelKeys.coerceIn(1f, maxAllowedParallel),
+                            onValueChange = { localParallelKeys = it.coerceIn(1f, maxAllowedParallel) },
+                            valueRange = 1f..maxAllowedParallel
+                        )
+                    } else {
+                        Column {
+                            Text(
+                                text = "Parallel Key",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = MaterialTheme.colorScheme.onBackground,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Spacer(modifier = Modifier.height(4.dp))
+                            Text(
+                                text = "Key ၁ ခု (အပိုင်း ၁ ပိုင်းသာဖြစ်သဖြင့် ၁ ခုသာ အသုံးပြုနိုင်ပါသည်)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
                     Spacer(modifier = Modifier.height(16.dp))
                     DropdownSection(
                         title = "Script Length",
@@ -2635,7 +2665,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
         AlertDialog(
             onDismissRequest = { /* Prevent dismiss */ },
             title = { 
-                Text("⚠️ RPD Limit (၂၀/၂၀ ကြိမ်) ပြည့်သွားပါပြီ ($currentDialogModel)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
+                Text("⚠️ RPD Limit (${mainKeyStatus.maxLimit} ကြိမ်) ပြည့်သွားပါပြီ ($currentDialogModel)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
             },
             text = {
                 Column(
@@ -3013,16 +3043,18 @@ fun SliderSection(
             )
         }
         Spacer(modifier = Modifier.height(8.dp))
-        Slider(
-            value = value,
-            onValueChange = onValueChange,
-            valueRange = valueRange,
-            steps = (valueRange.endInclusive - valueRange.start).toInt() - 1,
-            colors = SliderDefaults.colors(
-                thumbColor = MaterialTheme.colorScheme.primary,
-                activeTrackColor = MaterialTheme.colorScheme.primary
+        if (valueRange.endInclusive > valueRange.start) {
+            Slider(
+                value = value.coerceIn(valueRange.start, valueRange.endInclusive),
+                onValueChange = onValueChange,
+                valueRange = valueRange,
+                steps = maxOf(0, (valueRange.endInclusive - valueRange.start).toInt() - 1),
+                colors = SliderDefaults.colors(
+                    thumbColor = MaterialTheme.colorScheme.primary,
+                    activeTrackColor = MaterialTheme.colorScheme.primary
+                )
             )
-        )
+        }
     }
 }
 
@@ -3476,7 +3508,7 @@ fun SettingsDialog(
                         if (rpdEnabled) {
                             Spacer(modifier = Modifier.height(6.dp))
                             Text(
-                                text = "Main Key ဖြင့် ၂၀ ကြိမ် (Success + Failed) ပြည့်ပါက Spare Key သို့ အလိုအလျောက် ဆက်လက် run ပေးပါမည်။ Google Quota သည် Pacific Time ညဉ့်သန်းခေါင် (00:00 PST/PDT)၊ မြန်မာစံတော်ချိန် ${mainKeyStatus.resetTimeDescription.split(" [").first()} တွင် အလိုအလျောက် Reset ဖြစ်ပါမည်။",
+                                text = "Main Key ဖြင့် သတ်မှတ် RPD Limit (${mainKeyStatus.maxLimit} ကြိမ်) ပြည့်ပါက Spare Key သို့ အလိုအလျောက် ဆက်လက် run ပေးပါမည်။ Google Quota သည် Pacific Time ညဉ့်သန်းခေါင် (00:00 PST/PDT)၊ မြန်မာစံတော်ချိန် ${mainKeyStatus.resetTimeDescription.split(" [").first()} တွင် အလိုအလျောက် Reset ဖြစ်ပါမည်။",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )

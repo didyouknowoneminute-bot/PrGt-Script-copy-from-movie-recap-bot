@@ -21,6 +21,12 @@ object RpdTracker {
     private const val PREFS_NAME = "rpd_tracker_cache"
     private const val PACIFIC_TIMEZONE_ID = "America/Los_Angeles"
     const val DEFAULT_RPD_LIMIT = 20
+    const val FLASH_LITE_RPD_LIMIT = 150
+
+    fun getLimitForModel(model: String): Int {
+        val norm = normalizeModel(model)
+        return if (norm.contains("lite")) FLASH_LITE_RPD_LIMIT else DEFAULT_RPD_LIMIT
+    }
 
     /**
      * Map any UI display string or raw model ID to a canonical model ID without modifying model IDs.
@@ -28,11 +34,12 @@ object RpdTracker {
     fun normalizeModel(model: String): String {
         val trimmed = model.trim().lowercase(Locale.US)
         return when {
+            trimmed.contains("3.8") -> "gemini-3.8-flash"
             trimmed.contains("3.7") -> "gemini-3.7-flash"
             trimmed.contains("3.6") -> "gemini-3.6-flash"
-            trimmed.contains("3.5-flash-lite") || (trimmed.contains("3.5") && trimmed.contains("lite")) -> "gemini-3.5-flash-lite"
-            trimmed.contains("3.5") -> "gemini-3.5-flash"
+            trimmed.contains("3.5") -> "gemini-3.5-flash-lite"
             trimmed.contains("3.1") -> "gemini-3.1-flash-lite"
+            trimmed.contains("3-flash") || trimmed.contains("3 flash") || trimmed.contains("gemini-3") || trimmed == "3" -> "gemini-3-flash"
             trimmed.startsWith("gemini-") -> trimmed
             trimmed.isBlank() -> "default"
             else -> trimmed
@@ -82,7 +89,7 @@ object RpdTracker {
     fun getStatus(
         context: Context,
         apiKey: String,
-        limit: Int = DEFAULT_RPD_LIMIT,
+        limit: Int = -1,
         model: String = ""
     ): RpdStatus {
         val trimmed = apiKey.trim()
@@ -112,12 +119,13 @@ object RpdTracker {
         }
 
         val normModel = normalizeModel(model)
+        val effectiveLimit = if (limit > 0) limit else getLimitForModel(normModel)
 
         if (trimmed.isEmpty()) {
             return RpdStatus(
                 usedCount = 0,
-                maxLimit = limit,
-                remainingCount = limit,
+                maxLimit = effectiveLimit,
+                remainingCount = effectiveLimit,
                 isLimitReached = false,
                 resetTimeDescription = resetDescription,
                 hoursUntilReset = hoursUntilReset,
@@ -143,12 +151,12 @@ object RpdTracker {
             }
         }
 
-        val remaining = (limit - used).coerceAtLeast(0)
-        val isReached = used >= limit
+        val remaining = (effectiveLimit - used).coerceAtLeast(0)
+        val isReached = used >= effectiveLimit
 
         return RpdStatus(
             usedCount = used,
-            maxLimit = limit,
+            maxLimit = effectiveLimit,
             remainingCount = remaining,
             isLimitReached = isReached,
             resetTimeDescription = resetDescription,

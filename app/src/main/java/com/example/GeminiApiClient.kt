@@ -84,13 +84,14 @@ class GeminiApiClient(private val context: Context) {
 
     private fun getModelName(uiModelName: String): String {
         return when {
+            uiModelName.contains("3.8", ignoreCase = true) -> "gemini-3.8-flash"
             uiModelName.contains("3.7", ignoreCase = true) -> "gemini-3.7-flash"
             uiModelName.contains("3.6", ignoreCase = true) -> "gemini-3.6-flash"
-            uiModelName.contains("3.5-flash-lite", ignoreCase = true) || uiModelName.contains("3.5 Flash-Lite", ignoreCase = true) -> "gemini-3.5-flash-lite"
-            uiModelName.contains("3.5", ignoreCase = true) -> "gemini-3.5-flash"
+            uiModelName.contains("3.5", ignoreCase = true) -> "gemini-3.5-flash-lite"
             uiModelName.contains("3.1", ignoreCase = true) -> "gemini-3.1-flash-lite"
+            uiModelName.contains("3-flash", ignoreCase = true) || uiModelName.contains("3 flash", ignoreCase = true) || uiModelName.contains("gemini-3", ignoreCase = true) || uiModelName.trim() == "3" -> "gemini-3-flash"
             uiModelName.startsWith("gemini-") -> uiModelName.trim()
-            else -> "gemini-3.7-flash"
+            else -> "gemini-3.6-flash"
         }
     }
 
@@ -1032,6 +1033,7 @@ class GeminiApiClient(private val context: Context) {
                     fileName = mediaFileName
                 ) ?: ""
             }
+            val wasCharacterProfileCached = extractedCharacterProfile.isNotBlank()
 
             if (extractedCharacterProfile.isNotBlank()) {
                 if (deduplicatedPriorProfile.isNotBlank()) {
@@ -1044,7 +1046,11 @@ class GeminiApiClient(private val context: Context) {
                     val priorPartNames = combinedPriorMap.keys.joinToString(", ") { "Part $it" }
                     send(GenerationUpdate.Log("🔗 အရှေ့အပိုင်းများ ($priorPartNames) မှ Character List နှင့် Relationship Status များကို ဆွဲယူပြီး ယခုအပိုင်းနှင့် ပေါင်းစည်းစစ်ဆေးနေပါသည်..."))
                 } else {
-                    send(GenerationUpdate.Log("🔍 ဗီဒီယိုတစ်ပုဒ်လုံး၏ Character Profile နှင့် ပင်မဇာတ်ဆောင် (Main Protagonist) သတ်မှတ်ချက်ကို ဦးစွာ စစ်ဆေးထုတ်ယူနေပါသည်..."))
+                    if (specificPartsToGenerate != null) {
+                        send(GenerationUpdate.Log("🔍 Cache ထဲတွင် Character Profile မရှိသေးသဖြင့် အသစ် ပြန်လည်စစ်ဆေးထုတ်ယူနေပါသည်..."))
+                    } else {
+                        send(GenerationUpdate.Log("🔍 ဗီဒီယိုတစ်ပုဒ်လုံး၏ Character Profile နှင့် ပင်မဇာတ်ဆောင် (Main Protagonist) သတ်မှတ်ချက်ကို ဦးစွာ စစ်ဆေးထုတ်ယူနေပါသည်..."))
+                    }
                 }
 
                 val hintInstruction = if (characterHint.isNotBlank()) {
@@ -1229,7 +1235,7 @@ class GeminiApiClient(private val context: Context) {
 
             // Parse detected characters for user confirmation & custom name editing dialog
             var customCharacterNameRules = listOf<String>()
-            if (extractedCharacterProfile.isNotBlank() && specificPartsToGenerate == null) {
+            if (extractedCharacterProfile.isNotBlank() && (specificPartsToGenerate == null || !wasCharacterProfileCached)) {
                 val parsedCharacters = mutableListOf<DetectedCharacter>()
                 extractedCharacterProfile.lines().forEach { line ->
                     val trimmed = line.trim().removePrefix("-").removePrefix("*").trim()
