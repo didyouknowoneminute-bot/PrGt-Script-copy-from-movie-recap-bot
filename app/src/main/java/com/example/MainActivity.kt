@@ -110,10 +110,97 @@ fun MainScreen(modifier: Modifier = Modifier) {
     }
     var characterHint by remember { mutableStateOf(sharedPrefs.getString("preset_character_hint", "") ?: "") }
     
-    val scriptTones = listOf("Dramatic", "Comedic", "Suspenseful", "Cute & Adorable", "Action & High-Energy")
-    var selectedTone by remember {
-        val saved = sharedPrefs.getString("preset_tone", scriptTones[0]) ?: scriptTones[0]
-        mutableStateOf(if (scriptTones.contains(saved)) saved else scriptTones[0])
+    data class ToneItem(
+        val key: String,
+        val myanmarLabel: String,
+        val myanmarSuggestion: String,
+        val englishLabel: String,
+        val englishSuggestion: String
+    )
+
+    val allToneItems = listOf(
+        ToneItem(
+            key = "Dramatic",
+            myanmarLabel = "Dramatic (ဒရာမာ / ခံစားချက်အသားပေး လေသံ)",
+            myanmarSuggestion = "ဝမ်းနည်းဖွယ်၊ နာကျင်ဖွယ်၊ မိသားစု/အချစ်ရေးနှင့် ရင်ထဲထိရှစေမည့် ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Dramatic (Emotional & Heartfelt Tone)",
+            englishSuggestion = "Best for deep drama, emotional turmoil, romance, and touching family stories."
+        ),
+        ToneItem(
+            key = "Comedic",
+            myanmarLabel = "Comedic (ဟာသ / ပေါ့ပေါ့ပါးပါး ပျော်စရာ လေသံ)",
+            myanmarSuggestion = "ဟာသကားများ၊ အလွဲလွဲအချော်ချော်များနှင့် နားထောင်သူ ပေါ့ပေါ့ပါးပါး ပြုံးရယ်စေလိုသော ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Comedic (Lighthearted, Witty & Fun)",
+            englishSuggestion = "Best for comedy, hilarious mishaps, and lighthearted entertainment."
+        ),
+        ToneItem(
+            key = "Suspenseful",
+            myanmarLabel = "Suspenseful (သည်းထိတ်ရင်ဖို / စိတ်လှုပ်ရှားဖွယ် လေသံ)",
+            myanmarSuggestion = "လျှို့ဝှက်ဆန်းကြယ်မှု၊ လူသတ်မှု၊ စုံထောက်နှင့် \"ဘာဆက်ဖြစ်မလဲ\" ရင်တထိတ်ထိတ် စောင့်ကြည့်ရသော ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Suspenseful (Edge-of-Seat & Mysterious)",
+            englishSuggestion = "Best for mystery, murder investigations, detective thrillers, and plot twists."
+        ),
+        ToneItem(
+            key = "Cute & Adorable",
+            myanmarLabel = "Cute & Adorable (ချစ်စရာကောင်းသော / ကလေးသဘာဝ နူးညံ့သည့် လေသံ)",
+            myanmarSuggestion = "ကလေးဇာတ်ကောင်များ၊ အိမ်မွေးတိရစ္ဆာန်များနှင့် ချစ်စရာနူးညံ့သော ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Cute & Adorable (Sweet & Heartwarming)",
+            englishSuggestion = "Best for child protagonists, pets, and innocent family-friendly stories."
+        ),
+        ToneItem(
+            key = "Action & High-Energy",
+            myanmarLabel = "Action & High-Energy (အက်ရှင် / အရှိန်ပြင်းသွက်လက်သော လေသံ)",
+            myanmarSuggestion = "တိုက်ခိုက်ခန်း၊ သေနတ်ပစ်ခန်း၊ လိုက်လံဖမ်းဆီးခန်းများနှင့် အရှိန်ပြင်း adrenaline တက်စေမည့် အက်ရှင်ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Action & High-Energy (Fast-Paced & Adrenaline)",
+            englishSuggestion = "Best for fight scenes, shootouts, high-speed chases, and explosive action."
+        ),
+        ToneItem(
+            key = "Psychological Thriller",
+            myanmarLabel = "Psychological Thriller (စိတ်ပိုင်းဆိုင်ရာသည်းထိတ်ရင်ဖို / ဇာတ်ကောင်စိတ်ခံစားမှု အသားပေး)",
+            myanmarSuggestion = "ဇာတ်ကောင်၏ စိတ်ဖိစီးမှု၊ အကြပ်အတည်း၊ သံသယ၊ ဉာဏ်ကစားမှုနှင့် ရှင်သန်ရုန်းကန်ရသော (Mind Game / Survival) ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Psychological Thriller (Mind Games & Survival)",
+            englishSuggestion = "Best for psychological pressure, paranoia, dilemmas, and intense survival stories."
+        ),
+        ToneItem(
+            key = "Intense & Character-Driven",
+            myanmarLabel = "Intense & Character-Driven (ဇာတ်ကောင်ဗဟိုပြု အပြင်းစား စိတ်လှုပ်ရှားဖွယ်)",
+            myanmarSuggestion = "ဇာတ်ကောင်၏ ဆုံးဖြတ်ချက်များ၊ ပေးဆပ်မှုများ၊ အချိုးအကွေ့များနှင့် စိတ်ခံစားမှု ပြင်းထန်သော ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Intense & Character-Driven (High-Stakes & Deep Dilemmas)",
+            englishSuggestion = "Best for critical decisions, heavy sacrifices, and deep character development."
+        ),
+        ToneItem(
+            key = "Dark & Gritty",
+            myanmarLabel = "Dark & Gritty (အမှောင်ဘက်လွှမ်းပြီး ပြင်းထန်ရက်စက်သော လေသံ)",
+            myanmarSuggestion = "လက်စားချေမှု၊ ရာဇဝတ်ဂိုဏ်း၊ ရက်စက်ကြမ်းတမ်းမှုနှင့် လောက၏ အမှောင်ဘက်ခြမ်းလွှမ်းသော ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Dark & Gritty (Raw, Ruthless & Bleak)",
+            englishSuggestion = "Best for revenge, underworld crime, harsh realities, and morally gray anti-heroes."
+        ),
+        ToneItem(
+            key = "Heroic & Epic",
+            myanmarLabel = "Heroic & Epic (သူရဲကောင်းဆန်ဆန် / ဇာတ်ကောင်စွမ်းရည်မြှင့် လေသံ)",
+            myanmarSuggestion = "စွမ်းအားရှင်၊ သူရဲကောင်း၊ အခက်အခဲကို ကျော်လွှားအောင်ပွဲခံပုံနှင့် ဇာတ်ကောင်ကြီးစိုးသော ဇာတ်လမ်းများနှင့် သင့်တော်သည်။",
+            englishLabel = "Heroic & Epic (Inspiring & Grand Triumph)",
+            englishSuggestion = "Best for superheroes, legendary conquests, overcoming impossible odds, and epic climaxes."
+        )
+    )
+
+    fun getToneLabelForLang(keyOrLabel: String, lang: String): String {
+        val item = allToneItems.find {
+            it.key.equals(keyOrLabel, ignoreCase = true) ||
+            it.myanmarLabel.equals(keyOrLabel, ignoreCase = true) ||
+            it.englishLabel.equals(keyOrLabel, ignoreCase = true) ||
+            keyOrLabel.contains(it.key, ignoreCase = true)
+        } ?: allToneItems[0]
+        return if (lang == "English") item.englishLabel else item.myanmarLabel
+    }
+
+    fun getToneKeyFromAny(keyOrLabel: String): String {
+        return allToneItems.find {
+            it.key.equals(keyOrLabel, ignoreCase = true) ||
+            it.myanmarLabel.equals(keyOrLabel, ignoreCase = true) ||
+            it.englishLabel.equals(keyOrLabel, ignoreCase = true) ||
+            keyOrLabel.contains(it.key, ignoreCase = true)
+        }?.key ?: keyOrLabel
     }
 
     val outputLanguages = listOf("Myanmar", "English")
@@ -122,12 +209,30 @@ fun MainScreen(modifier: Modifier = Modifier) {
         mutableStateOf(if (outputLanguages.contains(saved)) saved else outputLanguages[0])
     }
 
+    var selectedToneKey by remember {
+        val saved = sharedPrefs.getString("preset_tone", "Dramatic") ?: "Dramatic"
+        mutableStateOf(getToneKeyFromAny(saved))
+    }
+    val selectedTone = getToneLabelForLang(selectedToneKey, selectedLanguage)
+
+    val scriptTones = if (selectedLanguage == "English") {
+        allToneItems.map { it.englishLabel }
+    } else {
+        allToneItems.map { it.myanmarLabel }
+    }
+
+    val scriptToneSuggestions = if (selectedLanguage == "English") {
+        allToneItems.associate { it.englishLabel to it.englishSuggestion }
+    } else {
+        allToneItems.associate { it.myanmarLabel to it.myanmarSuggestion }
+    }
+
     // Settings State
     val modelOptions = listOf(
         "gemini-3.8-flash" to "Gemini 3.8 Flash (Latest Preview)",
         "gemini-3.7-flash" to "Gemini 3.7 Flash (Hybrid Reasoning)",
         "gemini-3.6-flash" to "Gemini 3.6 Flash (Default)",
-        "gemini-3-flash" to "Gemini 3 Flash (Fast & Efficient)",
+        "gemini-3-flash-preview" to "Gemini 3 Flash (Fast & Efficient)",
         "gemini-3.5-flash-lite" to "Gemini 3.5 Flash-Lite (RPD 150)",
         "gemini-3.1-flash-lite" to "Gemini 3.1 Flash-Lite (RPD 150)"
     )
@@ -187,7 +292,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
     var rpdEnabled by remember { mutableStateOf(sharedPrefs.getBoolean("gemini_rpd_enabled", true)) }
     var selectedModelKey by remember { 
-        val saved = sharedPrefs.getString("gemini_model", "gemini-3.6-flash") ?: "gemini-3.6-flash"
+        val rawSaved = sharedPrefs.getString("gemini_model", "gemini-3.6-flash") ?: "gemini-3.6-flash"
+        val saved = if (rawSaved == "gemini-3-flash") "gemini-3-flash-preview" else rawSaved
         mutableStateOf(if (modelKeys.contains(saved)) saved else "gemini-3.6-flash")
     }
     var rpmSetting by remember { mutableFloatStateOf(sharedPrefs.getFloat("gemini_rpm", 20f)) }
@@ -1330,9 +1436,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     options = scriptTones,
                     selectedOption = selectedTone,
                     onOptionSelected = {
-                        selectedTone = it
-                        sharedPrefs.edit().putString("preset_tone", it).apply()
-                    }
+                        selectedToneKey = getToneKeyFromAny(it)
+                        sharedPrefs.edit().putString("preset_tone", selectedToneKey).apply()
+                    },
+                    suggestionsMap = scriptToneSuggestions
                 )
 
                 // Output Language
@@ -1955,12 +2062,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         selectedOption = localPOV,
                         onOptionSelected = { localPOV = it }
                     )
-                    Spacer(modifier = Modifier.height(16.dp))
+                    val regenTones = if (localLanguage == "English") allToneItems.map { it.englishLabel } else allToneItems.map { it.myanmarLabel }
+                    val regenSuggestions = if (localLanguage == "English") allToneItems.associate { it.englishLabel to it.englishSuggestion } else allToneItems.associate { it.myanmarLabel to it.myanmarSuggestion }
                     DropdownSection(
                         title = "Script Tone",
-                        options = scriptTones,
-                        selectedOption = localTone,
-                        onOptionSelected = { localTone = it }
+                        options = regenTones,
+                        selectedOption = getToneLabelForLang(localTone, localLanguage),
+                        onOptionSelected = { localTone = getToneLabelForLang(it, localLanguage) },
+                        suggestionsMap = regenSuggestions
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     DropdownSection(
@@ -2045,7 +2154,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
                         OutlinedButton(
                             onClick = {
@@ -2055,89 +2164,176 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                 }
                             },
                             modifier = Modifier.weight(1f),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
                         ) {
-                            Text("Select All", style = MaterialTheme.typography.labelMedium)
+                            Text("Select All", style = MaterialTheme.typography.labelSmall)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                selectedPartIndices.clear()
+                                for (i in 0 until totalParts) {
+                                    val content = partsMap[i]
+                                    val isFailed = content.isNullOrBlank() || 
+                                        content.contains("နေရာလွတ်") || 
+                                        content.contains("Error") ||
+                                        content.contains("failed", ignoreCase = true) ||
+                                        content.contains("ကြိုးစားသော်လည်း မအောင်မြင်")
+                                    if (isFailed) {
+                                        selectedPartIndices.add(i)
+                                    }
+                                }
+                            },
+                            modifier = Modifier.weight(1.3f),
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
+                        ) {
+                            Text("Select Failed Only", style = MaterialTheme.typography.labelSmall)
                         }
                         OutlinedButton(
                             onClick = {
                                 selectedPartIndices.clear()
                             },
                             modifier = Modifier.weight(1f),
-                            contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 4.dp)
                         ) {
-                            Text("Clear All", style = MaterialTheme.typography.labelMedium)
+                            Text("Clear All", style = MaterialTheme.typography.labelSmall)
                         }
                     }
 
                     Spacer(modifier = Modifier.height(14.dp))
 
-                    val chunkedParts = (0 until totalParts).chunked(5)
                     Column(
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
-                        chunkedParts.forEach { rowIndices ->
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp)
-                            ) {
-                                rowIndices.forEach { partIndex ->
-                                    val isSelected = selectedPartIndices.contains(partIndex)
-                                    val partContent = partsMap[partIndex]
-                                    val isFailedOrMissing = partContent.isNullOrBlank() || 
-                                        partContent.contains("နေရာလွတ်") || 
-                                        partContent.contains("Error")
+                        for (partIndex in 0 until totalParts) {
+                            val isSelected = selectedPartIndices.contains(partIndex)
+                            val rawContent = partsMap[partIndex]
+                            val isMissing = rawContent.isNullOrBlank()
+                            val isError = !isMissing && (rawContent.contains("Error") || 
+                                rawContent.contains("failed", ignoreCase = true) || 
+                                rawContent.contains("ကြိုးစားသော်လည်း မအောင်မြင်") ||
+                                rawContent.contains("မအောင်မြင်ပါ"))
+                            val isPlaceholder = !isMissing && rawContent.contains("နေရာလွတ်")
 
-                                    Box(
-                                        modifier = Modifier
-                                            .weight(1f)
-                                            .aspectRatio(1f)
-                                            .clip(RoundedCornerShape(8.dp))
-                                            .background(
-                                                if (isSelected) MaterialTheme.colorScheme.primary
-                                                else if (isFailedOrMissing) MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.5f)
-                                                else MaterialTheme.colorScheme.surfaceVariant
-                                            )
-                                            .border(
-                                                width = if (isSelected) 2.dp else 1.dp,
-                                                color = if (isSelected) MaterialTheme.colorScheme.primary
-                                                else if (isFailedOrMissing) MaterialTheme.colorScheme.error.copy(alpha = 0.6f)
-                                                else MaterialTheme.colorScheme.outlineVariant,
-                                                shape = RoundedCornerShape(8.dp)
-                                            )
-                                            .clickable {
-                                                if (isSelected) {
-                                                    selectedPartIndices.remove(partIndex)
-                                                } else {
-                                                    selectedPartIndices.add(partIndex)
-                                                }
-                                            },
-                                        contentAlignment = Alignment.Center
+                            val displayContent = when {
+                                isMissing -> "[အပိုင်း ${partIndex + 1} - နေရာလွတ်...]"
+                                isError -> rawContent.trim()
+                                isPlaceholder -> rawContent.trim()
+                                else -> rawContent.trim()
+                            }
+
+                            Card(
+                                shape = RoundedCornerShape(10.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = if (isSelected) {
+                                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                                    } else if (isError || isPlaceholder || isMissing) {
+                                        MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+                                    } else {
+                                        MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)
+                                    }
+                                ),
+                                border = androidx.compose.foundation.BorderStroke(
+                                    width = if (isSelected) 2.dp else 1.dp,
+                                    color = if (isSelected) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else if (isError || isPlaceholder || isMissing) {
+                                        MaterialTheme.colorScheme.error.copy(alpha = 0.6f)
+                                    } else {
+                                        MaterialTheme.colorScheme.outlineVariant
+                                    }
+                                ),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        if (isSelected) {
+                                            selectedPartIndices.remove(partIndex)
+                                        } else {
+                                            selectedPartIndices.add(partIndex)
+                                        }
+                                    }
+                            ) {
+                                Column(modifier = Modifier.padding(12.dp)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
                                     ) {
-                                        Column(
-                                            horizontalAlignment = Alignment.CenterHorizontally,
-                                            verticalArrangement = Arrangement.Center
-                                        ) {
-                                            Text(
-                                                text = "${partIndex + 1}",
-                                                style = MaterialTheme.typography.titleSmall,
-                                                fontWeight = if (isSelected) FontWeight.Bold else FontWeight.SemiBold,
-                                                color = if (isSelected) MaterialTheme.colorScheme.onPrimary
-                                                else if (isFailedOrMissing) MaterialTheme.colorScheme.error
-                                                else MaterialTheme.colorScheme.onSurfaceVariant
+                                        Row(verticalAlignment = Alignment.CenterVertically) {
+                                            Checkbox(
+                                                checked = isSelected,
+                                                onCheckedChange = { checked ->
+                                                    if (checked) selectedPartIndices.add(partIndex)
+                                                    else selectedPartIndices.remove(partIndex)
+                                                },
+                                                modifier = Modifier.size(24.dp)
                                             )
-                                            if (isFailedOrMissing && !isSelected) {
+                                            Spacer(modifier = Modifier.width(6.dp))
+                                            Text(
+                                                text = "Part ${partIndex + 1}",
+                                                style = MaterialTheme.typography.titleSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = if (isSelected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface
+                                            )
+                                        }
+                                        if (isError || isPlaceholder || isMissing) {
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = MaterialTheme.colorScheme.error.copy(alpha = 0.15f)
+                                            ) {
                                                 Text(
-                                                    text = "⚠️",
-                                                    style = MaterialTheme.typography.labelSmall
+                                                    text = if (isError) "⚠️ Failed" else "⚠️ နေရာလွတ်",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.error,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        } else {
+                                            Surface(
+                                                shape = RoundedCornerShape(6.dp),
+                                                color = MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)
+                                            ) {
+                                                Text(
+                                                    text = "✅ ရရှိပြီး",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.SemiBold,
+                                                    color = MaterialTheme.colorScheme.primary,
+                                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
                                                 )
                                             }
                                         }
                                     }
-                                }
-                                for (emptySlot in 0 until (5 - rowIndices.size)) {
-                                    Spacer(modifier = Modifier.weight(1f))
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    Surface(
+                                        shape = RoundedCornerShape(8.dp),
+                                        color = if (isError || isPlaceholder || isMissing) {
+                                            MaterialTheme.colorScheme.error.copy(alpha = 0.08f)
+                                        } else {
+                                            MaterialTheme.colorScheme.surface
+                                        },
+                                        border = androidx.compose.foundation.BorderStroke(
+                                            width = 0.5.dp,
+                                            color = if (isError || isPlaceholder || isMissing) {
+                                                MaterialTheme.colorScheme.error.copy(alpha = 0.3f)
+                                            } else {
+                                                MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+                                            }
+                                        ),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(
+                                            text = displayContent,
+                                            style = MaterialTheme.typography.bodyMedium,
+                                            lineHeight = 24.sp,
+                                            color = if (isError || isPlaceholder || isMissing) {
+                                                MaterialTheme.colorScheme.error
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurface
+                                            },
+                                            modifier = Modifier.padding(10.dp)
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2260,12 +2456,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         selectedOption = localPOV,
                         onOptionSelected = { localPOV = it }
                     )
-                    Spacer(modifier = Modifier.height(16.dp))
+                    val retryTones = if (localLanguage == "English") allToneItems.map { it.englishLabel } else allToneItems.map { it.myanmarLabel }
+                    val retrySuggestions = if (localLanguage == "English") allToneItems.associate { it.englishLabel to it.englishSuggestion } else allToneItems.associate { it.myanmarLabel to it.myanmarSuggestion }
                     DropdownSection(
                         title = "Script Tone",
-                        options = scriptTones,
-                        selectedOption = localTone,
-                        onOptionSelected = { localTone = it }
+                        options = retryTones,
+                        selectedOption = getToneLabelForLang(localTone, localLanguage),
+                        onOptionSelected = { localTone = getToneLabelForLang(it, localLanguage) },
+                        suggestionsMap = retrySuggestions
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     DropdownSection(
@@ -3064,7 +3262,8 @@ fun DropdownSection(
     title: String,
     options: List<String>,
     selectedOption: String,
-    onOptionSelected: (String) -> Unit
+    onOptionSelected: (String) -> Unit,
+    suggestionsMap: Map<String, String>? = null
 ) {
     var expanded by remember { mutableStateOf(false) }
 
@@ -3099,14 +3298,47 @@ fun DropdownSection(
                 onDismissRequest = { expanded = false }
             ) {
                 options.forEach { option ->
+                    val suggestion = suggestionsMap?.get(option)
                     DropdownMenuItem(
-                        text = { Text(option) },
+                        text = {
+                            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                                Text(
+                                    text = option,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (option == selectedOption) FontWeight.Bold else FontWeight.Normal
+                                )
+                                if (!suggestion.isNullOrBlank()) {
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    Text(
+                                        text = "💡 $suggestion",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.85f)
+                                    )
+                                }
+                            }
+                        },
                         onClick = {
                             onOptionSelected(option)
                             expanded = false
                         }
                     )
                 }
+            }
+        }
+        val currentSuggestion = suggestionsMap?.get(selectedOption)
+        if (!currentSuggestion.isNullOrBlank()) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Surface(
+                shape = RoundedCornerShape(8.dp),
+                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(
+                    text = "💡 $currentSuggestion",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                )
             }
         }
     }

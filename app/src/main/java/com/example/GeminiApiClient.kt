@@ -89,7 +89,7 @@ class GeminiApiClient(private val context: Context) {
             uiModelName.contains("3.6", ignoreCase = true) -> "gemini-3.6-flash"
             uiModelName.contains("3.5", ignoreCase = true) -> "gemini-3.5-flash-lite"
             uiModelName.contains("3.1", ignoreCase = true) -> "gemini-3.1-flash-lite"
-            uiModelName.contains("3-flash", ignoreCase = true) || uiModelName.contains("3 flash", ignoreCase = true) || uiModelName.contains("gemini-3", ignoreCase = true) || uiModelName.trim() == "3" -> "gemini-3-flash"
+            uiModelName.contains("3-flash", ignoreCase = true) || uiModelName.contains("3 flash", ignoreCase = true) || uiModelName.contains("gemini-3", ignoreCase = true) || uiModelName.trim() == "3" -> "gemini-3-flash-preview"
             uiModelName.startsWith("gemini-") -> uiModelName.trim()
             else -> "gemini-3.6-flash"
         }
@@ -475,6 +475,30 @@ class GeminiApiClient(private val context: Context) {
                         - အက်ရှင်ဇာတ်ဝင်ခန်းများ၊ တိုက်ခိုက်ခန်းများ၊ သဲထိတ်ရင်ဖို လိုက်လံဖမ်းဆီးခန်းများနှင့် အပြောင်းအလဲမြန်သော အဖြစ်အပျက်များကို အရှိန်အဟုန်ပြင်းပြင်း၊ သွက်သွက်လက်လက်နှင့် စိတ်လှုပ်ရှားတက်ကြွစေမည့် စကားလုံးများဖြင့် ရေးသားရန်။
                         - ဝါကျများကို တိုတိုပြတ်ပြတ်နှင့် စည်းချက်မှန်မှန် (Punchy & Fast-paced) သုံးစွဲပြီး နားဆင်သူ၏ ရင်ခုန်သံကို မြန်ဆန်လာစေမည့် ပြင်းထန်သွက်လက်သော လူပြောစကားလေသံဖြင့် ရေးသားရန်။
                         """.trimIndent()
+                    tone.contains("Psychological", ignoreCase = true) || tone.contains("Thriller", ignoreCase = true) ->
+                        """
+                        Psychological Thriller (စိတ်ပိုင်းဆိုင်ရာသည်းထိတ်ရင်ဖို / ဇာတ်ကောင်စိတ်ခံစားမှု အသားပေး လေသံ):
+                        - ဇာတ်ကောင်၏ အတွင်းစိတ်လှုပ်ရှားမှု၊ စိတ်ဖိစီးမှု၊ ကြောက်ရွံ့မှု၊ သံသယနှင့် စိတ်ပိုင်းဆိုင်ရာ အကျပ်အတည်း (Inner Conflict & Mental Pressure) များကို အဓိက ပေါ်လွင်အောင် ရေးသားရန်။
+                        - အန္တရာယ်များနှင့် မသေချာမရေရာမှုများကြားတွင် ဇာတ်ကောင် ရှင်သန်ရုန်းကန်ရပုံ (Survival Instinct) ကို နားထောင်သူ ကိုယ်တိုင် ဇာတ်ကောင်နေရာသို့ ရောက်သွားသလို အသက်ရှူမှားလောက်အောင် ရင်တမမ စိတ်လှုပ်ရှားစေမည့် လူပြောစကားလေသံဖြင့် ရေးသားရန်။
+                        """.trimIndent()
+                    tone.contains("Character-Driven", ignoreCase = true) || tone.contains("Intense", ignoreCase = true) ->
+                        """
+                        Intense & Character-Driven (ဇာတ်ကောင်ဗဟိုပြု အပြင်းစား စိတ်လှုပ်ရှားဖွယ် လေသံ):
+                        - ဇာတ်လမ်းအဖြစ်အပျက်ထက် "ဇာတ်ကောင်၏ ရွေးချယ်ဆုံးဖြတ်ချက်များ၊ ပေးဆပ်ရမှုများနှင့် စိတ်ခံစားမှုပြင်းထန်မှု" ကို အဓိက ဦးစားပေး ဖော်ပြရန်။
+                        - ဇာတ်ကောင်ရင်ဆိုင်နေရသော အန္တရာယ်နှင့် စိန်ခေါ်မှုကြီးမားပုံ (High Stakes & Emotional Intensity) ကို နားထောင်သူ စိတ်ဝင်စားမှု အစအဆုံး မပြတ်သွားအောင် ဆွဲဆောင်မှုရှိသော လူပြောစကားလေသံဖြင့် ရေးသားရန်။
+                        """.trimIndent()
+                    tone.contains("Dark", ignoreCase = true) || tone.contains("Gritty", ignoreCase = true) ->
+                        """
+                        Dark & Gritty (အမှောင်ဘက်လွှမ်းပြီး ပြင်းထန်ရက်စက်သော လေသံ):
+                        - ဇာတ်လမ်း၏ ခက်ခဲကြမ်းတမ်းမှု၊ လျှို့ဝှက်ချက်များ၊ သစ္စာဖောက်မှု၊ အန္တရာယ်ကြီးမားမှုနှင့် လက်စားချေမှု အငွေ့အသက်များကို အလေးထား ရေးသားရန်။
+                        - မည်သည့်အရာမှ လွယ်လွယ်ကူကူမပြီးဘဲ အမှန်တရား၏ ခါးသီးမှုနှင့် လောက၏ အမှောင်ဘက်ခြမ်းကို ဖော်ကျူးသည့် ပြတ်သားလေးနက်သော လူပြောစကားလေသံဖြင့် ရေးသားရန်။
+                        """.trimIndent()
+                    tone.contains("Heroic", ignoreCase = true) || tone.contains("Epic", ignoreCase = true) ->
+                        """
+                        Heroic & Epic (သူရဲကောင်းဆန်ဆန် / ဇာတ်ကောင်စွမ်းရည်မြှင့် လေသံ):
+                        - ဇာတ်ကောင်၏ စိတ်ဓာတ်ကြံ့ခိုင်မှု၊ ကြီးမားသော စိန်ခေါ်မှုအခက်အခဲများကို မဆုတ်မနစ် ရင်ဆိုင်ကျော်လွှားပုံနှင့် သူရဲကောင်းဆန်သော အောင်ပွဲခံအခိုက်အတန့်များကို ကြီးကျယ်ခမ်းနားစွာ ပုံဖော်ရန်။
+                        - နားဆင်သူများ စိတ်ဓာတ်တက်ကြွပြီး ဇာတ်ကောင်ဘက်မှ အားရကျေနပ်စေမည့် လှုံ့ဆော်မှုအပြည့်ရှိသော လူပြောစကားလေသံဖြင့် ရေးသားရန်။
+                        """.trimIndent()
                     else -> "$tone (ရွေးချယ်ထားသော '$tone' လေသံအတိုင်း နားထောင်သူ စိတ်ဝင်စားအောင် ရေးသားပါ)"
                 }
             } else {
@@ -504,6 +528,30 @@ class GeminiApiClient(private val context: Context) {
                         Action & High-Energy (Fast-Paced, Dynamic & Adrenaline-Fueled Tone):
                         - Narrate with high intensity, relentless pace, and gripping energy that matches action sequences, chase scenes, fight choreography, and fast-moving plot twists.
                         - Use short, punchy, dynamic sentences with strong verbs and high-stakes spoken phrasing to keep the listener's adrenaline pumping throughout the voiceover.
+                        """.trimIndent()
+                    tone.contains("Psychological", ignoreCase = true) || tone.contains("Thriller", ignoreCase = true) ->
+                        """
+                        Psychological Thriller (Mind Games, Paranoia & Psychological Stakes):
+                        - Narrate by intensely emphasizing the characters' inner turmoil, psychological pressure, fear, doubt, paranoia, and deep moral dilemmas (Inner Conflict & Mental Pressure).
+                        - Capture the protagonist's desperate fight for survival amid uncertainty and danger, keeping the listener on edge and holding their breath as if they were living through the character's nightmare.
+                        """.trimIndent()
+                    tone.contains("Character-Driven", ignoreCase = true) || tone.contains("Intense", ignoreCase = true) ->
+                        """
+                        Intense & Character-Driven (High Emotional Stakes & Character-Centric Voiceover):
+                        - Prioritize the characters' critical choices, sacrifices, emotional turning points, and personal stakes above generic plot actions.
+                        - Narrate with high-stakes urgency and intense emotional resonance, keeping the listener deeply invested in the protagonist's journey and difficult decisions.
+                        """.trimIndent()
+                    tone.contains("Dark", ignoreCase = true) || tone.contains("Gritty", ignoreCase = true) ->
+                        """
+                        Dark & Gritty (Raw, Ruthless, Bleak & High-Tension Tone):
+                        - Emphasize the harsh, unforgiving realities, underworld tension, betrayal, moral ambiguity, and revenge-driven atmosphere of the story.
+                        - Use a blunt, grounded, and brooding spoken style that pulls no punches and highlights the bitter, brutal truths of the world.
+                        """.trimIndent()
+                    tone.contains("Heroic", ignoreCase = true) || tone.contains("Epic", ignoreCase = true) ->
+                        """
+                        Heroic & Epic (Inspiring, Grand & Triumphant Voiceover):
+                        - Magnify the protagonist's indomitable willpower, perseverance against impossible odds, and thrilling heroic breakthroughs in a grand, cinematic style.
+                        - Deliver an electrifying and uplifting spoken narration that rallies the listener and makes every triumph feel deeply earned and satisfying.
                         """.trimIndent()
                     else -> "$tone (Narrate strictly in an engaging '$tone' spoken voiceover tone)"
                 }

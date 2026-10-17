@@ -39,7 +39,7 @@ object RpdTracker {
             trimmed.contains("3.6") -> "gemini-3.6-flash"
             trimmed.contains("3.5") -> "gemini-3.5-flash-lite"
             trimmed.contains("3.1") -> "gemini-3.1-flash-lite"
-            trimmed.contains("3-flash") || trimmed.contains("3 flash") || trimmed.contains("gemini-3") || trimmed == "3" -> "gemini-3-flash"
+            trimmed.contains("3-flash") || trimmed.contains("3 flash") || trimmed.contains("gemini-3") || trimmed == "3" -> "gemini-3-flash-preview"
             trimmed.startsWith("gemini-") -> trimmed
             trimmed.isBlank() -> "default"
             else -> trimmed
