@@ -23,6 +23,7 @@ import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.AudioFile
 import androidx.compose.material.icons.rounded.ArrowDropDown
@@ -94,7 +95,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val sharedPrefs = remember { context.getSharedPreferences("app_prefs", android.content.Context.MODE_PRIVATE) }
 
     // States (Loaded from Last Presets Cache)
-    var parts by remember { mutableStateOf(sharedPrefs.getFloat("preset_parts", 20f).coerceIn(5f, 50f)) }
+    var parts by remember { mutableStateOf(sharedPrefs.getFloat("preset_parts", 20f).coerceIn(5f, 80f)) }
     var parallelKeys by remember { mutableStateOf(sharedPrefs.getFloat("preset_parallel_keys", 1f).coerceIn(1f, 10f)) }
     
     val scriptLengths = listOf("Short", "Medium", "Long", "TTS match")
@@ -371,6 +372,9 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var selectedMediaMimeType by remember { mutableStateOf<String?>(null) }
     var selectedMediaName by remember { mutableStateOf("No file selected") }
     var selectedMediaDurationMs by remember { mutableStateOf(0L) }
+    var selectedSrtUri by remember { mutableStateOf<Uri?>(null) }
+    var selectedSrtName by remember { mutableStateOf("") }
+    var selectedSrtContent by remember { mutableStateOf("") }
 
     // Persistent server-cached media state for current session
     var cachedUploadedGeminiUri by remember { mutableStateOf<String?>(null) }
@@ -385,6 +389,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
     val dao = db.prgtScriptDao()
     val historyScripts by dao.getAllScripts().collectAsState(initial = emptyList())
     var showHistory by remember { mutableStateOf(false) }
+    var historyTabIndex by remember { mutableIntStateOf(0) }
     
     var scriptToRename by remember { mutableStateOf<com.example.db.PrGtScript?>(null) }
     var newNameInput by remember { mutableStateOf("") }
@@ -518,6 +523,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     val existingRpdObj = org.json.JSONObject(existingScript.rpdInfoJson)
                     localCharacterProfile = existingRpdObj.optString("characterProfile", "")
                     localConfirmedMainChar = existingRpdObj.optString("confirmedMainCharacter", "")
+                    val srtFromHistory = existingRpdObj.optString("srtContent", "")
+                    if (srtFromHistory.isNotBlank() && selectedSrtContent.isBlank()) {
+                        selectedSrtContent = srtFromHistory
+                        selectedSrtName = existingRpdObj.optString("srtName", "History Subtitles")
+                    }
                 } catch (_: Exception) {
                 }
             }
@@ -618,6 +628,16 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         val partsJson = org.json.JSONObject()
                         snapshotMap.forEach { (k, v) -> partsJson.put(k.toString(), v) }
 
+                        val existingRpdObj = try {
+                            if (!existingScript?.rpdInfoJson.isNullOrBlank()) org.json.JSONObject(existingScript!!.rpdInfoJson) else null
+                        } catch (_: Exception) { null }
+
+                        val hasSrt = selectedSrtContent.isNotBlank() || (existingRpdObj?.optBoolean("hasSrt", false) == true)
+                        val allPartsCompleted = (0 until savedPartsCount).all { idx ->
+                            val text = snapshotMap[idx] ?: ""
+                            text.isNotBlank() && !text.contains("နေရာလွတ်") && !text.contains("Error") && !text.contains("[အပိုင်း (")
+                        }
+
                         val rpdJson = org.json.JSONObject().apply {
                             put("rpdEnabled", rpdEnabled)
                             put("rpdLimit", RpdTracker.getLimitForModel(activeModel))
@@ -631,6 +651,32 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             put("characterProfile", localCharacterProfile)
                             put("confirmedMainCharacter", localConfirmedMainChar)
                             put("uploadApiKey", apiKey)
+                            put("originalMediaName", selectedMediaName)
+                            put("hasSrt", hasSrt)
+                            if (selectedSrtContent.isNotBlank()) {
+                                put("srtContent", selectedSrtContent)
+                                put("srtName", selectedSrtName)
+                            } else if (existingRpdObj != null && existingRpdObj.has("srtContent")) {
+                                put("srtContent", existingRpdObj.getString("srtContent"))
+                                put("srtName", existingRpdObj.optString("srtName", "Subtitles"))
+                            }
+
+                            val priorOriginal = existingRpdObj?.optString("originalCustomScriptText", "") ?: ""
+                            if (priorOriginal.isNotBlank()) {
+                                put("originalCustomScriptText", priorOriginal)
+                                put("originalCustomPartsJson", existingRpdObj?.optString("originalCustomPartsJson", partsJson.toString()))
+                            } else if (snapshotText.isNotBlank()) {
+                                put("originalCustomScriptText", snapshotText)
+                                put("originalCustomPartsJson", partsJson.toString())
+                            }
+
+                            if (allPartsCompleted) {
+                                put("isAutoFixed", hasSrt)
+                                put("autoFixStatus", if (hasSrt) "SUCCESS" else "NONE")
+                            } else {
+                                put("isAutoFixed", false)
+                                put("autoFixStatus", "FAILED")
+                            }
                         }
 
                         val scriptEntity = com.example.db.PrGtScript(
@@ -737,7 +783,8 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 mainKeyEnabled = mainKeyEnabled,
                 spareApiKeysList = enabledSpareKeys,
                 spareKeySlots = spareKeySlots,
-                parallelKeyCount = parallelKeys.toInt()
+                parallelKeyCount = parallelKeys.toInt(),
+                srtContent = selectedSrtContent
             ).collect { update ->
                 when (update) {
                     is GenerationUpdate.Log -> generationLogs.add(update.message)
@@ -916,6 +963,23 @@ fun MainScreen(modifier: Modifier = Modifier) {
         }
     }
 
+    val srtPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            selectedSrtUri = uri
+            selectedSrtName = getMediaFileName(context, uri, "Subtitle selected")
+            try {
+                context.contentResolver.openInputStream(uri)?.use { stream ->
+                    selectedSrtContent = stream.bufferedReader().use { it.readText() }
+                }
+                android.widget.Toast.makeText(context, "SRT စာတန်းထိုးဖိုင် ထည့်သွင်းပြီးပါပြီ", android.widget.Toast.LENGTH_SHORT).show()
+            } catch (e: Exception) {
+                android.widget.Toast.makeText(context, "SRT ဖတ်မရပါ: ${e.message}", android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
     val retryMediaPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri: Uri? ->
@@ -924,9 +988,38 @@ fun MainScreen(modifier: Modifier = Modifier) {
         pendingRetryScript = null
         pendingRetryParts = null
         if (uri != null && script != null) {
+            val pickedFileName = getMediaFileName(context, uri, "")
+
+            var expectedOriginalName = ""
+            if (script.rpdInfoJson.isNotBlank()) {
+                try {
+                    val rObj = org.json.JSONObject(script.rpdInfoJson)
+                    expectedOriginalName = rObj.optString("originalMediaName", "")
+                } catch (_: Exception) {}
+            }
+            if (expectedOriginalName.isBlank()) {
+                expectedOriginalName = script.fileName
+            }
+
+            fun cleanBaseName(n: String): String {
+                return n.trim().substringBeforeLast('.').trim().lowercase(java.util.Locale.US)
+            }
+
+            val isMatch = pickedFileName.isBlank() ||
+                cleanBaseName(pickedFileName) == cleanBaseName(expectedOriginalName) ||
+                cleanBaseName(pickedFileName) == cleanBaseName(script.fileName)
+
+            if (!isMatch) {
+                errorMessageDialog = "⚠️ Video File Name မကိုက်ညီပါ!\n\n" +
+                    "• မူရင်းဖိုင်အမည်: $expectedOriginalName\n" +
+                    "• ရွေးချယ်လိုက်သောဖိုင်: $pickedFileName\n\n" +
+                    "ဗီဒီယိုဖိုင် မှားယွင်းပါက ဇာတ်လမ်းအကြောင်းအရာများ လွဲမှားကုန်မည်ဖြစ်သဖြင့် Processing ဆက်မလုပ်ဘဲ ရပ်တန့်ထားပါသည်။ မူရင်း ဗီဒီယိုဖိုင်အမှန်ကိုသာ ပြန်လည်ရွေးချယ်ပေးပါရန်။"
+                return@rememberLauncherForActivityResult
+            }
+
             selectedMediaUri = uri
             selectedMediaMimeType = context.contentResolver.getType(uri) ?: (script.mimeType ?: "video/mp4")
-            selectedMediaName = getMediaFileName(context, uri, script.fileName)
+            selectedMediaName = if (pickedFileName.isNotBlank()) pickedFileName else script.fileName
             try {
                 val retriever = android.media.MediaMetadataRetriever()
                 retriever.setDataSource(context, uri)
@@ -1102,26 +1195,144 @@ fun MainScreen(modifier: Modifier = Modifier) {
         }
 
         if (showHistory) {
-            LazyColumn(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(horizontal = 24.dp),
-                contentPadding = PaddingValues(vertical = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)
-            ) {
-                if (historyScripts.isEmpty()) {
-                    item {
-                        Text(
-                            text = "No history available.",
-                            style = MaterialTheme.typography.bodyLarge,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
+            val (autoFixedScripts, customScripts, failedScripts) = remember(historyScripts) {
+                val autoFixed = mutableListOf<com.example.db.PrGtScript>()
+                val custom = mutableListOf<com.example.db.PrGtScript>()
+                val failed = mutableListOf<com.example.db.PrGtScript>()
+
+                for (script in historyScripts) {
+                    val list = mutableListOf<Int>()
+                    val partsMap = try {
+                        if (script.scriptPartsJson.isNotBlank()) {
+                            val obj = org.json.JSONObject(script.scriptPartsJson)
+                            obj.keys().asSequence().associate { it.toInt() to obj.getString(it) }
+                        } else emptyMap()
+                    } catch (_: Exception) {
+                        emptyMap()
+                    }
+
+                    for (i in 0 until script.partsCount) {
+                        val partContent = partsMap[i]
+                        val isMissingInJson = partsMap.isNotEmpty() && (partContent == null || partContent.isBlank())
+                        val isPlaceholderInJson = partContent?.contains("နေရာလွတ်") == true || partContent?.contains("[အပိုင်း (") == true || partContent?.contains("Error") == true
+                        val isMarkerInText = script.scriptText.contains("[အပိုင်း (${i + 1})") || 
+                            script.scriptText.contains("[Final Retry Error in Part ${i + 1}:") ||
+                            script.scriptText.contains("[Error parsing final output for Part ${i + 1}:") ||
+                            script.scriptText.contains("[Network Error in Final Retry Part ${i + 1}:") ||
+                            script.scriptText.contains("[အပိုင်း ${i + 1} - နေရာလွတ်...]") ||
+                            script.scriptText.contains("Part ${i + 1}") && (script.scriptText.contains("Error") || script.scriptText.contains("failed"))
+
+                        if (isMissingInJson || isPlaceholderInJson || isMarkerInText) {
+                            list.add(i)
+                        }
+                    }
+
+                    val rpdObj = try {
+                        if (script.rpdInfoJson.isNotBlank()) org.json.JSONObject(script.rpdInfoJson) else null
+                    } catch (_: Exception) { null }
+                    val isAutoFixed = rpdObj?.optBoolean("isAutoFixed", false) == true
+                    val autoFixStatus = rpdObj?.optString("autoFixStatus", "NONE") ?: "NONE"
+                    val hasSrt = (rpdObj?.optString("srtContent", "")?.isNotBlank() == true) || (rpdObj?.optBoolean("hasSrt", false) == true)
+                    val isFailed = list.isNotEmpty() || autoFixStatus == "FAILED" || script.scriptText.contains("Error generating script")
+
+                    if (isFailed) {
+                        failed.add(script)
+                    } else if (isAutoFixed || hasSrt) {
+                        autoFixed.add(script)
+                        val origText = rpdObj?.optString("originalCustomScriptText", "") ?: ""
+                        if (origText.isNotBlank()) {
+                            val origPartsJson = rpdObj?.optString("originalCustomPartsJson", script.scriptPartsJson) ?: script.scriptPartsJson
+                            custom.add(script.copy(
+                                fileName = "${script.fileName} (Original/Custom)",
+                                scriptText = origText,
+                                scriptPartsJson = origPartsJson
+                            ))
+                        }
+                    } else {
+                        custom.add(script)
                     }
                 }
-                items(historyScripts, key = { it.id }) { script ->
-                    val previewText = remember(script.scriptText) {
-                        if (script.scriptText.length > 500) script.scriptText.take(500) + "..." else script.scriptText
+                Triple(autoFixed, custom, failed)
+            }
+
+            val currentTabScripts = when (historyTabIndex) {
+                0 -> autoFixedScripts
+                1 -> customScripts
+                else -> failedScripts
+            }
+
+            Column(modifier = Modifier.fillMaxSize()) {
+                TabRow(
+                    selectedTabIndex = historyTabIndex,
+                    containerColor = MaterialTheme.colorScheme.surface,
+                    contentColor = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Tab(
+                        selected = historyTabIndex == 0,
+                        onClick = { historyTabIndex = 0 },
+                        text = {
+                            Text(
+                                "✨ Auto-Fixed (${autoFixedScripts.size})",
+                                fontWeight = if (historyTabIndex == 0) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    )
+                    Tab(
+                        selected = historyTabIndex == 1,
+                        onClick = { historyTabIndex = 1 },
+                        text = {
+                            Text(
+                                "📝 Custom (${customScripts.size})",
+                                fontWeight = if (historyTabIndex == 1) FontWeight.Bold else FontWeight.Normal,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    )
+                    Tab(
+                        selected = historyTabIndex == 2,
+                        onClick = { historyTabIndex = 2 },
+                        text = {
+                            Text(
+                                "⚠️ Failed (${failedScripts.size})",
+                                fontWeight = if (historyTabIndex == 2) FontWeight.Bold else FontWeight.Normal,
+                                color = if (failedScripts.isNotEmpty()) MaterialTheme.colorScheme.error else LocalContentColor.current,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    )
+                }
+
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(horizontal = 24.dp),
+                    contentPadding = PaddingValues(vertical = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    if (currentTabScripts.isEmpty()) {
+                        item {
+                            val emptyMsg = when (historyTabIndex) {
+                                0 -> "✨ Auto-Fixed (SRT) စာတန်းထိုးဖြင့် စစ်ဆေးထားသော Script မရှိသေးပါ။"
+                                1 -> "📝 Custom Script မရှိသေးပါ။"
+                                else -> "✅ မပြည့်စုံသေးသော သို့မဟုတ် Failed ဖြစ်နေသော Script မရှိပါ။ (အားလုံး အောင်မြင်ပြည့်စုံနေပါသည်)"
+                            }
+                            Text(
+                                text = emptyMsg,
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 24.dp)
+                            )
+                        }
                     }
+                    items(currentTabScripts, key = { it.id }) { script ->
+                        val previewText = remember(script.scriptText) {
+                            if (script.scriptText.length > 500) script.scriptText.take(500) + "..." else script.scriptText
+                        }
 
                     val timeRemainingMs = remember(script.timestamp) {
                         val timeSinceSaved = System.currentTimeMillis() - script.timestamp
@@ -1201,12 +1412,49 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                     }
                                 }
                             }
-                            Spacer(modifier = Modifier.height(8.dp))
-                            Text(
-                                text = "Config: ${script.language} | ${script.modelId} | ${script.pov}",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.primary
-                            )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Config: ${script.language} | ${script.modelId} | ${script.pov}",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.weight(1f)
+                                )
+                                val scriptRpdObj = remember(script.rpdInfoJson) {
+                                    try {
+                                        if (script.rpdInfoJson.isNotBlank()) org.json.JSONObject(script.rpdInfoJson) else null
+                                    } catch (_: Exception) { null }
+                                }
+                                val cardHasSrt = (scriptRpdObj?.optString("srtContent", "")?.isNotBlank() == true) || (scriptRpdObj?.optBoolean("hasSrt", false) == true)
+                                val cardIsAutoFixed = scriptRpdObj?.optBoolean("isAutoFixed", false) == true
+                                Surface(
+                                    shape = RoundedCornerShape(6.dp),
+                                    color = when {
+                                        failedParts.isNotEmpty() -> MaterialTheme.colorScheme.errorContainer
+                                        cardIsAutoFixed || cardHasSrt -> MaterialTheme.colorScheme.primaryContainer
+                                        else -> MaterialTheme.colorScheme.secondaryContainer
+                                    }
+                                ) {
+                                    Text(
+                                        text = when {
+                                            failedParts.isNotEmpty() -> "⚠️ Incomplete"
+                                            cardIsAutoFixed || cardHasSrt -> "✨ Auto-Fixed"
+                                            else -> "📝 Custom"
+                                        },
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = when {
+                                            failedParts.isNotEmpty() -> MaterialTheme.colorScheme.onErrorContainer
+                                            cardIsAutoFixed || cardHasSrt -> MaterialTheme.colorScheme.onPrimaryContainer
+                                            else -> MaterialTheme.colorScheme.onSecondaryContainer
+                                        },
+                                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
+                                    )
+                                }
+                            }
                             Spacer(modifier = Modifier.height(12.dp))
                             Text(
                                 text = previewText,
@@ -1301,6 +1549,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     }
                 }
             }
+            }
         } else {
             Column(
                 modifier = Modifier
@@ -1316,7 +1565,14 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 PickerSection(
                     selectedFileName = selectedMediaName,
                     onSelectVideo = { videoPickerLauncher.launch("video/*") },
-                    onSelectAudio = { audioPickerLauncher.launch("audio/*") }
+                    onSelectAudio = { audioPickerLauncher.launch("audio/*") },
+                    selectedSrtName = selectedSrtName,
+                    onSelectSrt = { srtPickerLauncher.launch("*/*") },
+                    onClearSrt = {
+                        selectedSrtUri = null
+                        selectedSrtName = ""
+                        selectedSrtContent = ""
+                    }
                 )
 
                 // Number of parts
@@ -1327,7 +1583,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         parts = it
                         sharedPrefs.edit().putFloat("preset_parts", it).apply()
                     },
-                    valueRange = 5f..50f
+                    valueRange = 5f..80f
                 )
                 if (selectedMediaDurationMs > 0) {
                     val segmentDurationSecs = (selectedMediaDurationMs / parts.toInt()) / 1000
@@ -1495,8 +1751,19 @@ fun MainScreen(modifier: Modifier = Modifier) {
 
     if (viewingHistoryScript != null) {
         val script = viewingHistoryScript!!
+        val scriptRpdObj = remember(script.rpdInfoJson) {
+            try {
+                if (script.rpdInfoJson.isNotBlank()) org.json.JSONObject(script.rpdInfoJson) else null
+            } catch (_: Exception) { null }
+        }
+        val origCustomText = scriptRpdObj?.optString("originalCustomScriptText", "") ?: ""
+        val hasDualVersions = origCustomText.isNotBlank() && origCustomText != script.scriptText
+        var selectedViewerVersion by remember(script.id) { mutableStateOf("auto_fixed") }
+
         var isEditingInViewer by remember(script.id) { mutableStateOf(false) }
-        var viewerText by remember(script.id) { mutableStateOf(script.scriptText) }
+        var viewerText by remember(script.id, selectedViewerVersion) { 
+            mutableStateOf(if (selectedViewerVersion == "custom" && origCustomText.isNotBlank()) origCustomText else script.scriptText) 
+        }
         
         val wordCount = viewerText.split("\\s+".toRegex()).filter { it.isNotBlank() }.size
         val charCount = viewerText.length
@@ -1560,6 +1827,50 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 Column(
                     modifier = Modifier.fillMaxSize()
                 ) {
+                    if (hasDualVersions) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 12.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selectedViewerVersion == "auto_fixed") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                border = if (selectedViewerVersion == "auto_fixed") androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { selectedViewerVersion = "auto_fixed" }
+                            ) {
+                                Text(
+                                    text = "✨ Auto-Fixed",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (selectedViewerVersion == "auto_fixed") FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selectedViewerVersion == "auto_fixed") MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                            Surface(
+                                shape = RoundedCornerShape(8.dp),
+                                color = if (selectedViewerVersion == "custom") MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                                border = if (selectedViewerVersion == "custom") androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clickable { selectedViewerVersion = "custom" }
+                            ) {
+                                Text(
+                                    text = "📝 Before Auto-Fixed",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = if (selectedViewerVersion == "custom") FontWeight.Bold else FontWeight.Normal,
+                                    color = if (selectedViewerVersion == "custom") MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
+                                    textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                                )
+                            }
+                        }
+                    }
+
                     // Statistics & Metadata chip row
                     Row(
                         modifier = Modifier
@@ -2039,7 +2350,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         title = "Number of parts the video",
                         value = localParts,
                         onValueChange = { localParts = it },
-                        valueRange = 5f..50f
+                        valueRange = 5f..80f
                     )
                     Spacer(modifier = Modifier.height(16.dp))
                     SliderSection(
@@ -2110,6 +2421,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
         val targetScript = scriptForSpecialParts!!
         val totalParts = targetScript.partsCount
         val selectedPartIndices = remember(targetScript.id) { mutableStateListOf<Int>() }
+        var fixWithSrtInSpecial by remember(targetScript.id) { mutableStateOf(false) }
 
         val partsMap = remember(targetScript.id) {
             try {
@@ -2347,6 +2659,70 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             color = MaterialTheme.colorScheme.primary,
                             fontWeight = FontWeight.Medium
                         )
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (fixWithSrtInSpecial) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.5f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                        border = if (fixWithSrtInSpecial) androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { fixWithSrtInSpecial = !fixWithSrtInSpecial }
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Checkbox(
+                                    checked = fixWithSrtInSpecial,
+                                    onCheckedChange = { fixWithSrtInSpecial = it }
+                                )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "📌 Fix with SRT (စာတန်းထိုးဖြင့် တိုက်ဆိုင်စစ်ဆေးမည်)",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        fontWeight = FontWeight.Bold
+                                    )
+                                    Text(
+                                        text = if (fixWithSrtInSpecial) "ရွေးထားသော Part များကို စာတန်းထိုးနှင့် အတိအကျ စစ်ဆေးထုတ်ပေးပါမည်" else "ပိတ်ထားပါက မူလ Video Context ဖြင့်သာ သာမန် ပြင်ဆင်ထုတ်ပေးပါမည်",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                            if (fixWithSrtInSpecial) {
+                                Spacer(modifier = Modifier.height(8.dp))
+                                if (selectedSrtContent.isNotBlank()) {
+                                    Surface(
+                                        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f),
+                                        shape = RoundedCornerShape(6.dp),
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text(
+                                            text = "✅ ချိတ်ဆက်ထားသော SRT: $selectedSrtName",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 6.dp)
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(6.dp))
+                                }
+                                OutlinedButton(
+                                    onClick = { srtPickerLauncher.launch("*/*") },
+                                    modifier = Modifier.fillMaxWidth(),
+                                    shape = RoundedCornerShape(8.dp)
+                                ) {
+                                    Text(
+                                        text = if (selectedSrtContent.isNotBlank()) "🔄 SRT ဖိုင် အသစ်ပြောင်းလဲထည့်သွင်းမည်" else "📂 SRT စာတန်းထိုးဖိုင် ရွေးချယ်မည်",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             },
@@ -2849,21 +3225,53 @@ fun MainScreen(modifier: Modifier = Modifier) {
             mutableStateOf(activeRunningModel.ifBlank { selectedModelKey })
         }
         val currentDialogModel = dialogSelectedModelKey
-        val mainKeyStatus = remember(editMainKeyInput, rpdEnabled, currentDialogModel) { RpdTracker.getStatus(context, editMainKeyInput, model = currentDialogModel) }
-        val spareKeyStatus = remember(editSpareKeyInput, rpdEnabled, currentDialogModel) { RpdTracker.getStatus(context, editSpareKeyInput, model = currentDialogModel) }
+
+        data class SavedKeyItem(
+            val title: String,
+            val key: String,
+            val isMain: Boolean,
+            val slotIndex: Int = -1
+        )
+        val allSavedKeys = remember(apiKey, spareKeySlots) {
+            val list = mutableListOf<SavedKeyItem>()
+            if (apiKey.isNotBlank()) {
+                list.add(SavedKeyItem("Main Key", apiKey.trim(), isMain = true))
+            }
+            spareKeySlots.forEachIndexed { idx, slot ->
+                if (slot.key.isNotBlank()) {
+                    list.add(SavedKeyItem("Spare Key #${idx + 1}", slot.key.trim(), isMain = false, slotIndex = idx))
+                }
+            }
+            list
+        }
+
+        var selectedKeyIndex by remember(showRpdKeyDialog, currentDialogModel) {
+            val firstAvailable = allSavedKeys.indexOfFirst { item ->
+                !RpdTracker.getStatus(context, item.key, model = currentDialogModel).isLimitReached
+            }
+            mutableIntStateOf(if (firstAvailable != -1) firstAvailable else 0)
+        }
+        var showCustomKeyInput by remember(showRpdKeyDialog) { mutableStateOf(false) }
+        var customKeyInput by remember(showRpdKeyDialog) { mutableStateOf("") }
 
         val isModelChanged = dialogSelectedModelKey != (activeRunningModel.ifBlank { selectedModelKey })
-        val hasQuotaOnCurrentKeys = !mainKeyStatus.isLimitReached || (editSpareKeyInput.isNotBlank() && !spareKeyStatus.isLimitReached)
-        val canProceed = remember(editMainKeyInput, editSpareKeyInput, apiKey, spareApiKey, isModelChanged, hasQuotaOnCurrentKeys) {
-            val mainChangedAndValid = editMainKeyInput.trim().isNotBlank() && editMainKeyInput.trim() != apiKey.trim()
-            val spareChangedAndValid = editSpareKeyInput.trim().isNotBlank() && editSpareKeyInput.trim() != spareApiKey.trim()
-            mainChangedAndValid || spareChangedAndValid || (isModelChanged && hasQuotaOnCurrentKeys)
+        val currentSelectedKeyItem = allSavedKeys.getOrNull(selectedKeyIndex)
+        val selectedKeyStatus = remember(currentSelectedKeyItem, currentDialogModel) {
+            if (currentSelectedKeyItem != null) RpdTracker.getStatus(context, currentSelectedKeyItem.key, model = currentDialogModel)
+            else null
+        }
+        val canProceed = remember(showCustomKeyInput, customKeyInput, selectedKeyStatus, isModelChanged) {
+            if (showCustomKeyInput) {
+                customKeyInput.trim().isNotBlank()
+            } else {
+                (selectedKeyStatus != null && !selectedKeyStatus.isLimitReached) || isModelChanged
+            }
         }
 
         AlertDialog(
             onDismissRequest = { /* Prevent dismiss */ },
             title = { 
-                Text("⚠️ RPD Limit (${mainKeyStatus.maxLimit} ကြိမ်) ပြည့်သွားပါပြီ ($currentDialogModel)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
+                Text("⚠️ RPD Limit ပြည့်သွားပါပြီ ($currentDialogModel)", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.error) 
             },
             text = {
                 Column(
@@ -2873,7 +3281,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Text(
-                        text = "လက်ရှိ အသုံးပြုနေသော API Keys များ၏ Daily Request Limit (RPD - $currentDialogModel) ကုန်ဆုံးသွားပါပြီ။\n\nကျန်ရှိနေသော အပိုင်းများကို ဆက်လက်ထုတ်ယူရန် အခြား Gemini Model တစ်ခုသို့ ပြောင်းလဲအသုံးပြုနိုင်သလို (သို့မဟုတ်) Main API Key / Spare API Key အသစ် လဲလှယ်ထည့်သွင်းပေးနိုင်ပါသည် ($rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို Auto-Save လုပ်ပေးပါမည်)။",
+                        text = "လက်ရှိ API Key ၏ Daily Limit (RPD - $currentDialogModel) ကုန်ဆုံးသွားပါပြီ။\n\nSettings ထဲတွင် သိမ်းဆည်းထားပြီးဖြစ်သော Keys များမှ RPD လက်ကျန်ရှိသည့် Key ကို တိုက်ရိုက်ရွေးချယ်နိုင်သလို Gemini Model ကိုလည်း ချက်ချင်း ပြောင်းလဲအသုံးပြုနိုင်ပါသည် ($rpdCountdown စက္ကန့်အတွင်း လက်ရှိရသမျှကို Auto-Save လုပ်ပေးပါမည်)။",
                         style = MaterialTheme.typography.bodyMedium
                     )
 
@@ -2885,129 +3293,135 @@ fun MainScreen(modifier: Modifier = Modifier) {
                         onOptionSelected = { dialogSelectedModelKey = modelDisplayToKey(it) }
                     )
 
-                    // Main Key Section
-                    if (editMainKeyInput.isNotBlank()) {
-                        if (mainKeyStatus.isLimitReached) {
-                            Card(
-                                shape = RoundedCornerShape(10.dp),
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                                modifier = Modifier.fillMaxWidth()
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "အသုံးပြုမည့် Key ကို ရွေးချယ်ပါ:",
+                        style = MaterialTheme.typography.titleSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+
+                    allSavedKeys.forEachIndexed { idx, item ->
+                        val keyStatus = RpdTracker.getStatus(context, item.key, model = currentDialogModel)
+                        val isSelected = !showCustomKeyInput && selectedKeyIndex == idx
+                        val isLimit = keyStatus.isLimitReached
+
+                        Surface(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable {
+                                    showCustomKeyInput = false
+                                    selectedKeyIndex = idx
+                                },
+                            shape = RoundedCornerShape(10.dp),
+                            color = when {
+                                isSelected -> MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.6f)
+                                isLimit -> MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+                                else -> MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f)
+                            },
+                            border = if (isSelected) androidx.compose.foundation.BorderStroke(1.5.dp, MaterialTheme.colorScheme.primary) else null
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Row(
-                                    modifier = Modifier.padding(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Main Key RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ပြည့်ပြီး (Reset: ${mainKeyStatus.hoursUntilReset}h ${mainKeyStatus.minutesUntilReset}m)",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onErrorContainer,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        } else {
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.45f),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(
-                                    text = "Main Key RPD: ${mainKeyStatus.usedCount}/${mainKeyStatus.maxLimit} ကြိမ် (Available: ${mainKeyStatus.remainingCount} ကြိမ်)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.primary,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
+                                RadioButton(
+                                    selected = isSelected,
+                                    onClick = {
+                                        showCustomKeyInput = false
+                                        selectedKeyIndex = idx
+                                    }
                                 )
+                                Spacer(modifier = Modifier.width(6.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            text = item.title,
+                                            style = MaterialTheme.typography.titleSmall,
+                                            fontWeight = FontWeight.Bold
+                                        )
+                                        Text(
+                                            text = if (item.key.length > 8) "${item.key.take(4)}...${item.key.takeLast(4)}" else item.key,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(2.dp))
+                                    if (isLimit) {
+                                        Text(
+                                            text = "🔴 Limit Reached: ${keyStatus.usedCount}/${keyStatus.maxLimit} (Reset: ${keyStatus.hoursUntilReset}h ${keyStatus.minutesUntilReset}m)",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.error,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    } else {
+                                        Text(
+                                            text = "🟢 Available: ${keyStatus.remainingCount} calls left (${keyStatus.usedCount}/${keyStatus.maxLimit})",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.primary,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    }
+                                }
                             }
                         }
                     }
 
-                    OutlinedTextField(
-                        value = editMainKeyInput,
-                        onValueChange = { editMainKeyInput = it },
-                        label = { Text("Main API Key") },
-                        placeholder = { Text("AIzaSy...") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp)
-                    )
-
-                    // Spare Key Section
-                    if (editSpareKeyInput.isNotBlank()) {
-                        if (spareKeyStatus.isLimitReached) {
-                            Card(
-                                shape = RoundedCornerShape(10.dp),
-                                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Row(
-                                    modifier = Modifier.padding(8.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Icon(Icons.Filled.Warning, contentDescription = null, tint = MaterialTheme.colorScheme.error, modifier = Modifier.size(20.dp))
-                                    Spacer(modifier = Modifier.width(6.dp))
-                                    Text(
-                                        text = "Spare Key RPD: ${spareKeyStatus.usedCount}/${spareKeyStatus.maxLimit} ပြည့်ပြီး (Reset: ${spareKeyStatus.hoursUntilReset}h ${spareKeyStatus.minutesUntilReset}m)",
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onErrorContainer,
-                                        fontWeight = FontWeight.Bold
-                                    )
-                                }
-                            }
-                        } else {
-                            Surface(
-                                shape = RoundedCornerShape(8.dp),
-                                color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.45f),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(
-                                    text = "Spare Key RPD: ${spareKeyStatus.usedCount}/${spareKeyStatus.maxLimit} ကြိမ် (Available: ${spareKeyStatus.remainingCount} ကြိမ်)",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    fontWeight = FontWeight.SemiBold,
-                                    color = MaterialTheme.colorScheme.secondary,
-                                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp)
-                                )
-                            }
+                    // Optional Custom Key Section
+                    Surface(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showCustomKeyInput = !showCustomKeyInput },
+                        shape = RoundedCornerShape(10.dp),
+                        color = if (showCustomKeyInput) MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.4f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.25f),
+                        border = if (showCustomKeyInput) androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.secondary) else null
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(10.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            RadioButton(
+                                selected = showCustomKeyInput,
+                                onClick = { showCustomKeyInput = true }
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "+ Key အသစ် သီးခြား ထည့်သွင်းမည် (Custom Key)",
+                                style = MaterialTheme.typography.bodyMedium,
+                                fontWeight = FontWeight.SemiBold
+                            )
                         }
                     }
 
-                    OutlinedTextField(
-                        value = editSpareKeyInput,
-                        onValueChange = { editSpareKeyInput = it },
-                        label = { Text("Spare API Key") },
-                        placeholder = { Text("Enter spare API key (optional)") },
-                        singleLine = true,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp)
-                    )
+                    if (showCustomKeyInput) {
+                        OutlinedTextField(
+                            value = customKeyInput,
+                            onValueChange = { customKeyInput = it },
+                            label = { Text("Gemini API Key အသစ်") },
+                            placeholder = { Text("AIzaSy...") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp)
+                        )
+                    }
                 }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        val trimmedMain = editMainKeyInput.trim()
-                        val trimmedSpare = editSpareKeyInput.trim()
-                        
-                        // Save both updated keys directly to settings / preferences
-                        if (trimmedMain.isNotBlank()) {
-                            apiKey = trimmedMain
-                            mainKeyEnabled = true
-                            sharedPrefs.edit()
-                                .putString("gemini_api_key", trimmedMain)
-                                .putBoolean("gemini_main_key_enabled", true)
-                                .apply()
-                        }
-                        
-                        if (trimmedSpare.isNotBlank()) {
-                            val updatedSlots = spareKeySlots.toMutableList()
-                            if (updatedSlots.isEmpty()) {
-                                updatedSlots.add(SpareKeySlot(key = trimmedSpare, enabled = true))
-                            } else {
-                                updatedSlots[0] = SpareKeySlot(key = trimmedSpare, enabled = true)
+                        val chosenKey = if (showCustomKeyInput) {
+                            val trimmed = customKeyInput.trim()
+                            if (trimmed.isNotBlank()) {
+                                apiKey = trimmed
+                                sharedPrefs.edit().putString("gemini_api_key", trimmed).apply()
                             }
-                            saveSpareKeySlots(updatedSlots)
+                            trimmed
+                        } else {
+                            allSavedKeys.getOrNull(selectedKeyIndex)?.key ?: apiKey
                         }
 
                         val isModelSwitched = dialogSelectedModelKey != (activeRunningModel.ifBlank { selectedModelKey })
@@ -3017,22 +3431,13 @@ fun MainScreen(modifier: Modifier = Modifier) {
                             sharedPrefs.edit().putString("gemini_model", dialogSelectedModelKey).apply()
                         }
                         
-                        // Decide which key to feed into active generation channel
-                        val nextKeyToUse = when {
-                            trimmedSpare.isNotBlank() && trimmedSpare != spareApiKey.trim() -> trimmedSpare
-                            trimmedMain.isNotBlank() && trimmedMain != apiKey.trim() -> trimmedMain
-                            trimmedSpare.isNotBlank() && !spareKeyStatus.isLimitReached -> trimmedSpare
-                            !mainKeyStatus.isLimitReached -> trimmedMain
-                            else -> trimmedMain
-                        }
-
                         val messageToSend = if (isModelSwitched) {
-                            "MODEL:$dialogSelectedModelKey:$nextKeyToUse"
+                            "MODEL:$dialogSelectedModelKey:$chosenKey"
                         } else {
-                            nextKeyToUse
+                            chosenKey
                         }
 
-                        if (nextKeyToUse.isNotBlank() || isModelSwitched) {
+                        if (chosenKey.isNotBlank() || isModelSwitched) {
                             coroutineScope.launch {
                                 activeNewKeyChannel?.send(messageToSend)
                             }
@@ -3041,7 +3446,7 @@ fun MainScreen(modifier: Modifier = Modifier) {
                     },
                     enabled = canProceed
                 ) {
-                    Text("သိမ်းဆည်းပြီး ဆက်လုပ်မည်")
+                    Text("ရွေးချယ်ပြီး ဆက်လုပ်မည်")
                 }
             },
             dismissButton = {
@@ -3150,7 +3555,10 @@ fun MainScreen(modifier: Modifier = Modifier) {
 fun PickerSection(
     selectedFileName: String,
     onSelectVideo: () -> Unit,
-    onSelectAudio: () -> Unit
+    onSelectAudio: () -> Unit,
+    selectedSrtName: String = "",
+    onSelectSrt: () -> Unit = {},
+    onClearSrt: () -> Unit = {}
 ) {
     Column {
         Text(
@@ -3190,6 +3598,74 @@ fun PickerSection(
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f)
         )
+
+        Spacer(modifier = Modifier.height(12.dp))
+
+        // SRT Subtitle Section (Optional)
+        Surface(
+            shape = RoundedCornerShape(12.dp),
+            color = if (selectedSrtName.isNotBlank()) MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f) else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+            border = androidx.compose.foundation.BorderStroke(
+                width = 1.dp,
+                color = if (selectedSrtName.isNotBlank()) MaterialTheme.colorScheme.primary.copy(alpha = 0.6f) else MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f)
+            ),
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Icon(
+                        Icons.Filled.Description,
+                        contentDescription = null,
+                        tint = if (selectedSrtName.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(24.dp)
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Column {
+                        Text(
+                            text = if (selectedSrtName.isNotBlank()) selectedSrtName else "SRT / Subtitles (Optional)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = if (selectedSrtName.isNotBlank()) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = if (selectedSrtName.isNotBlank()) "✅ စာတန်းထိုး ချိတ်ဆက်ထားသည် (Context တိကျမည်)" else "စာတန်းထိုး ထည့်သွင်းပါက စကားပြော Context ၁၀၀% တိကျပါမည်",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                if (selectedSrtName.isNotBlank()) {
+                    IconButton(onClick = onClearSrt, modifier = Modifier.size(32.dp)) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Clear SRT",
+                            tint = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.size(18.dp)
+                        )
+                    }
+                } else {
+                    OutlinedButton(
+                        onClick = onSelectSrt,
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+                        Text("Add SRT", style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+            }
+        }
     }
 }
 

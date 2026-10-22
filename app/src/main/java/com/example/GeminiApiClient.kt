@@ -129,7 +129,8 @@ class GeminiApiClient(private val context: Context) {
         mainKeyEnabled: Boolean = true,
         spareApiKeysList: List<String> = emptyList(),
         spareKeySlots: List<SpareKeySlot> = emptyList(),
-        parallelKeyCount: Int = 1
+        parallelKeyCount: Int = 1,
+        srtContent: String = ""
     ): Flow<GenerationUpdate> = channelFlow {
         send(GenerationUpdate.Progress(0.0f))
 
@@ -184,6 +185,14 @@ class GeminiApiClient(private val context: Context) {
             var durationMs = 30000L // Default fallback
             
             send(GenerationUpdate.Log("AI Engine: $actualModelName"))
+
+            val parsedSubtitles = if (srtContent.isNotBlank()) {
+                val cues = SrtParser.parseSrtContent(srtContent)
+                if (cues.isNotEmpty()) {
+                    send(GenerationUpdate.Log("📑 SRT စာတန်းထိုးဖိုင် (${cues.size} cues) အား ထည့်သွင်းအသုံးပြုပါမည် (စကားပြော Context အပြည့်အဝ ရရှိပါမည်)။"))
+                }
+                cues
+            } else emptyList()
 
             val uploadedFileUriByKey = java.util.concurrent.ConcurrentHashMap<String, String>()
             val uploadMutexByKey = java.util.concurrent.ConcurrentHashMap<String, Mutex>()
@@ -560,9 +569,9 @@ class GeminiApiClient(private val context: Context) {
 
             val modalityInstruction = if (isVideo) {
                 """
-                |Media Source: ဗီဒီယို (Video - Visual Actions + Spoken Dialogues & Plot Meaning)
+                |Media Source: ဗီဒီယို (Video - Visual Actions + Spoken Dialogues & Plot Context)
                 |- ဤဗီဒီယိုအပိုင်းအခြားအတွင်း ဖြစ်ပျက်နေသော ဇာတ်ကောင်များ၏ လှုပ်ရှားမှု/မြင်ကွင်းများ (Visual actions, scenes, character expressions) နှင့် ဇာတ်ကောင်များ ပြောဆိုသော စကားသံ/နောက်ခံအသံများ (Spoken dialogues, speech context, sound effects) နှစ်ခုစလုံးကို အသေးစိတ် ကြည့်ရှုနားထောင်ပြီး အခြေခံ၍ ရေးသားရမည်။
-                |- အရေးကြီးစည်းကမ်း (Meaningful Plot & Dialogue Flow): ဗီဒီယိုထဲတွင် ဇာတ်ကောင်များ စကားပြောနေပါက "စကားပြောနေကြသည်" ဟုသာ အပေါ်ယံ မရေးဘဲ၊ စကားပြောသံများကို သေချာနားထောင်၍ ဘာအကြောင်းအရာကို ဆွေးနွေး/ငြင်းခုံနေကြသည်၊ ဘယ်သူက ဘာပြောလိုက်တဲ့အခါ ဘယ်သူက ဘယ်လိုပြန်ပြောသည်၊ ဘာကြောင့် ထိုသို့ပြုမူသည် ဆိုသည့် ဇာတ်လမ်းအဓိပ္ပါယ်နှင့် အနှစ်သာရ ပေါ်လွင်အောင် အဓိက ဖော်ထုတ်ရေးသားရမည်။
+                |- အရေးကြီးစည်းကမ်း (Meaningful Plot & Dialogue Context): ဗီဒီယိုထဲတွင် ဇာတ်ကောင်များ စကားပြောနေပါက "စကားပြောနေကြသည်" ဟုသာ အပေါ်ယံ မရေးဘဲ၊ စကားပြောသံ (နှင့် ပေးထားသော Subtitles စာတန်းထိုးများ) ကို သေချာနားထောင်/ဖတ်ရှု၍ ဘာအကြောင်းအရာကြောင့် မည်သူက မည်သူ့ကို ဘာပြောနေသည်၊ မည်သည့် ပဋိပက္ခ/ခံစားချက် ဖြစ်နေသည် ဆိုသည့် ဇာတ်လမ်း Context နှင့် အဓိပ္ပါယ်အနှစ်သာရ ပေါ်လွင်အောင် အဓိက ဖော်ထုတ်ရေးသားရမည်။
                 """.trimMargin()
             } else {
                 """
@@ -1521,6 +1530,14 @@ class GeminiApiClient(private val context: Context) {
                         val endStr = formatTime(endMs)
 
                         try {
+                            val segmentSubtitles = if (parsedSubtitles.isNotEmpty()) {
+                                SrtParser.getSubtitlesForSegment(parsedSubtitles, startMs, endMs)
+                            } else ""
+
+                            val subtitleContext = if (segmentSubtitles.isNotBlank()) {
+                                "\n\nစကားပြောစာတန်းထိုးများ (Subtitles Transcript in $startStr - $endStr):\n$segmentSubtitles\n(ဤစကားပြောစာသားများကို အခြေခံ၍ ဇာတ်ကောင်များပြောဆိုမှု၏ ဆိုလိုရင်း Context ကို အတိအကျ ဖော်ထုတ်ရေးသားပါ။)"
+                            } else ""
+
                             val timingConstraint = if (isVideo) {
                                 """
                                 Timestamp $startStr မှ $endStr (Seconds: ${startMs/1000}s to ${endMs/1000}s) အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။ 
@@ -1547,7 +1564,7 @@ class GeminiApiClient(private val context: Context) {
                                 4. Script Tone: $toneDetail
                                 5. Length Constraint: $lengthInstruction
                                 6. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
-                                7. Timing & Context: $timingConstraint
+                                7. Timing & Context: $timingConstraint$subtitleContext
                                 8. Language Constraints: $languageConstraint
                             """.trimIndent()
 
@@ -1846,6 +1863,13 @@ class GeminiApiClient(private val context: Context) {
                         launch {
                             var success = false
                             try {
+                                val segmentSubtitles = if (parsedSubtitles.isNotEmpty()) {
+                                SrtParser.getSubtitlesForSegment(parsedSubtitles, startMs, endMs)
+                            } else ""
+
+                            val subtitleContext = if (segmentSubtitles.isNotBlank()) {
+                                "\n\nစကားပြောစာတန်းထိုးများ (Subtitles Transcript in $startStr - $endStr):\n$segmentSubtitles\n(ဤစကားပြောစာသားများကို အခြေခံ၍ ဇာတ်ကောင်များပြောဆိုမှု၏ ဆိုလိုရင်း Context ကို အတိအကျ ဖော်ထုတ်ရေးသားပါ။)"
+                            } else ""
 
                             val timingConstraint = if (isVideo) {
                                 """
@@ -1873,7 +1897,7 @@ class GeminiApiClient(private val context: Context) {
                                 4. Script Tone: $toneDetail
                                 5. Length Constraint: $lengthInstruction
                                 6. Spoken Ready: Timestamp များ၊ Scene Number များ၊ ဇယားများ၊ ကွင်းစကွင်းပိတ် ညွှန်းဆိုချက်များ လုံးဝ (လုံးဝ) မထည့်ဘဲ၊ လူကိုယ်တိုင် အသံထွက်ဖတ်ရန် အဆင်သင့်ဖြစ်သော စကားပြောသဘာဝအတိုင်း "ဇာတ်ကြောင်းပြော စာသားသက်သက်" ကိုသာ ထုတ်ပေးပါ။ (စာအုပ်ဖတ်ပြသည့် စာစကား/စာအရေးအသားပုံစံ လုံးဝမဖြစ်စေရ၊ လူပြောစကားသဘာဝအတိုင်းသာ ဖြစ်ရမည်။)
-                                7. Timing & Context: $timingConstraint
+                                7. Timing & Context: $timingConstraint$subtitleContext
                                 8. Language Constraints: $languageConstraint
                             """.trimIndent()
 
