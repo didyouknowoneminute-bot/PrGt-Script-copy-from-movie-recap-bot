@@ -24,6 +24,7 @@ import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.AudioFile
 import androidx.compose.material.icons.rounded.ArrowDropDown
@@ -328,6 +329,15 @@ fun MainScreen(modifier: Modifier = Modifier) {
     var currentMissingParts by remember { mutableStateOf<List<Int>>(emptyList()) }
     var retryCountdown by remember { mutableIntStateOf(15) }
     var rpdCountdown by remember { mutableIntStateOf(10) }
+    
+    // Smart SRT Audit & Mismatch State
+    var showSrtMismatchDialog by remember { mutableStateOf<List<com.example.SrtMismatchItem>?>(null) }
+    var onConfirmRegenerateMismatches by remember { mutableStateOf<((List<com.example.SrtMismatchItem>) -> Unit)?>(null) }
+    var isAuditingSrt by remember { mutableStateOf(false) }
+    var isRegeneratingMismatches by remember { mutableStateOf(false) }
+    var autoRegenerateMismatches by remember {
+        mutableStateOf(sharedPrefs.getBoolean("auto_regenerate_mismatches", false))
+    }
     
     val coroutineScope = rememberCoroutineScope()
 
@@ -900,6 +910,118 @@ fun MainScreen(modifier: Modifier = Modifier) {
                 isEditingScript = false
                 if (!hadFatalProfileError && savedEntity != null) {
                     viewingHistoryScript = savedEntity
+                }
+
+                // Smart SRT Audit & Mismatch Regenerator (5 Retries)
+                val srtToAudit = if (selectedSrtContent.isNotBlank()) selectedSrtContent else {
+                    try {
+                        val rpdObj = if (!savedEntity?.rpdInfoJson.isNullOrBlank()) org.json.JSONObject(savedEntity!!.rpdInfoJson) else null
+                        rpdObj?.optString("srtContent", "") ?: ""
+                    } catch (_: Exception) { "" }
+                }
+
+                val subtitleCues = if (srtToAudit.isNotBlank()) SrtParser.parseSrtContent(srtToAudit) else emptyList()
+                if (subtitleCues.isNotEmpty() && scriptPartsMap.isNotEmpty() && !hadFatalProfileError) {
+                    isAuditingSrt = true
+                    generationLogs.add("🔍 [Smart SRT Audit] မူရင်း စာတန်းထိုး (SRT) နှင့် ဇာတ်ညွှန်းအား တိုက်ဆိုင်စစ်ဆေးနေပါသည် (Retry 5 ကြိမ် သတ်မှတ်ထားပါသည်)...")
+                    val foundMismatches = geminiApiClient.auditScriptWithSrt(
+                        apiKey = apiKey,
+                        spareApiKeys = enabledSpareKeys,
+                        modelName = activeModel,
+                        partsMap = scriptPartsMap,
+                        parsedSubtitles = subtitleCues,
+                        durationMs = savedDurationMs,
+                        partsCount = savedPartsCount,
+                        language = activeLanguage,
+                        onLog = { generationLogs.add(it) }
+                    )
+                    isAuditingSrt = false
+
+                    if (foundMismatches.isNotEmpty()) {
+                        generationLogs.add("⚠️ [Smart SRT Audit] စာတန်းထိုးနှင့် လွဲမှားနေသော အပိုင်း (${foundMismatches.size}) ခု တွေ့ရှိရပါသည်: ${foundMismatches.map { "Part ${it.displayPartNumber}" }.joinToString(", ")}")
+                        if (autoRegenerateMismatches) {
+                            // Option A: Auto-Fix Mode (Direct regenerate with 5 retries)
+                            generationLogs.add("⚡ [Auto-Fix Mode] လွဲမှားနေသော အပိုင်းများကို စာတန်းထိုးဖြင့် တိုက်ရိုက် Regenerate ပြန်လုပ်နေပါသည် (Retry 5 ကြိမ်)...")
+                            isRegeneratingMismatches = true
+                            val mediaMime = savedMimeType ?: selectedMediaMimeType
+                            val fileUri = savedGeminiFileUri ?: ""
+                            val isVid = mediaMime?.startsWith("video") == true
+
+                            for (item in foundMismatches) {
+                                val regeneratedText = geminiApiClient.regenerateMismatchedPart(
+                                    apiKey = apiKey,
+                                    spareApiKeys = enabledSpareKeys,
+                                    modelName = activeModel,
+                                    mediaMimeType = mediaMime,
+                                    fileUri = fileUri,
+                                    isVideo = isVid,
+                                    partIndex = item.partIndex,
+                                    partsCount = savedPartsCount,
+                                    durationMs = savedDurationMs,
+                                    segmentSubtitles = item.subtitleExcerpt,
+                                    tone = activeTone,
+                                    pov = activePOV,
+                                    language = activeLanguage,
+                                    characterProfile = localCharacterProfile,
+                                    mismatchIssue = item.issueDescription,
+                                    onLog = { generationLogs.add(it) }
+                                )
+                                if (!regeneratedText.isNullOrBlank()) {
+                                    scriptPartsMap[item.partIndex] = regeneratedText
+                                }
+                            }
+                            finalScript = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
+                            generatedScript = finalScript
+                            val updatedEntity = persistProgressToDb()
+                            if (updatedEntity != null) viewingHistoryScript = updatedEntity
+                            isRegeneratingMismatches = false
+                            generationLogs.add("✨ [Auto-Fix Mode] လွဲမှားသော အပိုင်းများ အားလုံးအား စာတန်းထိုးဖြင့် အောင်မြင်စွာ ပြန်လည်အစားထိုးပြီးပါပြီ။")
+                        } else {
+                            // Option B: Smart Review Dialog
+                            showSrtMismatchDialog = foundMismatches
+                            onConfirmRegenerateMismatches = { mismatchListToFix ->
+                                coroutineScope.launch {
+                                    isRegeneratingMismatches = true
+                                    generationLogs.add("🔄 [Smart SRT Audit] လွဲမှားနေသော အပိုင်း (${mismatchListToFix.size}) ပိုင်းအား စာတန်းထိုးဖြင့် ပြန်လည်ထုတ်လုပ်နေပါသည် (Retry 5 ကြိမ် သတ်မှတ်ထားပါသည်)...")
+                                    val mediaMime = savedMimeType ?: selectedMediaMimeType
+                                    val fileUri = savedGeminiFileUri ?: ""
+                                    val isVid = mediaMime?.startsWith("video") == true
+
+                                    for (item in mismatchListToFix) {
+                                        val regeneratedText = geminiApiClient.regenerateMismatchedPart(
+                                            apiKey = apiKey,
+                                            spareApiKeys = enabledSpareKeys,
+                                            modelName = activeModel,
+                                            mediaMimeType = mediaMime,
+                                            fileUri = fileUri,
+                                            isVideo = isVid,
+                                            partIndex = item.partIndex,
+                                            partsCount = savedPartsCount,
+                                            durationMs = savedDurationMs,
+                                            segmentSubtitles = item.subtitleExcerpt,
+                                            tone = activeTone,
+                                            pov = activePOV,
+                                            language = activeLanguage,
+                                            characterProfile = localCharacterProfile,
+                                            mismatchIssue = item.issueDescription,
+                                            onLog = { generationLogs.add(it) }
+                                        )
+                                        if (!regeneratedText.isNullOrBlank()) {
+                                            scriptPartsMap[item.partIndex] = regeneratedText
+                                        }
+                                    }
+                                    finalScript = scriptPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
+                                    generatedScript = finalScript
+                                    val updatedEntity = persistProgressToDb()
+                                    if (updatedEntity != null) viewingHistoryScript = updatedEntity
+                                    isRegeneratingMismatches = false
+                                    generationLogs.add("✨ [Smart SRT Audit] လွဲမှားသော အပိုင်းများ အားလုံးအား စာတန်းထိုးဖြင့် အောင်မြင်စွာ ပြန်လည်အစားထိုးပြီးပါပြီ။")
+                                }
+                            }
+                        }
+                    } else {
+                        generationLogs.add("✅ [Smart SRT Audit] စာတန်းထိုးနှင့် အားလုံး ကိုက်ညီမှုရှိပါသည်။ ပြင်ဆင်ရန် မလိုပါ။")
+                    }
                 }
             }
             
@@ -1988,6 +2110,121 @@ fun MainScreen(modifier: Modifier = Modifier) {
                                     modifier = Modifier.padding(start = 8.dp)
                                 ) {
                                     Text("Retry Failed Parts", style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
+
+                    val viewerHasSrt = (scriptRpdObj?.optString("srtContent", "")?.isNotBlank() == true) || selectedSrtContent.isNotBlank()
+                    if (viewerHasSrt) {
+                        Surface(
+                            color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.SpaceBetween
+                            ) {
+                                Row(
+                                    modifier = Modifier.weight(1f),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Filled.Search,
+                                        contentDescription = null,
+                                        tint = MaterialTheme.colorScheme.tertiary,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(6.dp))
+                                    Text(
+                                        text = if (isAuditingSrt) "စာတန်းထိုးနှင့် တိုက်ဆိုင်စစ်ဆေးနေပါသည် (5 Retries)..." else "Smart SRT Audit: စာတန်းထိုးနှင့် တိုက်ဆိုင်စစ်ဆေးနိုင်သည်",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontWeight = FontWeight.Medium,
+                                        color = MaterialTheme.colorScheme.onTertiaryContainer
+                                    )
+                                }
+                                OutlinedButton(
+                                    onClick = {
+                                        val srtText = if (selectedSrtContent.isNotBlank()) selectedSrtContent else scriptRpdObj?.optString("srtContent", "") ?: ""
+                                        val cues = SrtParser.parseSrtContent(srtText)
+                                        val partsObj = try {
+                                            if (script.scriptPartsJson.isNotBlank()) org.json.JSONObject(script.scriptPartsJson) else null
+                                        } catch (_: Exception) { null }
+                                        val currentPartsMap = mutableMapOf<Int, String>()
+                                        partsObj?.keys()?.forEach { k ->
+                                            val idx = k.toIntOrNull()
+                                            if (idx != null) currentPartsMap[idx] = partsObj.getString(k)
+                                        }
+                                        val enabledSpareKeys = spareKeySlots.filter { it.enabled && it.key.isNotBlank() }.map { it.key.trim() }
+                                        coroutineScope.launch {
+                                            isAuditingSrt = true
+                                            generationLogs.add("🔍 [Smart SRT Audit] စာတန်းထိုးနှင့် ဇာတ်ညွှန်းကို တိုက်ဆိုင်စစ်ဆေးနေပါသည် (Retry 5 ကြိမ် သတ်မှတ်ထားပါသည်)...")
+                                            val foundMismatches = geminiApiClient.auditScriptWithSrt(
+                                                apiKey = apiKey,
+                                                spareApiKeys = enabledSpareKeys,
+                                                modelName = script.modelId.ifBlank { selectedModelKey },
+                                                partsMap = currentPartsMap,
+                                                parsedSubtitles = cues,
+                                                durationMs = (script.durationSec.toLongOrNull() ?: 0L) * 1000L,
+                                                partsCount = script.partsCount,
+                                                language = script.language,
+                                                onLog = { generationLogs.add(it) }
+                                            )
+                                            isAuditingSrt = false
+                                            if (foundMismatches.isNotEmpty()) {
+                                                showSrtMismatchDialog = foundMismatches
+                                                onConfirmRegenerateMismatches = { mismatchListToFix ->
+                                                    coroutineScope.launch {
+                                                        isRegeneratingMismatches = true
+                                                        generationLogs.add("🔄 [Smart SRT Audit] လွဲမှားနေသော အပိုင်း (${mismatchListToFix.size}) ပိုင်းအား စာတန်းထိုးဖြင့် ပြန်လည်ထုတ်လုပ်နေပါသည် (Retry 5 ကြိမ်)...")
+                                                        for (item in mismatchListToFix) {
+                                                            val regeneratedText = geminiApiClient.regenerateMismatchedPart(
+                                                                apiKey = apiKey,
+                                                                spareApiKeys = enabledSpareKeys,
+                                                                modelName = script.modelId.ifBlank { selectedModelKey },
+                                                                mediaMimeType = script.mimeType ?: "video/mp4",
+                                                                fileUri = script.geminiFileUri ?: "",
+                                                                isVideo = (script.mimeType?.startsWith("video") == true),
+                                                                partIndex = item.partIndex,
+                                                                partsCount = script.partsCount,
+                                                                durationMs = (script.durationSec.toLongOrNull() ?: 0L) * 1000L,
+                                                                segmentSubtitles = item.subtitleExcerpt,
+                                                                tone = script.tone,
+                                                                pov = script.pov,
+                                                                language = script.language,
+                                                                characterProfile = scriptRpdObj?.optString("characterProfile", "") ?: "",
+                                                                mismatchIssue = item.issueDescription,
+                                                                onLog = { generationLogs.add(it) }
+                                                            )
+                                                            if (!regeneratedText.isNullOrBlank()) {
+                                                                currentPartsMap[item.partIndex] = regeneratedText
+                                                            }
+                                                        }
+                                                        val updatedPartsJson = org.json.JSONObject()
+                                                        currentPartsMap.forEach { (k, v) -> updatedPartsJson.put(k.toString(), v) }
+                                                        val updatedFullText = currentPartsMap.entries.sortedBy { it.key }.joinToString("\n\n") { it.value.trim() }
+                                                        val updatedScript = script.copy(
+                                                            scriptText = updatedFullText,
+                                                            scriptPartsJson = updatedPartsJson.toString()
+                                                        )
+                                                        dao.updateScript(updatedScript)
+                                                        viewingHistoryScript = updatedScript
+                                                        isRegeneratingMismatches = false
+                                                        generationLogs.add("✨ [Smart SRT Audit] လွဲမှားသော အပိုင်းများ အားလုံးအား စာတန်းထိုးဖြင့် အောင်မြင်စွာ ပြန်လည်အစားထိုးပြီးပါပြီ။")
+                                                    }
+                                                }
+                                            } else {
+                                                android.widget.Toast.makeText(context, "✅ စာတန်းထိုးနှင့် အားလုံး ကိုက်ညီမှုရှိပါသည် (လွဲမှားမှု မရှိပါ)။", android.widget.Toast.LENGTH_LONG).show()
+                                            }
+                                        }
+                                    },
+                                    enabled = !isAuditingSrt,
+                                    contentPadding = PaddingValues(horizontal = 10.dp, vertical = 4.dp),
+                                    modifier = Modifier.padding(start = 8.dp)
+                                ) {
+                                    Text(if (isAuditingSrt) "Auditing..." else "🔍 Audit & Fix", style = MaterialTheme.typography.labelSmall)
                                 }
                             }
                         }
@@ -3469,6 +3706,155 @@ fun MainScreen(modifier: Modifier = Modifier) {
         )
     }
 
+    if (showSrtMismatchDialog != null) {
+        val mismatches = showSrtMismatchDialog ?: emptyList()
+        AlertDialog(
+            onDismissRequest = { showSrtMismatchDialog = null },
+            icon = {
+                Icon(
+                    imageVector = Icons.Filled.Search,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.tertiary,
+                    modifier = Modifier.size(32.dp)
+                )
+            },
+            title = {
+                Column {
+                    Text(
+                        text = "🔍 Smart SRT Audit: လွဲမှားမှု (${mismatches.size}) ခု တွေ့ရှိရပါသည်",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = "မူရင်း စာတန်းထိုး (SRT) နှင့် တိုက်ဆိုင်စစ်ဆေးချက်အရ အောက်ပါအပိုင်းများတွင် အချက်အလက် ကွဲလွဲမှုများ တွေ့ရှိရပါသည်:",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 280.dp)
+                    ) {
+                        LazyColumn(
+                            modifier = Modifier.padding(8.dp),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(mismatches) { item ->
+                                Surface(
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = MaterialTheme.colorScheme.surface,
+                                    border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.3f)),
+                                    modifier = Modifier.fillMaxWidth()
+                                ) {
+                                    Column(modifier = Modifier.padding(10.dp)) {
+                                        Row(
+                                            verticalAlignment = Alignment.CenterVertically,
+                                            horizontalArrangement = Arrangement.SpaceBetween,
+                                            modifier = Modifier.fillMaxWidth()
+                                        ) {
+                                            Text(
+                                                text = "📌 Part ${item.displayPartNumber} [${item.startStr} - ${item.endStr}]",
+                                                style = MaterialTheme.typography.labelMedium,
+                                                fontWeight = FontWeight.Bold,
+                                                color = MaterialTheme.colorScheme.primary
+                                            )
+                                            Surface(
+                                                shape = RoundedCornerShape(4.dp),
+                                                color = MaterialTheme.colorScheme.error.copy(alpha = 0.15f)
+                                            ) {
+                                                Text(
+                                                    text = "⚠️ Mismatch",
+                                                    style = MaterialTheme.typography.labelSmall,
+                                                    fontWeight = FontWeight.Bold,
+                                                    color = MaterialTheme.colorScheme.error,
+                                                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp)
+                                                )
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.height(4.dp))
+                                        Text(
+                                            text = "လွဲချော်မှု: ${item.issueDescription}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = FontWeight.Medium,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        if (item.subtitleExcerpt.isNotBlank()) {
+                                            Spacer(modifier = Modifier.height(4.dp))
+                                            Text(
+                                                text = "💬 စာတန်းထိုး: \"${item.subtitleExcerpt.take(120)}...\"",
+                                                style = MaterialTheme.typography.bodySmall,
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                                maxLines = 2
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    // Auto-regenerate in future toggle
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                val nextVal = !autoRegenerateMismatches
+                                autoRegenerateMismatches = nextVal
+                                sharedPrefs.edit().putBoolean("auto_regenerate_mismatches", nextVal).apply()
+                            }
+                            .padding(vertical = 4.dp)
+                    ) {
+                        Checkbox(
+                            checked = autoRegenerateMismatches,
+                            onCheckedChange = { checked ->
+                                autoRegenerateMismatches = checked
+                                sharedPrefs.edit().putBoolean("auto_regenerate_mismatches", checked).apply()
+                            }
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "နောင်တွင် Dialog မမေးဘဲ အလိုအလျောက် တိုက်ရိုက် Regenerate ပြန်လုပ်မည် (Auto-Fix Mode)",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurface
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val mismatchListToFix = mismatches
+                        showSrtMismatchDialog = null
+                        onConfirmRegenerateMismatches?.invoke(mismatchListToFix)
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.tertiary)
+                ) {
+                    Text("🔄 Regenerate Parts (5 Retries)")
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = {
+                        showSrtMismatchDialog = null
+                        generationLogs.add("ℹ️ [Smart SRT Audit] အသုံးပြုသူမှ မူရင်းအတိုင်း ဆက်လက်သိမ်းဆည်းခဲ့ပါသည်။")
+                    }
+                ) {
+                    Text("မူရင်းအတိုင်း သိမ်းဆည်းမည်")
+                }
+            }
+        )
+    }
+
     if (showSettings) {
         SettingsDialog(
             apiKey = apiKey,
@@ -3501,6 +3887,11 @@ fun MainScreen(modifier: Modifier = Modifier) {
             onRpmChange = { newRpm ->
                 rpmSetting = newRpm
                 sharedPrefs.edit().putFloat("gemini_rpm", newRpm).apply()
+            },
+            autoRegenerateMismatches = autoRegenerateMismatches,
+            onAutoRegenerateMismatchesChange = { newSetting ->
+                autoRegenerateMismatches = newSetting
+                sharedPrefs.edit().putBoolean("auto_regenerate_mismatches", newSetting).apply()
             },
             onDismiss = { showSettings = false }
         )
@@ -3835,6 +4226,8 @@ fun SettingsDialog(
     models: List<String>,
     rpm: Float,
     onRpmChange: (Float) -> Unit,
+    autoRegenerateMismatches: Boolean = false,
+    onAutoRegenerateMismatchesChange: (Boolean) -> Unit = {},
     onDismiss: () -> Unit
 ) {
     AlertDialog(
@@ -4221,6 +4614,43 @@ fun SettingsDialog(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
+                    }
+                }
+
+                Card(
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "⚡ Auto-Regenerate SRT Mismatches",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.SemiBold
+                                )
+                                Text(
+                                    text = if (autoRegenerateMismatches) "Auto-Fix: တိုက်ရိုက် ပြင်ဆင်မည် (On)" else "Review Dialog: အသိပေးပြီးမှ ပြင်ဆင်မည် (Off)",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = if (autoRegenerateMismatches) MaterialTheme.colorScheme.tertiary else MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            Switch(
+                                checked = autoRegenerateMismatches,
+                                onCheckedChange = onAutoRegenerateMismatchesChange
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "ဖွင့်ထားပါက စာတန်းထိုး (SRT) နှင့် လွဲနေသောအပိုင်းများကို Dialog မမေးဘဲ အလိုအလျောက် ချက်ချင်း အသစ်ပြန်လည်ရေးသားပါမည် (Retry 5 ကြိမ်ပါဝင်သည်)။ ပိတ်ထားပါက စစ်ဆေးချက် Dialog ပြသပေးပါမည်။",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                 }
 

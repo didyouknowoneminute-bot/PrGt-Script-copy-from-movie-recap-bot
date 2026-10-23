@@ -2,6 +2,7 @@ package com.example.db
 
 import androidx.room.Dao
 import androidx.room.Insert
+import androidx.room.Update
 import androidx.room.Query
 import kotlinx.coroutines.flow.Flow
 
@@ -12,6 +13,9 @@ interface PrGtScriptDao {
 
     @Insert
     suspend fun insertScript(script: PrGtScript): Long
+
+    @Update
+    suspend fun updateScript(script: PrGtScript)
 
     @Query("DELETE FROM prgt_scripts WHERE id = :id")
     suspend fun deleteScriptById(id: Int)

@@ -41,6 +41,18 @@ data class SpareKeySlot(
     val enabled: Boolean = true
 )
 
+data class SrtMismatchItem(
+    val partIndex: Int,
+    val displayPartNumber: Int,
+    val startMs: Long,
+    val endMs: Long,
+    val startStr: String,
+    val endStr: String,
+    val issueDescription: String,
+    val subtitleExcerpt: String,
+    val currentScriptExcerpt: String
+)
+
 sealed class GenerationUpdate {
     data class Log(val message: String) : GenerationUpdate()
     data class Progress(val progress: Float) : GenerationUpdate()
@@ -2300,5 +2312,290 @@ class GeminiApiClient(private val context: Context) {
             Log.e("GeminiApiClient", errMsg, e)
             return UploadResult.Failure(errMsg)
         }
+    }
+
+    suspend fun auditScriptWithSrt(
+        apiKey: String,
+        spareApiKeys: List<String>,
+        modelName: String,
+        partsMap: Map<Int, String>,
+        parsedSubtitles: List<SrtParser.SubtitleCue>,
+        durationMs: Long,
+        partsCount: Int,
+        language: String,
+        onLog: (String) -> Unit
+    ): List<SrtMismatchItem> = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        if (parsedSubtitles.isEmpty() || partsMap.isEmpty() || partsCount <= 0) {
+            return@withContext emptyList()
+        }
+
+        val segmentDurationMs = if (partsCount > 0) durationMs / partsCount else 0L
+        if (segmentDurationMs <= 0L) return@withContext emptyList()
+
+        val candidateParts = mutableListOf<Triple<Int, String, String>>()
+        for (i in 0 until partsCount) {
+            val startMs = i * segmentDurationMs
+            val endMs = if (i == partsCount - 1) durationMs else (i + 1) * segmentDurationMs
+            val srt = SrtParser.getSubtitlesForSegment(parsedSubtitles, startMs, endMs).trim()
+            val script = (partsMap[i] ?: "").trim()
+            // Bypass/Skip parts that have no spoken subtitle transcript (Action scenes, silence, etc.)
+            if (srt.isNotBlank() && script.isNotBlank() && !script.contains("Error") && !script.contains("နေရာလွတ်")) {
+                candidateParts.add(Triple(i, script, srt))
+            }
+        }
+
+        if (candidateParts.isEmpty()) {
+            onLog("ℹ️ [Smart SRT Audit] စစ်ဆေးရန် စကားပြောစာတန်းထိုးပါရှိသော အပိုင်း မရှိပါ (Action/No-dialogue ဖြစ်နိုင်ပါသည်)။")
+            return@withContext emptyList()
+        }
+
+        val promptBuilder = StringBuilder()
+        promptBuilder.append("""
+            You are an expert Script Quality Auditor and Fact-Checker.
+            Compare the generated narration text for each segment against the actual spoken subtitle transcript (SRT) for that segment.
+
+            CRITICAL GUIDELINES:
+            1. If the generated script accurately reflects or reasonably summarizes the spoken dialogue, DO NOT flag it.
+            2. ONLY flag severe factual contradictions, wrong character identities/names, completely reversed plot points, or significant omissions of critical spoken facts.
+            3. Ignore minor stylistic or phrasing differences.
+            4. Output MUST be a strictly valid JSON array of objects. Format:
+            [
+              {
+                "partNumber": 1,
+                "issue": "Reason why it contradicts or severely deviates from the subtitles"
+              }
+            ]
+            If all parts match well and there are NO serious contradictions, output strictly: []
+
+            Segments to audit:
+        """.trimIndent())
+
+        for ((partIdx, script, srt) in candidateParts) {
+            val startMs = partIdx * segmentDurationMs
+            val endMs = if (partIdx == partsCount - 1) durationMs else (partIdx + 1) * segmentDurationMs
+            promptBuilder.append("\n\n--- Part ${partIdx + 1} [${formatTime(startMs)} - ${formatTime(endMs)}] ---")
+            promptBuilder.append("\n[Spoken Subtitles Transcript]:\n${srt.take(1200)}")
+            promptBuilder.append("\n[Generated Script Narration]:\n${script.take(1200)}")
+        }
+
+        val allKeys = mutableListOf<String>()
+        if (apiKey.isNotBlank()) allKeys.add(apiKey.trim())
+        for (k in spareApiKeys) {
+            val trimmed = k.trim()
+            if (trimmed.isNotBlank() && !allKeys.contains(trimmed)) allKeys.add(trimmed)
+        }
+        if (allKeys.isEmpty()) {
+            onLog("❌ [Smart SRT Audit] စစ်ဆေးရန် API Key မရှိပါ။")
+            return@withContext emptyList()
+        }
+
+        val actualModel = getModelName(modelName)
+        val maxAuditAttempts = 5
+        var currentAttempt = 0
+        var keyIndex = 0
+
+        while (currentAttempt < maxAuditAttempts) {
+            currentAttempt++
+            val activeKey = allKeys[keyIndex % allKeys.size]
+            onLog("🔍 [Smart SRT Audit] စာတန်းထိုးနှင့် တိုက်ဆိုင်စစ်ဆေးနေပါသည် (Attempt $currentAttempt/$maxAuditAttempts)...")
+
+            val jsonBody = JSONObject().apply {
+                put("contents", JSONArray().apply {
+                    put(JSONObject().apply {
+                        put("role", "user")
+                        put("parts", JSONArray().apply {
+                            put(JSONObject().apply { put("text", promptBuilder.toString()) })
+                        })
+                    })
+                })
+                put("generationConfig", JSONObject().apply {
+                    put("response_mime_type", "application/json")
+                })
+            }
+
+            val request = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModel:generateContent?key=$activeKey")
+                .post(jsonBody.toString().toRequestBody("application/json".toMediaTypeOrNull()))
+                .build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    val respBody = response.body?.string() ?: ""
+                    if (response.isSuccessful) {
+                        val responseJson = JSONObject(respBody)
+                        val candidates = responseJson.optJSONArray("candidates")
+                        val text = candidates?.optJSONObject(0)
+                            ?.optJSONObject("content")
+                            ?.optJSONArray("parts")
+                            ?.optJSONObject(0)
+                            ?.optString("text", "") ?: ""
+
+                        if (text.isNotBlank()) {
+                            val cleanJson = text.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+                            val jsonArray = JSONArray(cleanJson)
+                            val mismatches = mutableListOf<SrtMismatchItem>()
+                            for (j in 0 until jsonArray.length()) {
+                                val itemObj = jsonArray.optJSONObject(j) ?: continue
+                                val partNum = itemObj.optInt("partNumber", -1)
+                                val issue = itemObj.optString("issue", "").trim()
+                                if (partNum in 1..partsCount && issue.isNotBlank()) {
+                                    val zeroIdx = partNum - 1
+                                    val startMs = zeroIdx * segmentDurationMs
+                                    val endMs = if (zeroIdx == partsCount - 1) durationMs else (zeroIdx + 1) * segmentDurationMs
+                                    val srtExcerpt = SrtParser.getSubtitlesForSegment(parsedSubtitles, startMs, endMs).trim()
+                                    val scriptExcerpt = (partsMap[zeroIdx] ?: "").trim()
+                                    mismatches.add(
+                                        SrtMismatchItem(
+                                            partIndex = zeroIdx,
+                                            displayPartNumber = partNum,
+                                            startMs = startMs,
+                                            endMs = endMs,
+                                            startStr = formatTime(startMs),
+                                            endStr = formatTime(endMs),
+                                            issueDescription = issue,
+                                            subtitleExcerpt = srtExcerpt,
+                                            currentScriptExcerpt = scriptExcerpt
+                                        )
+                                    )
+                                }
+                            }
+                            return@withContext mismatches
+                        }
+                    } else {
+                        onLog("⚠️ [Smart SRT Audit] Attempt $currentAttempt/$maxAuditAttempts မအောင်မြင်ပါ (HTTP ${response.code})")
+                    }
+                }
+            } catch (e: Exception) {
+                onLog("⚠️ [Smart SRT Audit] Attempt $currentAttempt/$maxAuditAttempts Exception: ${e.message}")
+            }
+
+            keyIndex++
+            delay(1000)
+        }
+
+        onLog("⚠️ [Smart SRT Audit] Retry 5 ကြိမ် ပြည့်မြောက်သော်လည်း စစ်ဆေးမှု မအောင်မြင်ခဲ့ပါ။")
+        return@withContext emptyList()
+    }
+
+    suspend fun regenerateMismatchedPart(
+        apiKey: String,
+        spareApiKeys: List<String>,
+        modelName: String,
+        mediaMimeType: String?,
+        fileUri: String,
+        isVideo: Boolean,
+        partIndex: Int,
+        partsCount: Int,
+        durationMs: Long,
+        segmentSubtitles: String,
+        tone: String,
+        pov: String,
+        language: String,
+        characterProfile: String,
+        mismatchIssue: String,
+        onLog: (String) -> Unit
+    ): String? = kotlinx.coroutines.withContext(Dispatchers.IO) {
+        val segmentDurationMs = if (partsCount > 0) durationMs / partsCount else 0L
+        val startMs = partIndex * segmentDurationMs
+        val endMs = if (partIndex == partsCount - 1) durationMs else (partIndex + 1) * segmentDurationMs
+        val startStr = formatTime(startMs)
+        val endStr = formatTime(endMs)
+
+        val timingConstraint = if (isVideo) {
+            "Timestamp $startStr မှ $endStr အတွင်းရှိ ဗီဒီယိုမြင်ကွင်းနှင့် အသံပါအဖြစ်အပျက်များကိုသာ အတိအကျ အခြေခံရေးသားပါ။"
+        } else {
+            "Timestamp $startStr မှ $endStr အတွင်းရှိ အသံဖိုင်ပါ စကားပြောသံနှင့် အကြောင်းအရာများကိုသာ အတိအကျ အခြေခံရေးသားပါ။"
+        }
+
+        val subtitleContext = if (segmentSubtitles.isNotBlank()) {
+            "\n\n⚠️ အထူးဦးစားပေးပြင်ဆင်ရန် စကားပြောစာတန်းထိုးများ (Subtitles Transcript in $startStr - $endStr):\n$segmentSubtitles\n\n(ယခင်ရေးသားချက်တွင် အောက်ပါကွဲလွဲချက် ဖြစ်ပေါ်ခဲ့ပါသည်: '$mismatchIssue'။ ဤအချက်အလက်ကို ပြင်ဆင်ပြီး အထက်ပါ စကားပြောစာတန်းထိုးပါ အဖြစ်အပျက်များကို အတိအကျ ဦးစားပေးကိုးကား၍ အသစ်ပြန်လည် အချောသပ် ရေးသားပါ။)"
+        } else ""
+
+        val systemInstruction = """
+            သင်သည် '$tone' လေသံနှင့် '$pov' ရှုထောင့်ကို အထူးကျွမ်းကျင်သော PrGt's Script (ဇာတ်လမ်းအကျဉ်း) ဇာတ်ကြောင်းပြောသူ (Narrator) ဖြစ်သည်။
+            ယခင်ရေးသားချက်တွင် စကားပြောစာတန်းထိုးနှင့် လွဲချော်မှုရှိခဲ့သဖြင့် ဤအပိုင်းကို အထူးပြန်လည် အချောသပ် ပြင်ဆင်ရေးသားရမည်။
+            
+            ညွှန်ကြားချက်များ:
+            1. Narrator POV: $pov
+            2. Script Tone: $tone
+            3. Spoken Ready: Timestamp များ၊ Scene Number များ လုံးဝမထည့်ဘဲ စကားပြောသဘာဝအတိုင်း ဇာတ်ကြောင်းပြော စာသားသက်သက်သာ ထုတ်ပေးပါ။
+            4. Timing & Subtitles: $timingConstraint$subtitleContext
+            5. Output Language: $language
+        """.trimIndent()
+
+        val prompt = "အထက်ပါ ညွှန်ကြားချက်များနှင့် စာတန်းထိုး Context အတိုင်း $startStr မှ $endStr အပိုင်းကို အသစ်ပြန်လည် ရေးသားပေးပါ။"
+
+        val allKeys = mutableListOf<String>()
+        if (apiKey.isNotBlank()) allKeys.add(apiKey.trim())
+        for (k in spareApiKeys) {
+            val trimmed = k.trim()
+            if (trimmed.isNotBlank() && !allKeys.contains(trimmed)) allKeys.add(trimmed)
+        }
+        if (allKeys.isEmpty()) {
+            onLog("❌ [Part ${partIndex + 1} Regenerate] API Key မရှိပါ။")
+            return@withContext null
+        }
+
+        val actualModel = getModelName(modelName)
+        val maxAttempts = 5
+        var attempts = 0
+        var keyIndex = 0
+
+        while (attempts < maxAttempts) {
+            attempts++
+            val activeKey = allKeys[keyIndex % allKeys.size]
+            onLog("🔄 [Regenerate Part ${partIndex + 1}/$partsCount] [$startStr - $endStr] စာတန်းထိုးဖြင့် ပြန်လည်ထုတ်လုပ်နေပါသည် (Attempt $attempts/$maxAttempts)...")
+
+            val requestBody = createSegmentRequestBody(
+                systemInstruction = systemInstruction,
+                prompt = prompt,
+                mediaMimeType = mediaMimeType,
+                fileUri = fileUri,
+                isVideo = isVideo,
+                startMs = startMs,
+                endMs = endMs
+            )
+
+            val request = Request.Builder()
+                .url("https://generativelanguage.googleapis.com/v1beta/models/$actualModel:streamGenerateContent?key=$activeKey")
+                .post(requestBody)
+                .build()
+
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        val responseString = response.body?.string() ?: ""
+                        val jsonArray = JSONArray(responseString)
+                        val partTextBuilder = StringBuilder()
+                        for (j in 0 until jsonArray.length()) {
+                            val chunk = jsonArray.getJSONObject(j)
+                            val candidates = chunk.optJSONArray("candidates")
+                            if (candidates != null && candidates.length() > 0) {
+                                val contentParts = candidates.getJSONObject(0).optJSONObject("content")?.optJSONArray("parts")
+                                if (contentParts != null && contentParts.length() > 0) {
+                                    val text = contentParts.getJSONObject(0).optString("text", "")
+                                    partTextBuilder.append(text)
+                                }
+                            }
+                        }
+                        val resultText = partTextBuilder.toString().trim()
+                        if (resultText.isNotBlank()) {
+                            onLog("✅ [Regenerate Part ${partIndex + 1}] [$startStr - $endStr] အောင်မြင်စွာ ပြန်လည်အစားထိုးပြီးပါပြီ (Attempt $attempts)။")
+                            return@withContext resultText
+                        }
+                    } else {
+                        onLog("❌ [Regenerate Part ${partIndex + 1}] Attempt $attempts/$maxAttempts Failed: HTTP ${response.code}")
+                    }
+                }
+            } catch (e: Exception) {
+                onLog("❌ [Regenerate Part ${partIndex + 1}] Attempt $attempts/$maxAttempts Exception: ${e.message}")
+            }
+
+            keyIndex++
+            delay(1200)
+        }
+
+        onLog("❌ [Regenerate Part ${partIndex + 1}] Retry 5 ကြိမ်ပြည့်သော်လည်း အသစ်မရရှိခဲ့ပါ။")
+        return@withContext null
     }
 }
